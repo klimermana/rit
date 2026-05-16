@@ -361,7 +361,8 @@ impl App {
                 self.diff.scroll = 0;
             }
             (_, Char('y'), Mod::NONE) => self.yank_selected_hash(),
-            (Focus::Log, Char('/'), Mod::NONE) => {
+            (_, Char('/'), Mod::NONE) => {
+                self.focus = Focus::Log;
                 self.search.active = true;
                 self.search.query.clear();
                 self.search.matches.clear();
@@ -532,6 +533,10 @@ impl App {
         self.search.matches = if q.is_empty() {
             Vec::new()
         } else {
+            // Trigger continued loading so the search eventually covers all commits.
+            if !self.walk_done {
+                let _ = self.tx.send(GitReq::LoadMore(LOAD_PAGE));
+            }
             self.log
                 .rows
                 .iter()
