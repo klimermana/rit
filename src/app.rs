@@ -399,8 +399,9 @@ impl App {
             (Focus::Log, Char('d'), Mod::CONTROL) => self.move_log_down(HALF_PAGE),
             (Focus::Log, Char('u'), Mod::CONTROL) => self.move_log_up(HALF_PAGE),
             (Focus::Diff, Char('j') | Down | Enter, Mod::NONE) => self.diff.scroll = self.diff.scroll.saturating_add(1),
-            (Focus::Diff, Char('k') | Up, Mod::NONE) => self.diff.scroll = self.diff.scroll.saturating_sub(1),
-            (Focus::Diff, Enter, Mod::SHIFT) => self.diff.scroll = self.diff.scroll.saturating_sub(1),
+            (Focus::Diff, Char('k') | Up | Backspace, Mod::NONE) => {
+                self.diff.scroll = self.diff.scroll.saturating_sub(1)
+            }
             (Focus::Diff, Char('g'), Mod::NONE) => self.diff.scroll = 0,
             (Focus::Diff, Char('G'), Mod::NONE) => {
                 let total = self.diff.total_visible_lines();
