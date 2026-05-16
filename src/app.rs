@@ -82,6 +82,8 @@ pub struct DiffState {
     pub loading: bool,
     pub show_line_numbers: bool,
     pub show_hunks: bool,
+    /// Inner height of the diff pane, updated by the renderer each frame.
+    pub view_height: usize,
 }
 
 pub struct StatusState {
@@ -136,6 +138,7 @@ impl App {
                 loading: false,
                 show_line_numbers: true,
                 show_hunks: true,
+                view_height: 1,
             },
             status: StatusState { open: false, lines: Vec::new(), scroll: 0, loading: false },
             focus: Focus::Log,
@@ -403,16 +406,13 @@ impl App {
             (Focus::Log, Char('G'), Mod::NONE) => self.jump_log_bottom(),
             (Focus::Log, Char('d'), Mod::CONTROL) => self.move_log_down(HALF_PAGE),
             (Focus::Log, Char('u'), Mod::CONTROL) => self.move_log_up(HALF_PAGE),
-            (Focus::Diff, Char('j') | Down | Enter, Mod::NONE) => self.diff.scroll = self.diff.scroll.saturating_add(1),
+            (Focus::Diff, Char('j') | Down | Enter, Mod::NONE) => self.diff_scroll_down(1),
             (Focus::Diff, Char('k') | Up | Backspace, Mod::NONE) => {
-                self.diff.scroll = self.diff.scroll.saturating_sub(1)
+                self.diff.scroll = self.diff.scroll.saturating_sub(1);
             }
             (Focus::Diff, Char('g'), Mod::NONE) => self.diff.scroll = 0,
-            (Focus::Diff, Char('G'), Mod::NONE) => {
-                let total = self.diff.total_visible_lines();
-                self.diff.scroll = total.saturating_sub(1);
-            }
-            (Focus::Diff, Char('d'), Mod::CONTROL) => self.diff.scroll = self.diff.scroll.saturating_add(HALF_PAGE),
+            (Focus::Diff, Char('G'), Mod::NONE) => self.diff_scroll_to_bottom(),
+            (Focus::Diff, Char('d'), Mod::CONTROL) => self.diff_scroll_down(HALF_PAGE),
             (Focus::Diff, Char('u'), Mod::CONTROL) => self.diff.scroll = self.diff.scroll.saturating_sub(HALF_PAGE),
             _ => {}
         }
@@ -611,6 +611,16 @@ impl App {
     /// Yet" row).
     pub fn commits_len(&self) -> usize {
         self.log.rows.iter().filter(|r| matches!(r, LogRow::Commit(_))).count()
+    }
+
+    fn diff_scroll_down(&mut self, n: usize) {
+        let max = self.diff.total_visible_lines().saturating_sub(self.diff.view_height);
+        self.diff.scroll = (self.diff.scroll.saturating_add(n)).min(max);
+    }
+
+    fn diff_scroll_to_bottom(&mut self) {
+        let total = self.diff.total_visible_lines();
+        self.diff.scroll = total.saturating_sub(self.diff.view_height);
     }
 }
 

@@ -72,6 +72,7 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
     log_view::draw_log(frame, app, log_area, is_log_focused);
 
     if let Some(diff_area) = diff_area_opt {
+        app.diff.view_height = (diff_area.height as usize).saturating_sub(2).max(1);
         let is_diff_focused = matches!(app.focus, crate::app::Focus::Diff);
         diff_view::draw_diff(frame, app, diff_area, is_diff_focused);
     }
