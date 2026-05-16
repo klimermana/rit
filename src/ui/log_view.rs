@@ -8,16 +8,9 @@ use ratatui::{
 };
 
 pub fn draw_log(frame: &mut Frame, app: &App, area: Rect, focused: bool) {
-    let border_style = if focused {
-        Style::default().fg(Color::Cyan)
-    } else {
-        Style::default().fg(Color::DarkGray)
-    };
+    let border_style = if focused { Style::default().fg(Color::Cyan) } else { Style::default().fg(Color::DarkGray) };
 
-    let block = Block::default()
-        .title(" Log ")
-        .borders(Borders::ALL)
-        .border_style(border_style);
+    let block = Block::default().title(" Log ").borders(Borders::ALL).border_style(border_style);
 
     let inner = block.inner(area);
     frame.render_widget(block, area);
@@ -44,8 +37,7 @@ pub fn draw_log(frame: &mut Frame, app: &App, area: Rect, focused: bool) {
     for (i, row) in app.log.rows[scroll..end].iter().enumerate() {
         let global_idx = scroll + i;
         let is_selected = global_idx == app.log.selected;
-        let is_match = !app.search.query.is_empty()
-            && app.search.matches.binary_search(&global_idx).is_ok();
+        let is_match = !app.search.query.is_empty() && app.search.matches.binary_search(&global_idx).is_ok();
 
         let spans = match row {
             LogRow::WorkingTree(w) => working_tree_spans(w, app),
@@ -68,14 +60,8 @@ pub fn draw_log(frame: &mut Frame, app: &App, area: Rect, focused: bool) {
 
 fn commit_spans<'a>(commit: &'a CommitInfo, app: &App) -> Vec<Span<'a>> {
     let mut spans: Vec<Span> = Vec::new();
-    spans.push(Span::styled(
-        format!("{} ", commit.graph),
-        Style::default().fg(Color::DarkGray),
-    ));
-    spans.push(Span::styled(
-        commit.short_id.as_str(),
-        Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD),
-    ));
+    spans.push(Span::styled(format!("{} ", commit.graph), Style::default().fg(Color::DarkGray)));
+    spans.push(Span::styled(commit.short_id.as_str(), Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)));
     spans.push(Span::raw(" "));
     spans.push(Span::styled(
         format!("{:<width$}", commit.date, width = app.date_col_width()),
@@ -95,10 +81,7 @@ fn commit_spans<'a>(commit: &'a CommitInfo, app: &App) -> Vec<Span<'a>> {
             RefKind::RemoteBranch => (Color::Magenta, Modifier::empty()),
             RefKind::Tag => (Color::Yellow, Modifier::empty()),
         };
-        spans.push(Span::styled(
-            format!("[{}]", label.name),
-            Style::default().fg(fg).add_modifier(modifier),
-        ));
+        spans.push(Span::styled(format!("[{}]", label.name), Style::default().fg(fg).add_modifier(modifier)));
         spans.push(Span::raw(" "));
     }
 
@@ -123,9 +106,6 @@ fn working_tree_spans<'a>(row: &'a WorkingTreeRow, app: &App) -> Vec<Span<'a>> {
         Style::default().fg(Color::Green),
     ));
     spans.push(Span::raw(" "));
-    spans.push(Span::styled(
-        "Not Committed Yet",
-        Style::default().fg(Color::DarkGray).add_modifier(Modifier::BOLD),
-    ));
+    spans.push(Span::styled("Not Committed Yet", Style::default().fg(Color::DarkGray).add_modifier(Modifier::BOLD)));
     spans
 }

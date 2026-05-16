@@ -1,6 +1,8 @@
-use crate::app::{App, LogRow};
-use crate::git::{DiffLine, DiffLineKind, DiffStats, DiffTarget, FileStat};
-use crate::ui::diff_line_to_ratatui;
+use crate::{
+    app::{App, LogRow},
+    git::{DiffLine, DiffLineKind, DiffStats, DiffTarget, FileStat},
+    ui::diff_line_to_ratatui,
+};
 use ratatui::{
     layout::Rect,
     style::{Color, Style},
@@ -10,18 +12,11 @@ use ratatui::{
 };
 
 pub fn draw_diff(frame: &mut Frame, app: &App, area: Rect, focused: bool) {
-    let border_style = if focused {
-        Style::default().fg(Color::Cyan)
-    } else {
-        Style::default().fg(Color::DarkGray)
-    };
+    let border_style = if focused { Style::default().fg(Color::Cyan) } else { Style::default().fg(Color::DarkGray) };
 
     let title = diff_title(app);
 
-    let block = Block::default()
-        .title(title)
-        .borders(Borders::ALL)
-        .border_style(border_style);
+    let block = Block::default().title(title).borders(Borders::ALL).border_style(border_style);
 
     let inner = block.inner(area);
     frame.render_widget(block, area);
@@ -33,11 +28,7 @@ pub fn draw_diff(frame: &mut Frame, app: &App, area: Rect, focused: bool) {
     }
 
     if app.diff.header_lines.is_none() && app.diff.body_lines.is_none() {
-        let msg = if app.log.rows.is_empty() {
-            "Select a commit to view diff"
-        } else {
-            "No diff available"
-        };
+        let msg = if app.log.rows.is_empty() { "Select a commit to view diff" } else { "No diff available" };
         let para = Paragraph::new(msg).style(Style::default().fg(Color::Gray));
         frame.render_widget(para, inner);
         return;
@@ -67,26 +58,31 @@ pub fn draw_diff(frame: &mut Frame, app: &App, area: Rect, focused: bool) {
     }
 
     let total = all_lines.len();
-    if total == 0 { return; }
+    if total == 0 {
+        return;
+    }
     let height = inner.height as usize;
     let scroll = app.diff.scroll.min(total.saturating_sub(1));
     let end = (scroll + height).min(total);
 
     let show_nums = app.diff.show_line_numbers;
-    let visible: Vec<Line> = all_lines.into_iter().skip(scroll).take(end - scroll).enumerate().map(|(i, line)| {
-        if show_nums {
-            let num = Span::styled(
-                format!("{:>4} ", scroll + i + 1),
-                Style::default().fg(Color::DarkGray),
-            );
-            let mut spans = Vec::with_capacity(line.spans.len() + 1);
-            spans.push(num);
-            spans.extend(line.spans);
-            Line::from(spans).style(line.style)
-        } else {
-            line
-        }
-    }).collect();
+    let visible: Vec<Line> = all_lines
+        .into_iter()
+        .skip(scroll)
+        .take(end - scroll)
+        .enumerate()
+        .map(|(i, line)| {
+            if show_nums {
+                let num = Span::styled(format!("{:>4} ", scroll + i + 1), Style::default().fg(Color::DarkGray));
+                let mut spans = Vec::with_capacity(line.spans.len() + 1);
+                spans.push(num);
+                spans.extend(line.spans);
+                Line::from(spans).style(line.style)
+            } else {
+                line
+            }
+        })
+        .collect();
 
     frame.render_widget(Paragraph::new(visible), inner);
 }
@@ -127,19 +123,13 @@ fn append_diffstat(out: &mut Vec<Line<'static>>, files: &[FileStat], stats: &Dif
 
     for f in files {
         let total = f.additions + f.deletions;
-        let bar_len = if max_changes == 0 {
-            0
-        } else {
-            ((total as f32 / max_changes as f32) * bar_cap as f32).round() as usize
-        };
+        let bar_len =
+            if max_changes == 0 { 0 } else { ((total as f32 / max_changes as f32) * bar_cap as f32).round() as usize };
         let bar_len = bar_len.min(bar_cap).max(if total > 0 { 1 } else { 0 });
 
         // Split the bar between + and - proportionally.
-        let plus_len = if total == 0 {
-            0
-        } else {
-            ((f.additions as f32 / total as f32) * bar_len as f32).round() as usize
-        };
+        let plus_len =
+            if total == 0 { 0 } else { ((f.additions as f32 / total as f32) * bar_len as f32).round() as usize };
         let minus_len = bar_len.saturating_sub(plus_len);
 
         let text = format!(

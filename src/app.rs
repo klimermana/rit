@@ -1,5 +1,7 @@
-use crate::git::{DiffLine, DiffStats, DiffTarget, FileStat, GitMsg, GitReq, RepoInfo};
-use crate::ui;
+use crate::{
+    git::{DiffLine, DiffStats, DiffTarget, FileStat, GitMsg, GitReq, RepoInfo},
+    ui,
+};
 use anyhow::Result;
 use compact_str::CompactString;
 use crossbeam_channel::{after, never, select, Receiver, Sender};
@@ -107,8 +109,9 @@ pub struct App {
     pub branch_name: String,
     /// True once the worker has reported it walked the whole history.
     pub walk_done: bool,
-    /// Current walk generation. Bumped on reload; the worker tags Commits/WalkDone
-    /// with its own generation and stale messages are dropped.
+    /// Current walk generation. Bumped on reload; the worker tags
+    /// Commits/WalkDone with its own generation and stale messages are
+    /// dropped.
     pub walk_gen: u64,
     pub should_quit: bool,
     pub tx: Sender<GitReq>,
@@ -238,7 +241,9 @@ impl App {
                 self.branch_name = branch;
             }
             GitMsg::Commits { gen, commits } => {
-                if gen != self.walk_gen { return; }
+                if gen != self.walk_gen {
+                    return;
+                }
                 self.log.rows.extend(commits.into_iter().map(LogRow::Commit));
                 if !self.search.query.is_empty() {
                     self.update_search_matches();
@@ -393,8 +398,9 @@ impl App {
             (Focus::Log, Char('G'), Mod::NONE) => self.jump_log_bottom(),
             (Focus::Log, Char('d'), Mod::CONTROL) => self.move_log_down(HALF_PAGE),
             (Focus::Log, Char('u'), Mod::CONTROL) => self.move_log_up(HALF_PAGE),
-            (Focus::Diff, Char('j') | Down, Mod::NONE) => self.diff.scroll = self.diff.scroll.saturating_add(1),
+            (Focus::Diff, Char('j') | Down | Enter, Mod::NONE) => self.diff.scroll = self.diff.scroll.saturating_add(1),
             (Focus::Diff, Char('k') | Up, Mod::NONE) => self.diff.scroll = self.diff.scroll.saturating_sub(1),
+            (Focus::Diff, Enter, Mod::SHIFT) => self.diff.scroll = self.diff.scroll.saturating_sub(1),
             (Focus::Diff, Char('g'), Mod::NONE) => self.diff.scroll = 0,
             (Focus::Diff, Char('G'), Mod::NONE) => {
                 let total = self.diff.total_visible_lines();
@@ -432,13 +438,17 @@ impl App {
     }
 
     fn move_log_down(&mut self, n: usize) {
-        if self.log.rows.is_empty() { return; }
+        if self.log.rows.is_empty() {
+            return;
+        }
         let new_sel = (self.log.selected + n).min(self.log.rows.len() - 1);
         if new_sel != self.log.selected {
             self.log.selected = new_sel;
             self.maybe_prefetch();
             self.ensure_selected_visible();
-            if self.diff.open { self.fetch_diff_for_selected(); }
+            if self.diff.open {
+                self.fetch_diff_for_selected();
+            }
         } else if new_sel + 1 == self.log.rows.len() {
             self.maybe_prefetch();
         }
@@ -449,24 +459,32 @@ impl App {
         if new_sel != self.log.selected {
             self.log.selected = new_sel;
             self.ensure_selected_visible();
-            if self.diff.open { self.fetch_diff_for_selected(); }
+            if self.diff.open {
+                self.fetch_diff_for_selected();
+            }
         }
     }
 
     fn jump_log_top(&mut self) {
         self.log.selected = 0;
         self.log.scroll = 0;
-        if self.diff.open { self.fetch_diff_for_selected(); }
+        if self.diff.open {
+            self.fetch_diff_for_selected();
+        }
     }
 
     fn jump_log_bottom(&mut self) {
-        if self.log.rows.is_empty() { return; }
+        if self.log.rows.is_empty() {
+            return;
+        }
         self.log.selected = self.log.rows.len() - 1;
         if !self.walk_done {
             let _ = self.tx.send(GitReq::LoadMore(LOAD_PAGE));
         }
         self.ensure_selected_visible();
-        if self.diff.open { self.fetch_diff_for_selected(); }
+        if self.diff.open {
+            self.fetch_diff_for_selected();
+        }
     }
 
     fn maybe_prefetch(&self) {
@@ -485,7 +503,9 @@ impl App {
     }
 
     fn fetch_diff_for_selected(&mut self) {
-        let Some(row) = self.log.rows.get(self.log.selected) else { return };
+        let Some(row) = self.log.rows.get(self.log.selected) else {
+            return;
+        };
         let target = match row {
             LogRow::Commit(c) => DiffTarget::Commit(c.id),
             LogRow::WorkingTree(_) => DiffTarget::WorkingTree,
@@ -506,13 +526,12 @@ impl App {
         self.search.matches = if q.is_empty() {
             Vec::new()
         } else {
-            self.log.rows.iter().enumerate()
+            self.log
+                .rows
+                .iter()
+                .enumerate()
                 .filter_map(|(i, row)| match row {
-                    LogRow::Commit(c)
-                        if c.summary_lower.contains(&q) || c.author_lower.contains(q.as_str()) =>
-                    {
-                        Some(i)
-                    }
+                    LogRow::Commit(c) if c.summary_lower.contains(&q) || c.author_lower.contains(q.as_str()) => Some(i),
                     _ => None,
                 })
                 .collect()
@@ -520,54 +539,70 @@ impl App {
     }
 
     fn first_match_at_or_after(&self, from: usize) -> Option<usize> {
-        self.search.matches.iter()
-            .find(|&&i| i >= from)
-            .or_else(|| self.search.matches.first())
-            .copied()
+        self.search.matches.iter().find(|&&i| i >= from).or_else(|| self.search.matches.first()).copied()
     }
 
     fn jump_to_next_match(&mut self) {
-        if self.search.matches.is_empty() { return; }
-        let next = self.search.matches.iter()
+        if self.search.matches.is_empty() {
+            return;
+        }
+        let next = self
+            .search
+            .matches
+            .iter()
             .find(|&&i| i > self.log.selected)
             .or_else(|| self.search.matches.first())
             .copied();
         if let Some(idx) = next {
             self.log.selected = idx;
             self.ensure_selected_visible();
-            if self.diff.open { self.fetch_diff_for_selected(); }
+            if self.diff.open {
+                self.fetch_diff_for_selected();
+            }
         }
     }
 
     fn jump_to_prev_match(&mut self) {
-        if self.search.matches.is_empty() { return; }
-        let prev = self.search.matches.iter().rev()
+        if self.search.matches.is_empty() {
+            return;
+        }
+        let prev = self
+            .search
+            .matches
+            .iter()
+            .rev()
             .find(|&&i| i < self.log.selected)
             .or_else(|| self.search.matches.last())
             .copied();
         if let Some(idx) = prev {
             self.log.selected = idx;
             self.ensure_selected_visible();
-            if self.diff.open { self.fetch_diff_for_selected(); }
+            if self.diff.open {
+                self.fetch_diff_for_selected();
+            }
         }
     }
 
     fn yank_selected_hash(&mut self) {
-        let Some(LogRow::Commit(commit)) = self.log.rows.get(self.log.selected) else { return };
+        let Some(LogRow::Commit(commit)) = self.log.rows.get(self.log.selected) else {
+            return;
+        };
         let hash = commit.id.to_string();
         yank_to_clipboard(&hash);
         // hash is hex ASCII, so 12-byte prefix is safe.
         let preview = if hash.len() >= 12 { &hash[..12] } else { hash.as_str() };
-        self.yank_message = Some(YankFeedback {
-            text: format!("Copied: {}", preview),
-            shown_at: Instant::now(),
-        });
+        self.yank_message = Some(YankFeedback { text: format!("Copied: {}", preview), shown_at: Instant::now() });
     }
 
-    pub fn author_col_width(&self) -> usize { AUTHOR_COL_WIDTH }
-    pub fn date_col_width(&self) -> usize { DATE_COL_WIDTH }
+    pub fn author_col_width(&self) -> usize {
+        AUTHOR_COL_WIDTH
+    }
+    pub fn date_col_width(&self) -> usize {
+        DATE_COL_WIDTH
+    }
 
-    /// Number of real commits in the log (excludes the pseudo "Not Committed Yet" row).
+    /// Number of real commits in the log (excludes the pseudo "Not Committed
+    /// Yet" row).
     pub fn commits_len(&self) -> usize {
         self.log.rows.iter().filter(|r| matches!(r, LogRow::Commit(_))).count()
     }
@@ -579,11 +614,7 @@ impl DiffState {
     pub fn total_visible_lines(&self) -> usize {
         let header = self.header_lines.as_ref().map(|v| v.len()).unwrap_or(0);
         let diffstat = self.diffstat_line_count();
-        let body = if self.show_hunks {
-            self.body_lines.as_ref().map(|v| v.len()).unwrap_or(0)
-        } else {
-            0
-        };
+        let body = if self.show_hunks { self.body_lines.as_ref().map(|v| v.len()).unwrap_or(0) } else { 0 };
         header + diffstat + body
     }
 
@@ -600,8 +631,10 @@ impl DiffState {
 
 #[cfg(any(target_os = "macos", target_os = "linux"))]
 fn yank_to_clipboard(text: &str) {
-    use std::io::Write;
-    use std::process::{Command, Stdio};
+    use std::{
+        io::Write,
+        process::{Command, Stdio},
+    };
 
     #[cfg(target_os = "macos")]
     {
@@ -616,12 +649,18 @@ fn yank_to_clipboard(text: &str) {
     {
         let mut done = false;
         if let Ok(mut child) = Command::new("xclip").args(["-selection", "clipboard"]).stdin(Stdio::piped()).spawn() {
-            if let Some(stdin) = child.stdin.as_mut() { let _ = stdin.write_all(text.as_bytes()); }
-            if child.wait().is_ok() { done = true; }
+            if let Some(stdin) = child.stdin.as_mut() {
+                let _ = stdin.write_all(text.as_bytes());
+            }
+            if child.wait().is_ok() {
+                done = true;
+            }
         }
         if !done {
             if let Ok(mut child) = Command::new("xsel").args(["--clipboard", "--input"]).stdin(Stdio::piped()).spawn() {
-                if let Some(stdin) = child.stdin.as_mut() { let _ = stdin.write_all(text.as_bytes()); }
+                if let Some(stdin) = child.stdin.as_mut() {
+                    let _ = stdin.write_all(text.as_bytes());
+                }
                 let _ = child.wait();
             }
         }

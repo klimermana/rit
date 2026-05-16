@@ -12,9 +12,7 @@ use crossterm::{
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
 };
 use ratatui::{backend::CrosstermBackend, Terminal};
-use std::io;
-use std::panic;
-use std::time::Duration;
+use std::{io, panic, time::Duration};
 
 /// Interactive terminal git log/diff viewer.
 #[derive(Parser, Debug)]

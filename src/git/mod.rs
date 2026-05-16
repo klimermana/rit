@@ -5,8 +5,7 @@ use anyhow::Result;
 use chrono::{TimeZone, Utc};
 use compact_str::CompactString;
 use crossbeam_channel::{Receiver, Sender};
-use gix::bstr::ByteSlice;
-use gix::ObjectId;
+use gix::{bstr::ByteSlice, ObjectId};
 use similar::ChangeTag;
 use std::collections::{BTreeMap, HashMap};
 
@@ -81,7 +80,10 @@ pub enum GitMsg {
     RepoInfo(RepoInfo),
     /// `gen` matches the worker's current walk generation. The app drops
     /// commits whose generation predates the most recent reload.
-    Commits { gen: u64, commits: Vec<CommitInfo> },
+    Commits {
+        gen: u64,
+        commits: Vec<CommitInfo>,
+    },
     Diff {
         target: DiffTarget,
         header_lines: Vec<DiffLine>,
@@ -90,8 +92,12 @@ pub enum GitMsg {
         files: Vec<FileStat>,
     },
     Status(Vec<DiffLine>),
-    WorkingTreeMeta { author: String },
-    WalkDone { gen: u64 },
+    WorkingTreeMeta {
+        author: String,
+    },
+    WalkDone {
+        gen: u64,
+    },
     Error(String),
 }
 
@@ -109,11 +115,7 @@ pub fn run_git_thread(req_rx: Receiver<GitReq>, msg_tx: Sender<GitMsg>, path_fil
     }
 }
 
-fn run_git_thread_inner(
-    req_rx: Receiver<GitReq>,
-    msg_tx: Sender<GitMsg>,
-    path_filter: Option<String>,
-) -> Result<()> {
+fn run_git_thread_inner(req_rx: Receiver<GitReq>, msg_tx: Sender<GitMsg>, path_filter: Option<String>) -> Result<()> {
     let repo = match gix::discover(".") {
         Ok(r) => r,
         Err(e) => {
@@ -122,10 +124,7 @@ fn run_git_thread_inner(
         }
     };
 
-    let repo_path = repo
-        .workdir()
-        .map(|p| p.to_string_lossy().into_owned())
-        .unwrap_or_else(|| ".".to_string());
+    let repo_path = repo.workdir().map(|p| p.to_string_lossy().into_owned()).unwrap_or_else(|| ".".to_string());
 
     let _ = msg_tx.send(GitMsg::RepoInfo(repo_info_for(&repo)));
     let _ = msg_tx.send(GitMsg::WorkingTreeMeta { author: working_tree_author(&repo) });
@@ -208,7 +207,8 @@ impl<'r> Walker<'r> {
 
         let target = requested.max(1);
         let mut batch: Vec<CommitInfo> = Vec::with_capacity(target.min(256));
-        // Cap iterator pulls so a path filter that rejects everything can't pin the worker.
+        // Cap iterator pulls so a path filter that rejects everything can't pin the
+        // worker.
         let pull_cap = target.saturating_mul(64);
         let mut pulls = 0usize;
 
@@ -231,7 +231,9 @@ impl<'r> Walker<'r> {
                 }
             }
 
-            if let Some(commit_info) = build_commit_info(self.repo, info.id, &parent_ids, &self.refs_map, &mut self.graph_state) {
+            if let Some(commit_info) =
+                build_commit_info(self.repo, info.id, &parent_ids, &self.refs_map, &mut self.graph_state)
+            {
                 batch.push(commit_info);
             }
         }
@@ -288,12 +290,7 @@ fn truncate_chars(s: &str, max_chars: usize) -> String {
     }
 }
 
-fn commit_touches_path(
-    repo: &gix::Repository,
-    commit_id: ObjectId,
-    parent_ids: &[ObjectId],
-    filter: &str,
-) -> bool {
+fn commit_touches_path(repo: &gix::Repository, commit_id: ObjectId, parent_ids: &[ObjectId], filter: &str) -> bool {
     commit_touches_path_inner(repo, commit_id, parent_ids, filter).unwrap_or(false)
 }
 
@@ -303,8 +300,7 @@ fn commit_touches_path_inner(
     parent_ids: &[ObjectId],
     filter: &str,
 ) -> Result<bool> {
-    use gix::diff::tree::recorder::Change;
-    use gix::objs::TreeRefIter;
+    use gix::{diff::tree::recorder::Change, objs::TreeRefIter};
 
     let cur_commit = repo.find_object(commit_id)?.try_into_commit()?;
     let cur_tree = cur_commit.tree()?;
@@ -338,13 +334,17 @@ fn commit_touches_path_inner(
 
 fn load_refs(repo: &gix::Repository) -> HashMap<ObjectId, Vec<RefLabel>> {
     let mut map: HashMap<ObjectId, Vec<RefLabel>> = HashMap::new();
-    let Ok(refs) = repo.references() else { return map };
+    let Ok(refs) = repo.references() else {
+        return map;
+    };
     let Ok(all_refs) = refs.all() else { return map };
     let head_id = repo.head_id().ok().map(|id| id.detach());
 
     for ref_result in all_refs.flatten() {
         let full_name = ref_result.name().as_bstr().to_str_lossy().into_owned();
-        let Some(target_id) = ref_result.target().try_id().map(|id| id.to_owned()) else { continue };
+        let Some(target_id) = ref_result.target().try_id().map(|id| id.to_owned()) else {
+            continue;
+        };
         let (name, kind) = if full_name == "HEAD" {
             ("HEAD".into(), RefKind::Head)
         } else if let Some(b) = full_name.strip_prefix("refs/heads/") {
@@ -360,9 +360,7 @@ fn load_refs(repo: &gix::Repository) -> HashMap<ObjectId, Vec<RefLabel>> {
     }
 
     if let Some(head) = head_id {
-        let has_head = map.get(&head)
-            .map(|ls| ls.iter().any(|l| l.kind == RefKind::Head))
-            .unwrap_or(false);
+        let has_head = map.get(&head).map(|ls| ls.iter().any(|l| l.kind == RefKind::Head)).unwrap_or(false);
         if !has_head {
             map.entry(head).or_default().insert(0, RefLabel { name: "HEAD".into(), kind: RefKind::Head });
         }
@@ -376,12 +374,7 @@ fn repo_info_for(repo: &gix::Repository) -> RepoInfo {
         .and_then(|p| p.file_name().map(|n| n.to_string_lossy().into_owned()))
         .or_else(|| std::env::current_dir().ok().and_then(|p| p.file_name().map(|n| n.to_string_lossy().into_owned())))
         .unwrap_or_else(|| "unknown".to_string());
-    let branch = repo
-        .head_name()
-        .ok()
-        .flatten()
-        .map(|n| n.shorten().to_string())
-        .unwrap_or_else(|| "HEAD".to_string());
+    let branch = repo.head_name().ok().flatten().map(|n| n.shorten().to_string()).unwrap_or_else(|| "HEAD".to_string());
     RepoInfo { name, branch }
 }
 
@@ -393,21 +386,26 @@ fn working_tree_author(repo: &gix::Repository) -> String {
             return s;
         }
     }
-    std::env::var("USER")
-        .or_else(|_| std::env::var("USERNAME"))
-        .unwrap_or_else(|_| "you".to_string())
+    std::env::var("USER").or_else(|_| std::env::var("USERNAME")).unwrap_or_else(|_| "you".to_string())
 }
 
 fn relative_time(unix_secs: i64) -> CompactString {
     let now = Utc::now();
     let t = Utc.timestamp_opt(unix_secs, 0).single().unwrap_or(now);
     let s = now.signed_duration_since(t).num_seconds();
-    if s < 60 { format!("{}s ago", s).into() }
-    else if s < 3600 { format!("{}m ago", s / 60).into() }
-    else if s < 86400 { format!("{}h ago", s / 3600).into() }
-    else if s < 86400 * 30 { format!("{}d ago", s / 86400).into() }
-    else if s < 86400 * 365 { format!("{}mo ago", s / (86400 * 30)).into() }
-    else { format!("{}y ago", s / (86400 * 365)).into() }
+    if s < 60 {
+        format!("{}s ago", s).into()
+    } else if s < 3600 {
+        format!("{}m ago", s / 60).into()
+    } else if s < 86400 {
+        format!("{}h ago", s / 3600).into()
+    } else if s < 86400 * 30 {
+        format!("{}d ago", s / 86400).into()
+    } else if s < 86400 * 365 {
+        format!("{}mo ago", s / (86400 * 30)).into()
+    } else {
+        format!("{}y ago", s / (86400 * 365)).into()
+    }
 }
 
 struct DiffPayload {
@@ -447,10 +445,7 @@ fn compute_commit_diff_inner(repo: &gix::Repository, id: ObjectId) -> Result<Dif
         DiffLineKind::Meta,
         format!("Author:     {} <{}>", author.name.to_str_lossy(), author.email.to_str_lossy()),
     ));
-    header.push(DiffLine::new(
-        DiffLineKind::Meta,
-        format!("AuthorDate: {}", format_timestamp(author.time()?.seconds)),
-    ));
+    header.push(DiffLine::new(DiffLineKind::Meta, format!("AuthorDate: {}", format_timestamp(author.time()?.seconds))));
     header.push(DiffLine::new(
         DiffLineKind::Meta,
         format!("Commit:     {} <{}>", committer.name.to_str_lossy(), committer.email.to_str_lossy()),
@@ -460,10 +455,7 @@ fn compute_commit_diff_inner(repo: &gix::Repository, id: ObjectId) -> Result<Dif
         format!("CommitDate: {}", format_timestamp(committer.time()?.seconds)),
     ));
     header.push(DiffLine::new(DiffLineKind::Blank, ""));
-    header.push(DiffLine::new(
-        DiffLineKind::Message,
-        format!("    {}", decoded.message_summary().to_str_lossy()),
-    ));
+    header.push(DiffLine::new(DiffLineKind::Message, format!("    {}", decoded.message_summary().to_str_lossy())));
     header.push(DiffLine::new(DiffLineKind::Blank, ""));
 
     let cur_tree = commit_obj.tree()?;
@@ -487,8 +479,7 @@ fn diff_trees<'r>(
     stats: &mut DiffStats,
     files: &mut Vec<FileStat>,
 ) -> Result<()> {
-    use gix::diff::tree::recorder::Change;
-    use gix::objs::TreeRefIter;
+    use gix::{diff::tree::recorder::Change, objs::TreeRefIter};
 
     let hash_kind = repo.object_hash();
     let mut recorder = gix::diff::tree::Recorder::default();
@@ -543,7 +534,8 @@ fn diff_trees<'r>(
                 lines.push(DiffLine::new(DiffLineKind::FileHeader, format!("diff --git a/{p} b/{p}")));
                 lines.push(DiffLine::new(DiffLineKind::OldMarker, format!("--- a/{p}")));
                 lines.push(DiffLine::new(DiffLineKind::NewMarker, format!("+++ b/{p}")));
-                let old = repo.find_object(*previous_oid).map(|o| o.data.to_str_lossy().into_owned()).unwrap_or_default();
+                let old =
+                    repo.find_object(*previous_oid).map(|o| o.data.to_str_lossy().into_owned()).unwrap_or_default();
                 let new = repo.find_object(*oid).map(|o| o.data.to_str_lossy().into_owned()).unwrap_or_default();
                 let diff = similar::TextDiff::from_lines(old.as_str(), new.as_str());
                 let mut file_add = 0usize;
@@ -597,11 +589,7 @@ fn push_change(
 }
 
 fn format_timestamp(unix_secs: i64) -> String {
-    Utc.timestamp_opt(unix_secs, 0)
-        .single()
-        .unwrap_or_else(Utc::now)
-        .format("%a %b %e %T %Y +0000")
-        .to_string()
+    Utc.timestamp_opt(unix_secs, 0).single().unwrap_or_else(Utc::now).format("%a %b %e %T %Y +0000").to_string()
 }
 
 // Working-tree status is still produced by shelling out to `git`. The
@@ -634,10 +622,7 @@ fn compute_status(repo_path: &str) -> Vec<DiffLine> {
     }
 
     lines.push(DiffLine::new(DiffLineKind::Blank, ""));
-    lines.push(DiffLine::new(
-        DiffLineKind::SectionStaged,
-        "── Staged ──────────────────────────────────────────────",
-    ));
+    lines.push(DiffLine::new(DiffLineKind::SectionStaged, "── Staged ──────────────────────────────────────────────"));
     lines.push(DiffLine::new(DiffLineKind::Blank, ""));
 
     if let Ok(out) = Command::new("git").args(["-C", repo_path, "diff", "--cached"]).output() {
@@ -645,15 +630,15 @@ fn compute_status(repo_path: &str) -> Vec<DiffLine> {
         if s.trim().is_empty() {
             lines.push(DiffLine::new(DiffLineKind::Faint, "(no staged changes)"));
         } else {
-            for line in s.lines() { lines.push(classify_raw_diff_line(line)); }
+            for line in s.lines() {
+                lines.push(classify_raw_diff_line(line));
+            }
         }
     }
 
     lines.push(DiffLine::new(DiffLineKind::Blank, ""));
-    lines.push(DiffLine::new(
-        DiffLineKind::SectionUnstaged,
-        "── Unstaged ────────────────────────────────────────────",
-    ));
+    lines
+        .push(DiffLine::new(DiffLineKind::SectionUnstaged, "── Unstaged ────────────────────────────────────────────"));
     lines.push(DiffLine::new(DiffLineKind::Blank, ""));
 
     if let Ok(out) = Command::new("git").args(["-C", repo_path, "diff"]).output() {
@@ -661,7 +646,9 @@ fn compute_status(repo_path: &str) -> Vec<DiffLine> {
         if s.trim().is_empty() {
             lines.push(DiffLine::new(DiffLineKind::Faint, "(no unstaged changes)"));
         } else {
-            for line in s.lines() { lines.push(classify_raw_diff_line(line)); }
+            for line in s.lines() {
+                lines.push(classify_raw_diff_line(line));
+            }
         }
     }
 
@@ -669,7 +656,11 @@ fn compute_status(repo_path: &str) -> Vec<DiffLine> {
 }
 
 fn classify_raw_diff_line(line: &str) -> DiffLine {
-    let kind = if line.starts_with("+++") || line.starts_with("---") || line.starts_with("diff ") || line.starts_with("index ") {
+    let kind = if line.starts_with("+++")
+        || line.starts_with("---")
+        || line.starts_with("diff ")
+        || line.starts_with("index ")
+    {
         DiffLineKind::Faint
     } else if line.starts_with('+') {
         DiffLineKind::Add
@@ -718,7 +709,9 @@ fn run_numstat(repo_path: &str, cached: bool) -> Vec<FileStat> {
     let mut result = Vec::new();
     for line in s.lines() {
         let mut parts = line.splitn(3, '\t');
-        let (Some(a), Some(d), Some(p)) = (parts.next(), parts.next(), parts.next()) else { continue };
+        let (Some(a), Some(d), Some(p)) = (parts.next(), parts.next(), parts.next()) else {
+            continue;
+        };
         let additions = a.parse().unwrap_or(0);
         let deletions = d.parse().unwrap_or(0);
         result.push(FileStat { path: p.to_string(), additions, deletions });

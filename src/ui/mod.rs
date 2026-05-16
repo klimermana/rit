@@ -2,8 +2,10 @@ pub mod diff_view;
 pub mod help;
 pub mod log_view;
 
-use crate::app::App;
-use crate::git::{DiffLine, DiffLineKind};
+use crate::{
+    app::App,
+    git::{DiffLine, DiffLineKind},
+};
 use ratatui::{
     layout::{Constraint, Direction, Layout, Rect},
     style::{Color, Modifier, Style},
@@ -29,9 +31,7 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
     // Title bar
     let title = format!(" rit  {}  [{}] ", app.repo_name, app.branch_name);
     frame.render_widget(
-        Paragraph::new(title).style(
-            Style::default().bg(Color::DarkGray).fg(Color::White).add_modifier(Modifier::BOLD),
-        ),
+        Paragraph::new(title).style(Style::default().bg(Color::DarkGray).fg(Color::White).add_modifier(Modifier::BOLD)),
         chunks[0],
     );
 
@@ -40,7 +40,9 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
     if app.status.open {
         draw_status_view(frame, app, main_area);
         draw_status_bar(frame, app, chunks[2]);
-        if app.show_help { help::draw_help(frame, size); }
+        if app.show_help {
+            help::draw_help(frame, size);
+        }
         return;
     }
 
@@ -76,7 +78,9 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
 
     draw_status_bar(frame, app, chunks[2]);
 
-    if app.show_help { help::draw_help(frame, size); }
+    if app.show_help {
+        help::draw_help(frame, size);
+    }
 }
 
 fn draw_status_view(frame: &mut Frame, app: &App, area: Rect) {
@@ -90,7 +94,9 @@ fn draw_status_view(frame: &mut Frame, app: &App, area: Rect) {
 
     let height = inner.height as usize;
     let total = app.status.lines.len();
-    if total == 0 { return; }
+    if total == 0 {
+        return;
+    }
     let scroll = app.status.scroll.min(total.saturating_sub(1));
     let end = (scroll + height).min(total);
     let visible: Vec<Line> = app.status.lines[scroll..end].iter().map(diff_line_to_ratatui).collect();
@@ -120,9 +126,7 @@ fn draw_status_bar(frame: &mut Frame, app: &App, area: Rect) {
     } else if app.status.open {
         Line::from(Span::raw(" q/Esc/s:close-status  j/k:scroll  g/G:top/bottom"))
     } else if app.diff.open {
-        Line::from(Span::raw(
-            " q/Esc:close-diff  j/k:nav  Tab:switch  v:hunks  y:yank  ?:help",
-        ))
+        Line::from(Span::raw(" q/Esc:close-diff  j/k:nav  Tab:switch  v:hunks  y:yank  ?:help"))
     } else {
         let loading = if !app.walk_done { " [loading…]" } else { "" };
         Line::from(Span::raw(format!(
@@ -132,10 +136,7 @@ fn draw_status_bar(frame: &mut Frame, app: &App, area: Rect) {
         )))
     };
 
-    frame.render_widget(
-        Paragraph::new(text).style(Style::default().bg(Color::DarkGray).fg(Color::Gray)),
-        area,
-    );
+    frame.render_widget(Paragraph::new(text).style(Style::default().bg(Color::DarkGray).fg(Color::Gray)), area);
 }
 
 pub fn diff_line_to_ratatui(line: &DiffLine) -> Line<'static> {
