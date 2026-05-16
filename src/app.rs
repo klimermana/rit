@@ -1,4 +1,4 @@
-use crate::git::{DiffLine, DiffStats, GitMsg, GitReq, RepoInfo};
+use crate::git::{DiffLine, DiffStats, DiffTarget, FileStat, GitMsg, GitReq, RepoInfo};
 use crate::ui;
 use anyhow::Result;
 use compact_str::CompactString;
@@ -27,6 +27,15 @@ pub struct CommitInfo {
     pub graph: CompactString,
 }
 
+pub struct WorkingTreeRow {
+    pub author: CompactString,
+}
+
+pub enum LogRow {
+    WorkingTree(WorkingTreeRow),
+    Commit(CommitInfo),
+}
+
 #[derive(Clone)]
 pub struct RefLabel {
     pub name: CompactString,
@@ -47,7 +56,7 @@ pub enum Focus {
 }
 
 pub struct LogState {
-    pub commits: Vec<CommitInfo>,
+    pub rows: Vec<LogRow>,
     pub selected: usize,
     pub scroll: usize,
     /// Inner height of the log pane, updated by the renderer each frame.
@@ -62,12 +71,15 @@ pub struct SearchState {
 
 pub struct DiffState {
     pub open: bool,
-    pub for_commit: Option<gix::ObjectId>,
-    pub lines: Option<Vec<DiffLine>>,
+    pub target: Option<DiffTarget>,
+    pub header_lines: Option<Vec<DiffLine>>,
+    pub body_lines: Option<Vec<DiffLine>>,
+    pub files: Option<Vec<FileStat>>,
     pub stats: Option<DiffStats>,
     pub scroll: usize,
     pub loading: bool,
     pub show_line_numbers: bool,
+    pub show_hunks: bool,
 }
 
 pub struct StatusState {
@@ -106,17 +118,21 @@ pub struct App {
 
 impl App {
     pub fn new(tx: Sender<GitReq>, rx: Receiver<GitMsg>, input_rx: Receiver<KeyEvent>) -> Self {
+        let rows = vec![LogRow::WorkingTree(WorkingTreeRow { author: "you".into() })];
         Self {
-            log: LogState { commits: Vec::new(), selected: 0, scroll: 0, view_height: 1 },
+            log: LogState { rows, selected: 0, scroll: 0, view_height: 1 },
             search: SearchState { active: false, query: String::new(), matches: Vec::new() },
             diff: DiffState {
                 open: false,
-                for_commit: None,
-                lines: None,
+                target: None,
+                header_lines: None,
+                body_lines: None,
+                files: None,
                 stats: None,
                 scroll: 0,
                 loading: false,
                 show_line_numbers: true,
+                show_hunks: true,
             },
             status: StatusState { open: false, lines: Vec::new(), scroll: 0, loading: false },
             focus: Focus::Log,
@@ -218,15 +234,17 @@ impl App {
             }
             GitMsg::Commits { gen, commits } => {
                 if gen != self.walk_gen { return; }
-                self.log.commits.extend(commits);
+                self.log.rows.extend(commits.into_iter().map(LogRow::Commit));
                 if !self.search.query.is_empty() {
                     self.update_search_matches();
                 }
             }
-            GitMsg::Diff { id, lines, stats } => {
-                if self.diff.for_commit == Some(id) {
+            GitMsg::Diff { target, header_lines, body_lines, stats, files } => {
+                if self.diff.target == Some(target) {
                     self.diff.loading = false;
-                    self.diff.lines = Some(lines);
+                    self.diff.header_lines = Some(header_lines);
+                    self.diff.body_lines = Some(body_lines);
+                    self.diff.files = Some(files);
                     self.diff.stats = Some(stats);
                     self.diff.scroll = 0;
                 }
@@ -234,6 +252,11 @@ impl App {
             GitMsg::Status(lines) => {
                 self.status.loading = false;
                 self.status.lines = lines;
+            }
+            GitMsg::WorkingTreeMeta { author } => {
+                if let Some(LogRow::WorkingTree(w)) = self.log.rows.first_mut() {
+                    w.author = author.into();
+                }
             }
             GitMsg::WalkDone { gen } => {
                 if gen == self.walk_gen {
@@ -320,6 +343,10 @@ impl App {
             (_, Char('c'), Mod::CONTROL) => self.should_quit = true,
             (_, Char('?'), Mod::NONE) => self.show_help = true,
             (_, Char('#'), Mod::NONE) => self.diff.show_line_numbers = !self.diff.show_line_numbers,
+            (_, Char('v'), Mod::NONE) if self.diff.open => {
+                self.diff.show_hunks = !self.diff.show_hunks;
+                self.diff.scroll = 0;
+            }
             (_, Char('y'), Mod::NONE) => self.yank_selected_hash(),
             (Focus::Log, Char('/'), Mod::NONE) => {
                 self.search.active = true;
@@ -365,9 +392,8 @@ impl App {
             (Focus::Diff, Char('k') | Up, Mod::NONE) => self.diff.scroll = self.diff.scroll.saturating_sub(1),
             (Focus::Diff, Char('g'), Mod::NONE) => self.diff.scroll = 0,
             (Focus::Diff, Char('G'), Mod::NONE) => {
-                if let Some(lines) = &self.diff.lines {
-                    self.diff.scroll = lines.len().saturating_sub(1);
-                }
+                let total = self.diff.total_visible_lines();
+                self.diff.scroll = total.saturating_sub(1);
             }
             (Focus::Diff, Char('d'), Mod::CONTROL) => self.diff.scroll = self.diff.scroll.saturating_add(HALF_PAGE),
             (Focus::Diff, Char('u'), Mod::CONTROL) => self.diff.scroll = self.diff.scroll.saturating_sub(HALF_PAGE),
@@ -376,11 +402,17 @@ impl App {
     }
 
     fn reload(&mut self) {
-        self.log.commits.clear();
+        let author = match self.log.rows.first() {
+            Some(LogRow::WorkingTree(w)) => w.author.clone(),
+            _ => "you".into(),
+        };
+        self.log.rows = vec![LogRow::WorkingTree(WorkingTreeRow { author })];
         self.log.selected = 0;
         self.log.scroll = 0;
-        self.diff.lines = None;
-        self.diff.for_commit = None;
+        self.diff.header_lines = None;
+        self.diff.body_lines = None;
+        self.diff.files = None;
+        self.diff.target = None;
         self.diff.stats = None;
         self.diff.loading = false;
         self.status.lines.clear();
@@ -390,19 +422,19 @@ impl App {
         self.walk_gen = self.walk_gen.wrapping_add(1);
         self.error = None;
         let _ = self.tx.send(GitReq::Reload);
+        let _ = self.tx.send(GitReq::CheckWorkingTree);
         let _ = self.tx.send(GitReq::LoadMore(INITIAL_LOAD));
     }
 
     fn move_log_down(&mut self, n: usize) {
-        if self.log.commits.is_empty() { return; }
-        let new_sel = (self.log.selected + n).min(self.log.commits.len() - 1);
+        if self.log.rows.is_empty() { return; }
+        let new_sel = (self.log.selected + n).min(self.log.rows.len() - 1);
         if new_sel != self.log.selected {
             self.log.selected = new_sel;
             self.maybe_prefetch();
             self.ensure_selected_visible();
             if self.diff.open { self.fetch_diff_for_selected(); }
-        } else if new_sel + 1 == self.log.commits.len() {
-            // Already at end; if more commits are pending, request a page.
+        } else if new_sel + 1 == self.log.rows.len() {
             self.maybe_prefetch();
         }
     }
@@ -423,8 +455,8 @@ impl App {
     }
 
     fn jump_log_bottom(&mut self) {
-        if self.log.commits.is_empty() { return; }
-        self.log.selected = self.log.commits.len() - 1;
+        if self.log.rows.is_empty() { return; }
+        self.log.selected = self.log.rows.len() - 1;
         if !self.walk_done {
             let _ = self.tx.send(GitReq::LoadMore(LOAD_PAGE));
         }
@@ -433,7 +465,7 @@ impl App {
     }
 
     fn maybe_prefetch(&self) {
-        if !self.walk_done && self.log.selected + PREFETCH_THRESHOLD >= self.log.commits.len() {
+        if !self.walk_done && self.log.selected + PREFETCH_THRESHOLD >= self.log.rows.len() {
             let _ = self.tx.send(GitReq::LoadMore(LOAD_PAGE));
         }
     }
@@ -448,15 +480,19 @@ impl App {
     }
 
     fn fetch_diff_for_selected(&mut self) {
-        if let Some(c) = self.log.commits.get(self.log.selected) {
-            let id = c.id;
-            if self.diff.for_commit != Some(id) {
-                self.diff.for_commit = Some(id);
-                self.diff.lines = None;
-                self.diff.stats = None;
-                self.diff.loading = true;
-                let _ = self.tx.send(GitReq::FetchDiff(id));
-            }
+        let Some(row) = self.log.rows.get(self.log.selected) else { return };
+        let target = match row {
+            LogRow::Commit(c) => DiffTarget::Commit(c.id),
+            LogRow::WorkingTree(_) => DiffTarget::WorkingTree,
+        };
+        if self.diff.target != Some(target) {
+            self.diff.target = Some(target);
+            self.diff.header_lines = None;
+            self.diff.body_lines = None;
+            self.diff.files = None;
+            self.diff.stats = None;
+            self.diff.loading = true;
+            let _ = self.tx.send(GitReq::FetchDiff(target));
         }
     }
 
@@ -465,9 +501,15 @@ impl App {
         self.search.matches = if q.is_empty() {
             Vec::new()
         } else {
-            self.log.commits.iter().enumerate()
-                .filter(|(_, c)| c.summary_lower.contains(&q) || c.author_lower.contains(q.as_str()))
-                .map(|(i, _)| i)
+            self.log.rows.iter().enumerate()
+                .filter_map(|(i, row)| match row {
+                    LogRow::Commit(c)
+                        if c.summary_lower.contains(&q) || c.author_lower.contains(q.as_str()) =>
+                    {
+                        Some(i)
+                    }
+                    _ => None,
+                })
                 .collect()
         };
     }
@@ -506,20 +548,49 @@ impl App {
     }
 
     fn yank_selected_hash(&mut self) {
-        if let Some(commit) = self.log.commits.get(self.log.selected) {
-            let hash = commit.id.to_string();
-            yank_to_clipboard(&hash);
-            // hash is hex ASCII, so 12-byte prefix is safe.
-            let preview = if hash.len() >= 12 { &hash[..12] } else { hash.as_str() };
-            self.yank_message = Some(YankFeedback {
-                text: format!("Copied: {}", preview),
-                shown_at: Instant::now(),
-            });
-        }
+        let Some(LogRow::Commit(commit)) = self.log.rows.get(self.log.selected) else { return };
+        let hash = commit.id.to_string();
+        yank_to_clipboard(&hash);
+        // hash is hex ASCII, so 12-byte prefix is safe.
+        let preview = if hash.len() >= 12 { &hash[..12] } else { hash.as_str() };
+        self.yank_message = Some(YankFeedback {
+            text: format!("Copied: {}", preview),
+            shown_at: Instant::now(),
+        });
     }
 
     pub fn author_col_width(&self) -> usize { AUTHOR_COL_WIDTH }
     pub fn date_col_width(&self) -> usize { DATE_COL_WIDTH }
+
+    /// Number of real commits in the log (excludes the pseudo "Not Committed Yet" row).
+    pub fn commits_len(&self) -> usize {
+        self.log.rows.iter().filter(|r| matches!(r, LogRow::Commit(_))).count()
+    }
+}
+
+impl DiffState {
+    /// Total number of rendered lines: header + synthesised diffstat block +
+    /// (when `show_hunks`) body.
+    pub fn total_visible_lines(&self) -> usize {
+        let header = self.header_lines.as_ref().map(|v| v.len()).unwrap_or(0);
+        let diffstat = self.diffstat_line_count();
+        let body = if self.show_hunks {
+            self.body_lines.as_ref().map(|v| v.len()).unwrap_or(0)
+        } else {
+            0
+        };
+        header + diffstat + body
+    }
+
+    pub fn diffstat_line_count(&self) -> usize {
+        match &self.files {
+            Some(files) if !files.is_empty() => {
+                // separator line `---`, one row per file, blank, totals line
+                files.len() + 3
+            }
+            _ => 0,
+        }
+    }
 }
 
 #[cfg(any(target_os = "macos", target_os = "linux"))]

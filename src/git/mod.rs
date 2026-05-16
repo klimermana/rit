@@ -8,13 +8,20 @@ use crossbeam_channel::{Receiver, Sender};
 use gix::bstr::ByteSlice;
 use gix::ObjectId;
 use similar::ChangeTag;
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 
 const AUTHOR_DISPLAY_CHARS: usize = 20;
 
 pub struct DiffStats {
     pub files: usize,
     pub insertions: usize,
+    pub deletions: usize,
+}
+
+#[derive(Clone)]
+pub struct FileStat {
+    pub path: String,
+    pub additions: usize,
     pub deletions: usize,
 }
 
@@ -35,6 +42,9 @@ pub enum DiffLineKind {
     Add,
     Del,
     Context,
+    // Diffstat block
+    Diffstat,
+    DiffstatTotal,
     // Status view
     SectionTitle,
     SectionStaged,
@@ -61,21 +71,35 @@ pub struct RepoInfo {
     pub branch: String,
 }
 
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum DiffTarget {
+    Commit(ObjectId),
+    WorkingTree,
+}
+
 pub enum GitMsg {
     RepoInfo(RepoInfo),
     /// `gen` matches the worker's current walk generation. The app drops
     /// commits whose generation predates the most recent reload.
     Commits { gen: u64, commits: Vec<CommitInfo> },
-    Diff { id: ObjectId, lines: Vec<DiffLine>, stats: DiffStats },
+    Diff {
+        target: DiffTarget,
+        header_lines: Vec<DiffLine>,
+        body_lines: Vec<DiffLine>,
+        stats: DiffStats,
+        files: Vec<FileStat>,
+    },
     Status(Vec<DiffLine>),
+    WorkingTreeMeta { author: String },
     WalkDone { gen: u64 },
     Error(String),
 }
 
 pub enum GitReq {
     LoadMore(usize),
-    FetchDiff(ObjectId),
+    FetchDiff(DiffTarget),
     FetchStatus,
+    CheckWorkingTree,
     Reload,
 }
 
@@ -104,6 +128,7 @@ fn run_git_thread_inner(
         .unwrap_or_else(|| ".".to_string());
 
     let _ = msg_tx.send(GitMsg::RepoInfo(repo_info_for(&repo)));
+    let _ = msg_tx.send(GitMsg::WorkingTreeMeta { author: working_tree_author(&repo) });
 
     let mut walker = Walker::new(&repo, path_filter.as_deref(), 0)?;
 
@@ -112,13 +137,25 @@ fn run_git_thread_inner(
             GitReq::LoadMore(n) => {
                 walker.load_more(n, &msg_tx)?;
             }
-            GitReq::FetchDiff(id) => {
-                let (lines, stats) = compute_diff(&repo, id);
-                let _ = msg_tx.send(GitMsg::Diff { id, lines, stats });
+            GitReq::FetchDiff(target) => {
+                let payload = match target {
+                    DiffTarget::Commit(id) => compute_commit_diff(&repo, id),
+                    DiffTarget::WorkingTree => compute_working_tree_diff(&repo_path),
+                };
+                let _ = msg_tx.send(GitMsg::Diff {
+                    target,
+                    header_lines: payload.header,
+                    body_lines: payload.body,
+                    stats: payload.stats,
+                    files: payload.files,
+                });
             }
             GitReq::FetchStatus => {
                 let lines = compute_status(&repo_path);
                 let _ = msg_tx.send(GitMsg::Status(lines));
+            }
+            GitReq::CheckWorkingTree => {
+                let _ = msg_tx.send(GitMsg::WorkingTreeMeta { author: working_tree_author(&repo) });
             }
             GitReq::Reload => {
                 let next_gen = walker.gen.wrapping_add(1);
@@ -346,6 +383,19 @@ fn repo_info_for(repo: &gix::Repository) -> RepoInfo {
     RepoInfo { name, branch }
 }
 
+fn working_tree_author(repo: &gix::Repository) -> String {
+    // Prefer git config user.name; fall back to env, then a literal.
+    if let Some(name) = repo.config_snapshot().string("user.name") {
+        let s = name.to_string();
+        if !s.trim().is_empty() {
+            return s;
+        }
+    }
+    std::env::var("USER")
+        .or_else(|_| std::env::var("USERNAME"))
+        .unwrap_or_else(|_| "you".to_string())
+}
+
 fn relative_time(unix_secs: i64) -> CompactString {
     let now = Utc::now();
     let t = Utc.timestamp_opt(unix_secs, 0).single().unwrap_or(now);
@@ -358,50 +408,73 @@ fn relative_time(unix_secs: i64) -> CompactString {
     else { format!("{}y ago", s / (86400 * 365)).into() }
 }
 
-fn compute_diff(repo: &gix::Repository, id: ObjectId) -> (Vec<DiffLine>, DiffStats) {
-    match compute_diff_inner(repo, id) {
-        Ok(r) => r,
-        Err(e) => (
-            vec![DiffLine::new(DiffLineKind::Faint, format!("Error: {}", e))],
-            DiffStats { files: 0, insertions: 0, deletions: 0 },
-        ),
+struct DiffPayload {
+    header: Vec<DiffLine>,
+    body: Vec<DiffLine>,
+    stats: DiffStats,
+    files: Vec<FileStat>,
+}
+
+impl DiffPayload {
+    fn empty_error(e: anyhow::Error) -> Self {
+        Self {
+            header: vec![DiffLine::new(DiffLineKind::Faint, format!("Error: {}", e))],
+            body: Vec::new(),
+            stats: DiffStats { files: 0, insertions: 0, deletions: 0 },
+            files: Vec::new(),
+        }
     }
 }
 
-fn compute_diff_inner(repo: &gix::Repository, id: ObjectId) -> Result<(Vec<DiffLine>, DiffStats)> {
+fn compute_commit_diff(repo: &gix::Repository, id: ObjectId) -> DiffPayload {
+    compute_commit_diff_inner(repo, id).unwrap_or_else(DiffPayload::empty_error)
+}
+
+fn compute_commit_diff_inner(repo: &gix::Repository, id: ObjectId) -> Result<DiffPayload> {
     let commit_obj = repo.find_object(id)?.try_into_commit()?;
     let decoded = commit_obj.decode()?;
-    let mut lines: Vec<DiffLine> = Vec::new();
+    let mut header: Vec<DiffLine> = Vec::new();
+    let mut body: Vec<DiffLine> = Vec::new();
     let mut stats = DiffStats { files: 0, insertions: 0, deletions: 0 };
+    let mut files: Vec<FileStat> = Vec::new();
 
-    lines.push(DiffLine::new(DiffLineKind::CommitHeader, format!("commit {}", id)));
+    header.push(DiffLine::new(DiffLineKind::CommitHeader, format!("commit {}", id)));
     let author = decoded.author();
-    lines.push(DiffLine::new(
+    let committer = decoded.committer();
+    header.push(DiffLine::new(
         DiffLineKind::Meta,
-        format!("Author: {} <{}>", author.name.to_str_lossy(), author.email.to_str_lossy()),
+        format!("Author:     {} <{}>", author.name.to_str_lossy(), author.email.to_str_lossy()),
     ));
-    lines.push(DiffLine::new(
+    header.push(DiffLine::new(
         DiffLineKind::Meta,
-        format!("Date:   {}", format_timestamp(author.time.seconds)),
+        format!("AuthorDate: {}", format_timestamp(author.time.seconds)),
     ));
-    lines.push(DiffLine::new(DiffLineKind::Blank, ""));
-    lines.push(DiffLine::new(
+    header.push(DiffLine::new(
+        DiffLineKind::Meta,
+        format!("Commit:     {} <{}>", committer.name.to_str_lossy(), committer.email.to_str_lossy()),
+    ));
+    header.push(DiffLine::new(
+        DiffLineKind::Meta,
+        format!("CommitDate: {}", format_timestamp(committer.time.seconds)),
+    ));
+    header.push(DiffLine::new(DiffLineKind::Blank, ""));
+    header.push(DiffLine::new(
         DiffLineKind::Message,
         format!("    {}", decoded.message_summary().to_str_lossy()),
     ));
-    lines.push(DiffLine::new(DiffLineKind::Blank, ""));
+    header.push(DiffLine::new(DiffLineKind::Blank, ""));
 
     let cur_tree = commit_obj.tree()?;
     let parent_ids: Vec<ObjectId> = decoded.parents().collect();
 
     if parent_ids.is_empty() {
-        diff_trees(repo, &repo.empty_tree(), &cur_tree, &mut lines, &mut stats)?;
+        diff_trees(repo, &repo.empty_tree(), &cur_tree, &mut body, &mut stats, &mut files)?;
     } else {
         let par_tree = repo.find_object(parent_ids[0])?.try_into_commit()?.tree()?;
-        diff_trees(repo, &par_tree, &cur_tree, &mut lines, &mut stats)?;
+        diff_trees(repo, &par_tree, &cur_tree, &mut body, &mut stats, &mut files)?;
     }
 
-    Ok((lines, stats))
+    Ok(DiffPayload { header, body, stats, files })
 }
 
 fn diff_trees<'r>(
@@ -410,6 +483,7 @@ fn diff_trees<'r>(
     new_tree: &gix::Tree<'r>,
     lines: &mut Vec<DiffLine>,
     stats: &mut DiffStats,
+    files: &mut Vec<FileStat>,
 ) -> Result<()> {
     use gix::diff::tree::recorder::Change;
     use gix::objs::TreeRefIter;
@@ -426,44 +500,51 @@ fn diff_trees<'r>(
     for change in &recorder.records {
         match change {
             Change::Addition { entry_mode, oid, path, .. } if entry_mode.is_blob() => {
-                stats.files += 1;
-                let p = path.to_str_lossy();
+                let p = path.to_str_lossy().into_owned();
                 lines.push(DiffLine::new(DiffLineKind::FileHeader, format!("diff --git a/{p} b/{p}")));
                 lines.push(DiffLine::new(DiffLineKind::FileMeta, "new file"));
                 lines.push(DiffLine::new(DiffLineKind::OldMarker, "--- /dev/null"));
                 lines.push(DiffLine::new(DiffLineKind::NewMarker, format!("+++ b/{p}")));
+                let mut file_add = 0usize;
                 if let Ok(blob) = repo.find_object(*oid) {
                     let content = blob.data.to_str_lossy();
                     for line in content.lines() {
                         stats.insertions += 1;
+                        file_add += 1;
                         lines.push(DiffLine::new(DiffLineKind::Add, format!("+{}", line)));
                     }
                 }
+                stats.files += 1;
+                files.push(FileStat { path: p, additions: file_add, deletions: 0 });
             }
             Change::Deletion { entry_mode, oid, path, .. } if entry_mode.is_blob() => {
-                stats.files += 1;
-                let p = path.to_str_lossy();
+                let p = path.to_str_lossy().into_owned();
                 lines.push(DiffLine::new(DiffLineKind::FileHeader, format!("diff --git a/{p} b/{p}")));
                 lines.push(DiffLine::new(DiffLineKind::FileMeta, "deleted file"));
                 lines.push(DiffLine::new(DiffLineKind::OldMarker, format!("--- a/{p}")));
                 lines.push(DiffLine::new(DiffLineKind::NewMarker, "+++ /dev/null"));
+                let mut file_del = 0usize;
                 if let Ok(blob) = repo.find_object(*oid) {
                     let content = blob.data.to_str_lossy();
                     for line in content.lines() {
                         stats.deletions += 1;
+                        file_del += 1;
                         lines.push(DiffLine::new(DiffLineKind::Del, format!("-{}", line)));
                     }
                 }
+                stats.files += 1;
+                files.push(FileStat { path: p, additions: 0, deletions: file_del });
             }
             Change::Modification { entry_mode, previous_oid, oid, path, .. } if entry_mode.is_blob() => {
-                stats.files += 1;
-                let p = path.to_str_lossy();
+                let p = path.to_str_lossy().into_owned();
                 lines.push(DiffLine::new(DiffLineKind::FileHeader, format!("diff --git a/{p} b/{p}")));
                 lines.push(DiffLine::new(DiffLineKind::OldMarker, format!("--- a/{p}")));
                 lines.push(DiffLine::new(DiffLineKind::NewMarker, format!("+++ b/{p}")));
                 let old = repo.find_object(*previous_oid).map(|o| o.data.to_str_lossy().into_owned()).unwrap_or_default();
                 let new = repo.find_object(*oid).map(|o| o.data.to_str_lossy().into_owned()).unwrap_or_default();
                 let diff = similar::TextDiff::from_lines(old.as_str(), new.as_str());
+                let mut file_add = 0usize;
+                let mut file_del = 0usize;
                 for group in diff.grouped_ops(3) {
                     let or = group.first().map(|op| op.old_range()).unwrap_or(0..0);
                     let nr = group.first().map(|op| op.new_range()).unwrap_or(0..0);
@@ -473,10 +554,12 @@ fn diff_trees<'r>(
                     ));
                     for op in &group {
                         for ch in diff.iter_changes(op) {
-                            push_change(lines, stats, ch.tag(), ch.value());
+                            push_change(lines, stats, &mut file_add, &mut file_del, ch.tag(), ch.value());
                         }
                     }
                 }
+                stats.files += 1;
+                files.push(FileStat { path: p, additions: file_add, deletions: file_del });
             }
             _ => {}
         }
@@ -484,15 +567,24 @@ fn diff_trees<'r>(
     Ok(())
 }
 
-fn push_change(lines: &mut Vec<DiffLine>, stats: &mut DiffStats, tag: ChangeTag, value: &str) {
+fn push_change(
+    lines: &mut Vec<DiffLine>,
+    stats: &mut DiffStats,
+    file_add: &mut usize,
+    file_del: &mut usize,
+    tag: ChangeTag,
+    value: &str,
+) {
     let v = value.trim_end_matches('\n');
     match tag {
         ChangeTag::Insert => {
             stats.insertions += 1;
+            *file_add += 1;
             lines.push(DiffLine::new(DiffLineKind::Add, format!("+{}", v)));
         }
         ChangeTag::Delete => {
             stats.deletions += 1;
+            *file_del += 1;
             lines.push(DiffLine::new(DiffLineKind::Del, format!("-{}", v)));
         }
         ChangeTag::Equal => {
@@ -586,4 +678,47 @@ fn classify_raw_diff_line(line: &str) -> DiffLine {
         DiffLineKind::Context
     };
     DiffLine::new(kind, line)
+}
+
+fn compute_working_tree_diff(repo_path: &str) -> DiffPayload {
+    let body = compute_status(repo_path);
+    let mut by_path: BTreeMap<String, (usize, usize)> = BTreeMap::new();
+    for fs in run_numstat(repo_path, true).into_iter().chain(run_numstat(repo_path, false)) {
+        let entry = by_path.entry(fs.path).or_insert((0, 0));
+        entry.0 += fs.additions;
+        entry.1 += fs.deletions;
+    }
+    let mut totals = DiffStats { files: 0, insertions: 0, deletions: 0 };
+    let files: Vec<FileStat> = by_path
+        .into_iter()
+        .map(|(path, (a, d))| {
+            totals.files += 1;
+            totals.insertions += a;
+            totals.deletions += d;
+            FileStat { path, additions: a, deletions: d }
+        })
+        .collect();
+    DiffPayload { header: Vec::new(), body, stats: totals, files }
+}
+
+fn run_numstat(repo_path: &str, cached: bool) -> Vec<FileStat> {
+    use std::process::Command;
+    let mut args: Vec<&str> = vec!["-C", repo_path, "diff", "--numstat"];
+    if cached {
+        args.push("--cached");
+    }
+    let out = match Command::new("git").args(&args).output() {
+        Ok(o) => o,
+        Err(_) => return Vec::new(),
+    };
+    let s = String::from_utf8_lossy(&out.stdout);
+    let mut result = Vec::new();
+    for line in s.lines() {
+        let mut parts = line.splitn(3, '\t');
+        let (Some(a), Some(d), Some(p)) = (parts.next(), parts.next(), parts.next()) else { continue };
+        let additions = a.parse().unwrap_or(0);
+        let deletions = d.parse().unwrap_or(0);
+        result.push(FileStat { path: p.to_string(), additions, deletions });
+    }
+    result
 }

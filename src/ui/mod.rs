@@ -121,13 +121,13 @@ fn draw_status_bar(frame: &mut Frame, app: &App, area: Rect) {
         Line::from(Span::raw(" q/Esc/s:close-status  j/k:scroll  g/G:top/bottom"))
     } else if app.diff.open {
         Line::from(Span::raw(
-            " q/Esc:close-diff  j/k:nav  Tab:switch  /:search  y:yank  s:status  ?:help",
+            " q/Esc:close-diff  j/k:nav  Tab:switch  v:hunks  y:yank  ?:help",
         ))
     } else {
         let loading = if !app.walk_done { " [loading…]" } else { "" };
         Line::from(Span::raw(format!(
             " {} commits{}  q:quit  j/k:nav  Enter:diff  /:search  y:yank  s:status  ?:help  R:reload",
-            app.log.commits.len(),
+            app.commits_len(),
             loading
         )))
     };
@@ -138,9 +138,9 @@ fn draw_status_bar(frame: &mut Frame, app: &App, area: Rect) {
     );
 }
 
-pub fn diff_line_to_ratatui(line: &DiffLine) -> Line<'_> {
+pub fn diff_line_to_ratatui(line: &DiffLine) -> Line<'static> {
     let style = style_for(line.kind);
-    Line::from(Span::styled(line.text.as_str(), style))
+    Line::from(Span::styled(line.text.clone(), style))
 }
 
 fn style_for(kind: DiffLineKind) -> Style {
@@ -157,6 +157,8 @@ fn style_for(kind: DiffLineKind) -> Style {
         DiffLineKind::Add => Style::default().fg(Color::Green),
         DiffLineKind::Del => Style::default().fg(Color::Red),
         DiffLineKind::Context => Style::default(),
+        DiffLineKind::Diffstat => Style::default().fg(Color::Cyan),
+        DiffLineKind::DiffstatTotal => Style::default().fg(Color::DarkGray),
         DiffLineKind::SectionTitle => Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD),
         DiffLineKind::SectionStaged => Style::default().fg(Color::Green),
         DiffLineKind::SectionUnstaged => Style::default().fg(Color::Yellow),
