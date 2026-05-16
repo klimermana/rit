@@ -60,7 +60,7 @@ pub fn draw_log(frame: &mut Frame, app: &App, area: Rect, focused: bool) {
 
 fn commit_spans<'a>(commit: &'a CommitInfo, app: &App) -> Vec<Span<'a>> {
     let mut spans: Vec<Span> = Vec::new();
-    spans.push(Span::styled(format!("{} ", commit.graph), Style::default().fg(Color::DarkGray)));
+    // spans.push(Span::styled(format!("{} ", commit.graph), Style::default().fg(Color::DarkGray)));
     spans.push(Span::styled(commit.short_id.as_str(), Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)));
     spans.push(Span::raw(" "));
     spans.push(Span::styled(
@@ -93,7 +93,7 @@ fn working_tree_spans<'a>(row: &'a WorkingTreeRow, app: &App) -> Vec<Span<'a>> {
     let mut spans: Vec<Span> = Vec::new();
     let dim = Style::default().fg(Color::DarkGray);
     // Graph column left blank to line up with the commit rows.
-    spans.push(Span::raw("  "));
+    //spans.push(Span::raw("  "));
     spans.push(Span::styled("0000000", dim));
     spans.push(Span::raw(" "));
     spans.push(Span::styled(
