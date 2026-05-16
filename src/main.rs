@@ -1,0 +1,84 @@
+mod app;
+mod git;
+mod ui;
+
+use anyhow::Result;
+use app::App;
+use clap::Parser;
+use crossbeam_channel::{bounded, Sender};
+use crossterm::{
+    event::{self, Event, KeyEvent},
+    execute,
+    terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
+};
+use ratatui::{backend::CrosstermBackend, Terminal};
+use std::io;
+use std::panic;
+use std::time::Duration;
+
+/// Interactive terminal git log/diff viewer.
+#[derive(Parser, Debug)]
+#[command(version, about, long_about = None)]
+struct Cli {
+    /// Limit the log to commits that touch this path (substring match).
+    path: Option<String>,
+}
+
+fn main() -> Result<()> {
+    let cli = Cli::parse();
+    let path_filter = cli.path;
+
+    // Restore terminal on panic.
+    let original_hook = panic::take_hook();
+    panic::set_hook(Box::new(move |info| {
+        let _ = disable_raw_mode();
+        let _ = execute!(io::stderr(), LeaveAlternateScreen);
+        original_hook(info);
+    }));
+
+    enable_raw_mode()?;
+    let mut stdout = io::stdout();
+    execute!(stdout, EnterAlternateScreen)?;
+    let backend = CrosstermBackend::new(stdout);
+    let mut terminal = Terminal::new(backend)?;
+
+    let (req_tx, req_rx) = bounded::<git::GitReq>(64);
+    let (msg_tx, msg_rx) = bounded::<git::GitMsg>(256);
+    let (input_tx, input_rx) = bounded::<KeyEvent>(64);
+
+    let git_tx = msg_tx.clone();
+    std::thread::spawn(move || {
+        git::run_git_thread(req_rx, git_tx, path_filter);
+    });
+
+    std::thread::spawn(move || {
+        input_thread(input_tx);
+    });
+
+    let mut app = App::new(req_tx, msg_rx, input_rx);
+    let result = app.run(&mut terminal);
+
+    disable_raw_mode()?;
+    execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
+    terminal.show_cursor()?;
+
+    result
+}
+
+fn input_thread(tx: Sender<KeyEvent>) {
+    loop {
+        match event::poll(Duration::from_millis(200)) {
+            Ok(true) => match event::read() {
+                Ok(Event::Key(key)) => {
+                    if tx.send(key).is_err() {
+                        return;
+                    }
+                }
+                Ok(_) => {}
+                Err(_) => return,
+            },
+            Ok(false) => {}
+            Err(_) => return,
+        }
+    }
+}
