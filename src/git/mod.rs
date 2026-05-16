@@ -123,7 +123,7 @@ fn run_git_thread_inner(
     };
 
     let repo_path = repo
-        .work_dir()
+        .workdir()
         .map(|p| p.to_string_lossy().into_owned())
         .unwrap_or_else(|| ".".to_string());
 
@@ -258,10 +258,11 @@ fn build_commit_info(
     let decoded = commit.decode().ok()?;
 
     let short_id = id.to_hex_with_len(7).to_string().into();
-    let author_full = decoded.author().name.to_str_lossy().into_owned();
+    let author = decoded.author().ok()?;
+    let author_full = author.name.to_str_lossy().into_owned();
     let author_display: CompactString = truncate_chars(&author_full, AUTHOR_DISPLAY_CHARS).into();
     let author_lower: CompactString = author_display.to_lowercase();
-    let date = relative_time(decoded.author().time.seconds);
+    let date = relative_time(author.time().map(|t| t.seconds).unwrap_or(0));
     let summary = decoded.message().summary().to_str_lossy().into_owned();
     let summary_lower = summary.to_lowercase();
     let refs = refs_map.get(&id).cloned().unwrap_or_default();
@@ -314,10 +315,11 @@ fn commit_touches_path_inner(
         repo.find_object(parent_ids[0])?.try_into_commit()?.tree()?
     };
 
+    let hash_kind = repo.object_hash();
     let mut recorder = gix::diff::tree::Recorder::default();
     gix::diff::tree(
-        TreeRefIter::from_bytes(&par_tree.data),
-        TreeRefIter::from_bytes(&cur_tree.data),
+        TreeRefIter::from_bytes(&par_tree.data, hash_kind),
+        TreeRefIter::from_bytes(&cur_tree.data, hash_kind),
         gix::diff::tree::State::default(),
         &repo.objects,
         &mut recorder,
@@ -370,7 +372,7 @@ fn load_refs(repo: &gix::Repository) -> HashMap<ObjectId, Vec<RefLabel>> {
 
 fn repo_info_for(repo: &gix::Repository) -> RepoInfo {
     let name = repo
-        .work_dir()
+        .workdir()
         .and_then(|p| p.file_name().map(|n| n.to_string_lossy().into_owned()))
         .or_else(|| std::env::current_dir().ok().and_then(|p| p.file_name().map(|n| n.to_string_lossy().into_owned())))
         .unwrap_or_else(|| "unknown".to_string());
@@ -439,15 +441,15 @@ fn compute_commit_diff_inner(repo: &gix::Repository, id: ObjectId) -> Result<Dif
     let mut files: Vec<FileStat> = Vec::new();
 
     header.push(DiffLine::new(DiffLineKind::CommitHeader, format!("commit {}", id)));
-    let author = decoded.author();
-    let committer = decoded.committer();
+    let author = decoded.author()?;
+    let committer = decoded.committer()?;
     header.push(DiffLine::new(
         DiffLineKind::Meta,
         format!("Author:     {} <{}>", author.name.to_str_lossy(), author.email.to_str_lossy()),
     ));
     header.push(DiffLine::new(
         DiffLineKind::Meta,
-        format!("AuthorDate: {}", format_timestamp(author.time.seconds)),
+        format!("AuthorDate: {}", format_timestamp(author.time()?.seconds)),
     ));
     header.push(DiffLine::new(
         DiffLineKind::Meta,
@@ -455,7 +457,7 @@ fn compute_commit_diff_inner(repo: &gix::Repository, id: ObjectId) -> Result<Dif
     ));
     header.push(DiffLine::new(
         DiffLineKind::Meta,
-        format!("CommitDate: {}", format_timestamp(committer.time.seconds)),
+        format!("CommitDate: {}", format_timestamp(committer.time()?.seconds)),
     ));
     header.push(DiffLine::new(DiffLineKind::Blank, ""));
     header.push(DiffLine::new(
@@ -488,10 +490,11 @@ fn diff_trees<'r>(
     use gix::diff::tree::recorder::Change;
     use gix::objs::TreeRefIter;
 
+    let hash_kind = repo.object_hash();
     let mut recorder = gix::diff::tree::Recorder::default();
     gix::diff::tree(
-        TreeRefIter::from_bytes(&old_tree.data),
-        TreeRefIter::from_bytes(&new_tree.data),
+        TreeRefIter::from_bytes(&old_tree.data, hash_kind),
+        TreeRefIter::from_bytes(&new_tree.data, hash_kind),
         gix::diff::tree::State::default(),
         &repo.objects,
         &mut recorder,

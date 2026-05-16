@@ -9,14 +9,14 @@ name = "rit"
 path = "src/main.rs"
 
 [dependencies]
-ratatui = "0.29"
-crossterm = "0.28"
-gix = { version = "0.70", features = ["max-performance-safe", "comfort"] }
+ratatui = "0.30"
+crossterm = "0.29"
+gix = { version = "0.83", features = ["max-performance-safe", "comfort"] }
 crossbeam-channel = "0.5"
 anyhow = "1"
 chrono = "0.4"
-compact_str = "0.8"
-similar = "2"
+compact_str = "0.9"
+similar = "3"
 clap = { version = "4.6.1", features = ["derive"] }
 
 [workspace.lints.clippy]

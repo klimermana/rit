@@ -150,7 +150,10 @@ impl App {
         }
     }
 
-    pub fn run<B: Backend>(&mut self, terminal: &mut Terminal<B>) -> Result<()> {
+    pub fn run<B: Backend>(&mut self, terminal: &mut Terminal<B>) -> Result<()>
+    where
+        B::Error: Send + Sync + 'static,
+    {
         // Kick off the initial walk.
         let _ = self.tx.send(GitReq::LoadMore(INITIAL_LOAD));
 
