@@ -3,7 +3,7 @@ use crate::ui;
 use anyhow::Result;
 use compact_str::CompactString;
 use crossbeam_channel::{after, never, select, Receiver, Sender};
-use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+use crossterm::event::{Event, KeyCode, KeyEvent, KeyModifiers};
 use ratatui::{backend::Backend, Terminal};
 use std::time::{Duration, Instant};
 
@@ -113,11 +113,11 @@ pub struct App {
     pub should_quit: bool,
     pub tx: Sender<GitReq>,
     pub rx: Receiver<GitMsg>,
-    pub input_rx: Receiver<KeyEvent>,
+    pub input_rx: Receiver<Event>,
 }
 
 impl App {
-    pub fn new(tx: Sender<GitReq>, rx: Receiver<GitMsg>, input_rx: Receiver<KeyEvent>) -> Self {
+    pub fn new(tx: Sender<GitReq>, rx: Receiver<GitMsg>, input_rx: Receiver<Event>) -> Self {
         let rows = vec![LogRow::WorkingTree(WorkingTreeRow { author: "you".into() })];
         Self {
             log: LogState { rows, selected: 0, scroll: 0, view_height: 1 },
@@ -174,7 +174,9 @@ impl App {
 
             select! {
                 recv(input_rx) -> evt => match evt {
-                    Ok(key) => self.handle_input(key),
+                    Ok(Event::Key(key)) => self.handle_input(key),
+                    // Resize / Mouse / etc. just wake the loop so we redraw.
+                    Ok(_) => {}
                     Err(_) => self.should_quit = true,
                 },
                 recv(msg_rx) -> msg => match msg {

@@ -7,7 +7,7 @@ use app::App;
 use clap::Parser;
 use crossbeam_channel::{bounded, Sender};
 use crossterm::{
-    event::{self, Event, KeyEvent},
+    event::{self, Event},
     execute,
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
 };
@@ -44,7 +44,7 @@ fn main() -> Result<()> {
 
     let (req_tx, req_rx) = bounded::<git::GitReq>(64);
     let (msg_tx, msg_rx) = bounded::<git::GitMsg>(256);
-    let (input_tx, input_rx) = bounded::<KeyEvent>(64);
+    let (input_tx, input_rx) = bounded::<Event>(64);
 
     let git_tx = msg_tx.clone();
     std::thread::spawn(move || {
@@ -65,16 +65,15 @@ fn main() -> Result<()> {
     result
 }
 
-fn input_thread(tx: Sender<KeyEvent>) {
+fn input_thread(tx: Sender<Event>) {
     loop {
         match event::poll(Duration::from_millis(200)) {
             Ok(true) => match event::read() {
-                Ok(Event::Key(key)) => {
-                    if tx.send(key).is_err() {
+                Ok(evt) => {
+                    if tx.send(evt).is_err() {
                         return;
                     }
                 }
-                Ok(_) => {}
                 Err(_) => return,
             },
             Ok(false) => {}
