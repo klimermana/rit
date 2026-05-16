@@ -89,4 +89,4 @@ The diff/status content is stored as a domain `DiffLine { kind, text }` and only
 
 ## License
 
-Whatever Claude wrote here is yours to do as you please. No warranty.
+[MIT](LICENSE) — public domain dedication. Do whatever you want with it. No warranty.
