@@ -8,7 +8,7 @@ use ratatui::{
 
 pub fn draw_help(frame: &mut Frame, area: Rect) {
     let width = 52u16.min(area.width.saturating_sub(4));
-    let height = 32u16.min(area.height.saturating_sub(4));
+    let height = 34u16.min(area.height.saturating_sub(4));
 
     let x = (area.width.saturating_sub(width)) / 2;
     let y = (area.height.saturating_sub(height)) / 2;
@@ -60,6 +60,7 @@ pub fn draw_help(frame: &mut Frame, area: Rect) {
         Line::from(""),
         Line::from(Span::styled("Display", h)),
         row!("  #              ", "Toggle line numbers in diff"),
+        row!("  v              ", "Toggle patch hunks (summary view when off)"),
         Line::from(""),
         Line::from(Span::styled("CLI", h)),
         row!("  rit <path>     ", "Limit log to commits touching <path>"),
