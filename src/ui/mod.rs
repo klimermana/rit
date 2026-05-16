@@ -105,7 +105,20 @@ fn draw_status_view(frame: &mut Frame, app: &App, area: Rect) {
 }
 
 fn draw_status_bar(frame: &mut Frame, app: &App, area: Rect) {
-    let text = if app.search.active {
+    let text = if app.diff.search_active {
+        let pos = app.diff.search_matches.binary_search(&app.diff.scroll).map(|i| i + 1).unwrap_or(0);
+        Line::from(vec![
+            Span::raw(format!(" [{}/{}] /", pos, app.diff.search_matches.len())),
+            Span::styled(app.diff.search_query.clone(), Style::default().fg(Color::Yellow)),
+            Span::raw("█"),
+        ])
+    } else if !app.diff.search_query.is_empty() {
+        let pos = app.diff.search_matches.binary_search(&app.diff.scroll).map(|i| i + 1).unwrap_or(0);
+        Line::from(Span::styled(
+            format!(" [{}/{}] n:next  N:prev  Esc:clear diff search", pos, app.diff.search_matches.len()),
+            Style::default().fg(Color::Yellow),
+        ))
+    } else if app.search.active {
         Line::from(vec![
             Span::raw(" /"),
             Span::styled(app.search.query.clone(), Style::default().fg(Color::Yellow)),
@@ -127,7 +140,7 @@ fn draw_status_bar(frame: &mut Frame, app: &App, area: Rect) {
     } else if app.status.open {
         Line::from(Span::raw(" q/Esc/s:close-status  j/k:scroll  g/G:top/bottom"))
     } else if app.diff.open {
-        Line::from(Span::raw(" q/Esc:close-diff  j/k:nav  Tab:switch  v:hunks  y:yank  ?:help"))
+        Line::from(Span::raw(" q/Esc:close-diff  j/k:nav  Tab:switch  /:search-diff  v:hunks  y:yank  ?:help"))
     } else {
         let count = app.commits_len();
         let count_str = if app.walk_done { format!("{}", count) } else { format!("{}+", count) };

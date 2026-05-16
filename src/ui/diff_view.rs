@@ -66,21 +66,28 @@ pub fn draw_diff(frame: &mut Frame, app: &App, area: Rect, focused: bool) {
     let end = (scroll + height).min(total);
 
     let show_nums = app.diff.show_line_numbers;
+    let has_diff_search = !app.diff.search_query.is_empty();
+    let match_style = Style::default().bg(Color::Yellow).fg(Color::Black);
+
     let visible: Vec<Line> = all_lines
         .into_iter()
         .skip(scroll)
         .take(end - scroll)
         .enumerate()
         .map(|(i, line)| {
+            let global_idx = scroll + i;
+            let is_match = has_diff_search
+                && app.diff.search_matches.binary_search(&global_idx).is_ok();
+            let mut spans = Vec::new();
             if show_nums {
-                let num = Span::styled(format!("{:>4} ", scroll + i + 1), Style::default().fg(Color::DarkGray));
-                let mut spans = Vec::with_capacity(line.spans.len() + 1);
-                spans.push(num);
-                spans.extend(line.spans);
-                Line::from(spans).style(line.style)
-            } else {
-                line
+                spans.push(Span::styled(
+                    format!("{:>4} ", global_idx + 1),
+                    Style::default().fg(Color::DarkGray),
+                ));
             }
+            spans.extend(line.spans);
+            let base_style = if is_match { match_style } else { line.style };
+            Line::from(spans).style(base_style)
         })
         .collect();
 
