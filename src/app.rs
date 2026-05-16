@@ -90,6 +90,8 @@ pub struct DiffState {
     /// Sorted list of virtual line indices (header + diffstat + body) that
     /// match the current diff search query.
     pub search_matches: Vec<usize>,
+    /// Index into search_matches for the current highlighted match.
+    pub search_current: usize,
 }
 
 pub struct StatusState {
@@ -148,6 +150,7 @@ impl App {
                 search_active: false,
                 search_query: String::new(),
                 search_matches: Vec::new(),
+                search_current: 0,
             },
             status: StatusState { open: false, lines: Vec::new(), scroll: 0, loading: false },
             focus: Focus::Log,
@@ -443,6 +446,7 @@ impl App {
                 self.focus = Focus::Log;
                 self.diff.search_query.clear();
                 self.diff.search_matches.clear();
+                self.diff.search_current = 0;
             }
             // Esc clears an active search result set (when diff is not open).
             (_, Esc, Mod::NONE) if !self.search.query.is_empty() => {
@@ -647,6 +651,7 @@ impl App {
         let q = self.diff.search_query.to_lowercase();
         if q.is_empty() {
             self.diff.search_matches.clear();
+            self.diff.search_current = 0;
             return;
         }
         let header_len = self.diff.header_lines.as_ref().map(|v| v.len()).unwrap_or(0);
@@ -668,39 +673,36 @@ impl App {
             }
         }
         self.diff.search_matches = matches;
+        self.diff.search_current = 0;
     }
 
     fn jump_to_next_diff_match(&mut self) {
-        if self.diff.search_matches.is_empty() { return; }
-        let after = self.diff.scroll + 1;
-        let idx = self.diff.search_matches.iter()
-            .find(|&&i| i >= after)
-            .or_else(|| self.diff.search_matches.first())
-            .copied();
-        if let Some(i) = idx {
-            self.diff.scroll = i.saturating_sub(2);
-        }
+        let len = self.diff.search_matches.len();
+        if len == 0 { return; }
+        self.diff.search_current = (self.diff.search_current + 1) % len;
+        self.scroll_to_current_diff_match();
     }
 
     fn jump_to_prev_diff_match(&mut self) {
-        if self.diff.search_matches.is_empty() { return; }
-        let before = self.diff.scroll;
-        let idx = self.diff.search_matches.iter().rev()
-            .find(|&&i| i < before)
-            .or_else(|| self.diff.search_matches.last())
-            .copied();
-        if let Some(i) = idx {
-            self.diff.scroll = i.saturating_sub(2);
-        }
+        let len = self.diff.search_matches.len();
+        if len == 0 { return; }
+        self.diff.search_current = (self.diff.search_current + len - 1) % len;
+        self.scroll_to_current_diff_match();
     }
 
     fn jump_to_first_diff_match_at_or_after(&mut self, from: usize) {
+        if self.diff.search_matches.is_empty() { return; }
         let idx = self.diff.search_matches.iter()
-            .find(|&&i| i >= from)
-            .or_else(|| self.diff.search_matches.first())
-            .copied();
-        if let Some(i) = idx {
-            self.diff.scroll = i.saturating_sub(2);
+            .position(|&i| i >= from)
+            .unwrap_or(0);
+        self.diff.search_current = idx;
+        self.scroll_to_current_diff_match();
+    }
+
+    fn scroll_to_current_diff_match(&mut self) {
+        if let Some(&line_idx) = self.diff.search_matches.get(self.diff.search_current) {
+            // Show a couple lines of context above the match.
+            self.diff.scroll = line_idx.saturating_sub(2);
         }
     }
 
