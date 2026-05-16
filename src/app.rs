@@ -391,6 +391,11 @@ impl App {
                 self.diff.open = false;
                 self.focus = Focus::Log;
             }
+            // Esc clears an active search result set (when diff is not open).
+            (_, Esc, Mod::NONE) if !self.search.query.is_empty() => {
+                self.search.query.clear();
+                self.search.matches.clear();
+            }
             (Focus::Log, Char('q'), Mod::NONE) => self.should_quit = true,
             (Focus::Log, Char('j') | Down, Mod::NONE) => self.move_log_down(1),
             (Focus::Log, Char('k') | Up, Mod::NONE) => self.move_log_up(1),
