@@ -1055,15 +1055,82 @@ fn numstat_for_blobs(old: &[u8], new: &[u8]) -> (usize, usize) {
 
 #[cfg(test)]
 mod tests {
-    use super::{build_pathspec_search, classify_skip, hunk_header, SkipReason, MAX_INLINE_DIFF_BYTES};
-    use crate::model::PathFilter;
+    use super::{
+        build_commit_info, build_pathspec_search, classify_skip, hunk_header, GitMsg, HistoryMsg, SkipReason, Walker,
+        MAX_INLINE_DIFF_BYTES,
+    };
+    use crate::model::{CommitRecord, PathFilter};
     use gix::bstr::BStr;
     use similar::TextDiff;
+    use std::{collections::HashMap, path::Path};
 
     fn pathspec_matches(spec: &str, path: &str) -> bool {
         let mut search = build_pathspec_search(&PathFilter::new(spec)).expect("parse");
         let mut attrs = |_: &_, _: _, _: _, _: &mut _| true;
         search.pattern_matching_relative_path(<&BStr>::from(path.as_bytes()), Some(false), &mut attrs).is_some()
+    }
+
+    // ---- Fixture-repo helpers for the integration tests below ----
+
+    fn run_git(cwd: &Path, args: &[&str]) {
+        let out = std::process::Command::new("git")
+            .arg("-C")
+            .arg(cwd)
+            .args(args)
+            .output()
+            .expect("git binary should be available");
+        assert!(out.status.success(), "git {:?} failed: {}", args, String::from_utf8_lossy(&out.stderr));
+    }
+
+    fn make_fixture_repo() -> (tempfile::TempDir, gix::Repository) {
+        let td = tempfile::tempdir().expect("create temp dir");
+        let path = td.path();
+        run_git(path, &["init", "-q", "-b", "main"]);
+        run_git(path, &["config", "user.email", "test@example.com"]);
+        run_git(path, &["config", "user.name", "Test User"]);
+        run_git(path, &["config", "commit.gpgsign", "false"]);
+        let repo = gix::open(path).expect("open fixture repo");
+        (td, repo)
+    }
+
+    fn write_file(repo_path: &Path, rel: &str, content: &str) {
+        let p = repo_path.join(rel);
+        if let Some(parent) = p.parent() {
+            std::fs::create_dir_all(parent).expect("mkdir -p");
+        }
+        std::fs::write(p, content).expect("write file");
+    }
+
+    fn commit_all(repo_path: &Path, msg: &str) {
+        run_git(repo_path, &["add", "-A"]);
+        run_git(repo_path, &["commit", "-q", "-m", msg]);
+    }
+
+    fn commit_all_as(repo_path: &Path, msg: &str, author: &str, email: &str) {
+        run_git(repo_path, &["add", "-A"]);
+        run_git(
+            repo_path,
+            &[
+                "-c",
+                &format!("user.name={}", author),
+                "-c",
+                &format!("user.email={}", email),
+                "commit",
+                "-q",
+                "-m",
+                msg,
+            ],
+        );
+    }
+
+    fn drain_commits(rx: &crossbeam_channel::Receiver<GitMsg>) -> Vec<CommitRecord> {
+        let mut out: Vec<CommitRecord> = Vec::new();
+        while let Ok(msg) = rx.try_recv() {
+            if let GitMsg::History(HistoryMsg::Commits { commits, .. }) = msg {
+                out.extend(commits);
+            }
+        }
+        out
     }
 
     #[test]
@@ -1166,5 +1233,83 @@ mod tests {
         let mut big_binary = vec![b'a'; MAX_INLINE_DIFF_BYTES + 1];
         big_binary[0] = 0;
         assert!(matches!(classify_skip(&big_binary, b""), Some(SkipReason::Binary)));
+    }
+
+    // ---- Fixture-repo integration tests ----
+    //
+    // These shell out to the `git` CLI to set up the test repo, then drive
+    // rit's internal walker / build_commit_info against it. They cover
+    // behavior that is hard to verify from pure unit tests because it
+    // depends on the actual gix tree-diff and pathspec implementations.
+
+    #[test]
+    fn walker_pathspec_filters_to_matching_commits() {
+        let (td, repo) = make_fixture_repo();
+        let path = td.path();
+
+        write_file(path, "src/foo.rs", "fn a() {}\n");
+        commit_all(path, "modify foo");
+        write_file(path, "src/bar.rs", "fn b() {}\n");
+        commit_all(path, "modify bar");
+        write_file(path, "docs/intro.md", "hello\n");
+        commit_all(path, "modify doc");
+
+        let pf = PathFilter::new("src");
+        let mut walker = Walker::new(&repo, Some(pf), 0, false, HashMap::new()).expect("walker");
+        let (tx, rx) = crossbeam_channel::bounded::<GitMsg>(256);
+        walker.load_more(100, &tx).expect("load_more");
+
+        let summaries: Vec<String> = drain_commits(&rx).into_iter().map(|c| c.summary).collect();
+        // HEAD ancestors yields newest-first.
+        assert_eq!(summaries, vec!["modify bar".to_string(), "modify foo".to_string()]);
+    }
+
+    #[test]
+    fn walker_pathspec_nested_directory_includes_only_descendants() {
+        // Verifies that a nested pathspec only walks commits touching files
+        // under that directory -- catches a regression where the previous
+        // contains() filter would have spuriously matched `src/cli/...`
+        // against the spec `src/a` (substring hit on "src/a" being inside
+        // "src/api").
+        let (td, repo) = make_fixture_repo();
+        let path = td.path();
+
+        write_file(path, "src/api/foo.rs", "fn a() {}\n");
+        commit_all(path, "modify api/foo");
+        write_file(path, "src/cli/bar.rs", "fn b() {}\n");
+        commit_all(path, "modify cli/bar");
+        write_file(path, "src/api/baz.rs", "fn c() {}\n");
+        commit_all(path, "modify api/baz");
+
+        let pf = PathFilter::new("src/api");
+        let mut walker = Walker::new(&repo, Some(pf), 0, false, HashMap::new()).expect("walker");
+        let (tx, rx) = crossbeam_channel::bounded::<GitMsg>(256);
+        walker.load_more(100, &tx).expect("load_more");
+
+        let summaries: Vec<String> = drain_commits(&rx).into_iter().map(|c| c.summary).collect();
+        assert!(summaries.iter().any(|s| s == "modify api/foo"));
+        assert!(summaries.iter().any(|s| s == "modify api/baz"));
+        assert!(!summaries.iter().any(|s| s == "modify cli/bar"), "cli commit leaked through src/api spec: {:?}", summaries);
+    }
+
+    #[test]
+    fn build_commit_info_preserves_full_author_for_search() {
+        // Regression for the bug fixed in the search-full-author commit:
+        // search.author_lower must contain substrings past the 20-char
+        // display truncation. Without the fix, "rooijen" (at offset 16)
+        // would survive but "smith" (at offset 35) would not.
+        let (td, repo) = make_fixture_repo();
+        let path = td.path();
+
+        write_file(path, "a.txt", "hi\n");
+        let long_name = "Christopher van Rooijen-Aalbersberg-Smith";
+        commit_all_as(path, "first", long_name, "long@example.com");
+
+        let head_id = repo.head_id().expect("head").detach();
+        let info = build_commit_info(&repo, head_id, &[], &HashMap::new(), None).expect("commit info");
+
+        assert_eq!(info.author.as_str(), long_name, "author field should hold the full name, not the truncated form");
+        assert!(info.search.author_lower.contains("rooijen"));
+        assert!(info.search.author_lower.contains("smith"));
     }
 }
