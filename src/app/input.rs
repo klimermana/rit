@@ -90,7 +90,7 @@ impl App {
             (Char('j') | Down, Mod::NONE) => self.status.scroll = self.status.scroll.saturating_add(1),
             (Char('k') | Up, Mod::NONE) => self.status.scroll = self.status.scroll.saturating_sub(1),
             (Char('g'), Mod::NONE) => self.status.scroll = 0,
-            (Char('G'), Mod::NONE) => {
+            (Char('G'), Mod::NONE | Mod::SHIFT) => {
                 self.status.scroll = self.status.document.as_ref().map_or(0, |d| d.lines.len()).saturating_sub(1);
             }
             (Char('d'), Mod::CONTROL) => self.status.scroll = self.status.scroll.saturating_add(HALF_PAGE),
@@ -161,7 +161,7 @@ impl App {
             (Focus::Log, Char('j') | Down, Mod::NONE) => self.move_log_down(1),
             (Focus::Log, Char('k') | Up, Mod::NONE) => self.move_log_up(1),
             (Focus::Log, Char('g'), Mod::NONE) => self.jump_log_top(),
-            (Focus::Log, Char('G'), Mod::NONE) => self.jump_log_bottom(),
+            (Focus::Log, Char('G'), Mod::NONE | Mod::SHIFT) => self.jump_log_bottom(),
             (Focus::Log, Char('d'), Mod::CONTROL) => self.move_log_down(HALF_PAGE),
             (Focus::Log, Char('u'), Mod::CONTROL) => self.move_log_up(HALF_PAGE),
             // Full-page nav. Modifiers ignored — PageUp/PageDown is dedicated.
@@ -172,7 +172,7 @@ impl App {
                 self.diff.scroll = self.diff.scroll.saturating_sub(1);
             }
             (Focus::Diff, Char('g'), Mod::NONE) => self.diff.scroll = 0,
-            (Focus::Diff, Char('G'), Mod::NONE) => self.diff_scroll_to_bottom(),
+            (Focus::Diff, Char('G'), Mod::NONE | Mod::SHIFT) => self.diff_scroll_to_bottom(),
             (Focus::Diff, Char('d'), Mod::CONTROL) => self.diff_scroll_down(HALF_PAGE),
             (Focus::Diff, Char('u'), Mod::CONTROL) => self.diff.scroll = self.diff.scroll.saturating_sub(HALF_PAGE),
             (Focus::Diff, PageDown, _) => self.diff_scroll_down(self.diff.view_height.max(1)),
