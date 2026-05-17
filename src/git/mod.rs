@@ -176,9 +176,7 @@ fn process_request<'r>(
             let _ = msg_tx.send(GitMsg::Inspect(InspectMsg::StatusLoaded(document)));
         }
         GitReq::Inspect(InspectReq::RefreshWorkingTreeMeta) => {
-            let _ = msg_tx.send(GitMsg::Inspect(InspectMsg::WorkingTreeMeta {
-                author: working_tree_author(repo),
-            }));
+            let _ = msg_tx.send(GitMsg::Inspect(InspectMsg::WorkingTreeMeta { author: working_tree_author(repo) }));
         }
     }
     Ok(true)
@@ -976,12 +974,8 @@ fn compute_numstat_gix(repo: &gix::Repository) -> Vec<FileStat> {
             gix::status::Item::TreeIndex(change) => {
                 use gix::diff::index::Change;
                 let (path, old_id, new_id) = match change {
-                    Change::Addition { location, id, .. } => {
-                        (location.to_string(), None, Some(id.into_owned()))
-                    }
-                    Change::Deletion { location, id, .. } => {
-                        (location.to_string(), Some(id.into_owned()), None)
-                    }
+                    Change::Addition { location, id, .. } => (location.to_string(), None, Some(id.into_owned())),
+                    Change::Deletion { location, id, .. } => (location.to_string(), Some(id.into_owned()), None),
                     Change::Modification { location, previous_id, id, .. } => {
                         (location.to_string(), Some(previous_id.into_owned()), Some(id.into_owned()))
                     }
@@ -989,12 +983,8 @@ fn compute_numstat_gix(repo: &gix::Repository) -> Vec<FileStat> {
                         (location.to_string(), Some(source_id.into_owned()), Some(id.into_owned()))
                     }
                 };
-                let old = old_id
-                    .and_then(|id| repo.find_object(id).ok().map(|o| o.data.clone()))
-                    .unwrap_or_default();
-                let new = new_id
-                    .and_then(|id| repo.find_object(id).ok().map(|o| o.data.clone()))
-                    .unwrap_or_default();
+                let old = old_id.and_then(|id| repo.find_object(id).ok().map(|o| o.data.clone())).unwrap_or_default();
+                let new = new_id.and_then(|id| repo.find_object(id).ok().map(|o| o.data.clone())).unwrap_or_default();
                 let (additions, deletions) = numstat_for_blobs(&old, &new);
                 out.push(FileStat { path, additions, deletions });
             }
@@ -1010,10 +1000,8 @@ fn compute_numstat_gix(repo: &gix::Repository) -> Vec<FileStat> {
                         index_as_worktree::EntryStatus::Change(index_as_worktree::Change::Modification { .. })
                         | index_as_worktree::EntryStatus::Change(index_as_worktree::Change::Type { .. }) => {
                             let old = repo.find_object(entry.id).ok().map(|o| o.data.clone()).unwrap_or_default();
-                            let new_bytes = workdir
-                                .as_ref()
-                                .and_then(|wd| std::fs::read(wd.join(&path)).ok())
-                                .unwrap_or_default();
+                            let new_bytes =
+                                workdir.as_ref().and_then(|wd| std::fs::read(wd.join(&path)).ok()).unwrap_or_default();
                             let (additions, deletions) = numstat_for_blobs(&old, &new_bytes);
                             out.push(FileStat { path, additions, deletions });
                         }
@@ -1152,7 +1140,6 @@ mod tests {
         assert!(!pathspec_matches("*.rs", "Cargo.toml"));
     }
 
-
     #[test]
     fn header_spans_full_group_not_just_first_op() {
         // Single replacement surrounded by enough context that the diff
@@ -1289,7 +1276,11 @@ mod tests {
         let summaries: Vec<String> = drain_commits(&rx).into_iter().map(|c| c.summary).collect();
         assert!(summaries.iter().any(|s| s == "modify api/foo"));
         assert!(summaries.iter().any(|s| s == "modify api/baz"));
-        assert!(!summaries.iter().any(|s| s == "modify cli/bar"), "cli commit leaked through src/api spec: {:?}", summaries);
+        assert!(
+            !summaries.iter().any(|s| s == "modify cli/bar"),
+            "cli commit leaked through src/api spec: {:?}",
+            summaries
+        );
     }
 
     #[test]

@@ -64,11 +64,6 @@ impl FixtureRepo {
 }
 
 pub fn run_git(cwd: &Path, args: &[&str]) {
-    let out = std::process::Command::new("git")
-        .arg("-C")
-        .arg(cwd)
-        .args(args)
-        .output()
-        .expect("git binary on PATH");
+    let out = std::process::Command::new("git").arg("-C").arg(cwd).args(args).output().expect("git binary on PATH");
     assert!(out.status.success(), "git {:?} failed: {}", args, String::from_utf8_lossy(&out.stderr));
 }
