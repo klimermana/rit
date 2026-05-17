@@ -63,7 +63,7 @@ pub fn draw_help(frame: &mut Frame, area: Rect) {
         row!("  v              ", "Toggle patch hunks (summary view when off)"),
         Line::from(""),
         Line::from(Span::styled("CLI", h)),
-        row!("  rit <path>     ", "Limit log to commits touching <path>"),
+        row!("  rit <pathspec> ", "Limit log to commits matching pathspec (git log -- semantics)"),
         Line::from(""),
         row!("  ? / q / Esc    ", "Close this help"),
     ];

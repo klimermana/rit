@@ -27,7 +27,9 @@ The binary lands at `target/release/rit`.
 
 ```bash
 rit                       # show full log
-rit path/to/file.rs       # filter to commits touching this path
+rit path/to/file.rs       # pathspec filter (git log -- semantics)
+rit 'src/**/*.rs'         # glob pathspec
+rit ':!target'            # exclusion pathspec
 rit --help
 ```
 
@@ -83,7 +85,6 @@ The diff/status content is stored as a domain `DiffLine { kind, text }` and only
 ## Known limitations
 
 - Working-tree status shells out to the `git` binary rather than using gix directly (the gix port of staged/unstaged diff formatting would be a project of its own).
-- The path filter is a substring match, not a pathspec.
 - No mouse support.
 - Linux/macOS only for clipboard yank; everything else is portable.
 

@@ -124,7 +124,10 @@ struct Walker<'r> {
     graph_state: Option<graph::GraphState>,
     iter: Option<gix::revision::Walk<'r>>,
     done: bool,
-    path_filter: Option<PathFilter>,
+    /// Parsed once at construction; held in `&mut` form per call because
+    /// `gix::pathspec::Search::pattern_matching_relative_path` mutates
+    /// internal counters as it matches.
+    pathspec: Option<gix::pathspec::Search>,
     gen: u64,
 }
 
@@ -140,13 +143,17 @@ impl<'r> Walker<'r> {
             Ok(head_id) => (Some(head_id.ancestors().all()?), false),
             Err(_) => (None, true),
         };
+        let pathspec = match path_filter {
+            Some(pf) => Some(build_pathspec_search(&pf)?),
+            None => None,
+        };
         Ok(Self {
             repo,
             refs_map,
             graph_state: graph_enabled.then(graph::GraphState::default),
             iter,
             done,
-            path_filter,
+            pathspec,
             gen,
         })
     }
@@ -182,8 +189,8 @@ impl<'r> Walker<'r> {
 
             let parent_ids: Vec<ObjectId> = info.parent_ids.iter().copied().collect();
 
-            if let Some(filter) = &self.path_filter {
-                if !commit_touches_path(self.repo, info.id, &parent_ids, filter.as_str()) {
+            if let Some(search) = self.pathspec.as_mut() {
+                if !commit_touches_pathspec(self.repo, info.id, &parent_ids, search) {
                     continue;
                 }
             }
@@ -243,15 +250,31 @@ fn build_commit_info(
     })
 }
 
-fn commit_touches_path(repo: &gix::Repository, commit_id: ObjectId, parent_ids: &[ObjectId], filter: &str) -> bool {
-    commit_touches_path_inner(repo, commit_id, parent_ids, filter).unwrap_or(false)
+/// Parse the CLI path argument into a `gix::pathspec::Search`. Treats the
+/// raw input as a single pathspec — `src/ui`, `:!target`, `*.rs` and the
+/// other usual magic forms all work, matching `git log -- <pathspec>`
+/// behavior.
+fn build_pathspec_search(filter: &PathFilter) -> Result<gix::pathspec::Search> {
+    use gix::pathspec::{self, Pattern};
+    let pattern: Pattern = pathspec::parse(filter.as_str().as_bytes(), pathspec::Defaults::default())?;
+    let search = pathspec::Search::from_specs(std::iter::once(pattern), None, std::path::Path::new(""))?;
+    Ok(search)
 }
 
-fn commit_touches_path_inner(
+fn commit_touches_pathspec(
     repo: &gix::Repository,
     commit_id: ObjectId,
     parent_ids: &[ObjectId],
-    filter: &str,
+    search: &mut gix::pathspec::Search,
+) -> bool {
+    commit_touches_pathspec_inner(repo, commit_id, parent_ids, search).unwrap_or(false)
+}
+
+fn commit_touches_pathspec_inner(
+    repo: &gix::Repository,
+    commit_id: ObjectId,
+    parent_ids: &[ObjectId],
+    search: &mut gix::pathspec::Search,
 ) -> Result<bool> {
     use gix::{diff::tree::recorder::Change, objs::TreeRefIter};
 
@@ -274,11 +297,15 @@ fn commit_touches_path_inner(
         &mut recorder,
     )?;
 
+    // No attribute-driven pathspec magic is supported in this build; the
+    // stub closure satisfies the signature without doing any work.
+    let mut attrs = |_: &_, _: _, _: _, _: &mut _| true;
+
     for change in &recorder.records {
-        let p = match change {
+        let path = match change {
             Change::Addition { path, .. } | Change::Deletion { path, .. } | Change::Modification { path, .. } => path,
         };
-        if p.to_str_lossy().contains(filter) {
+        if search.pattern_matching_relative_path(path.as_ref(), Some(false), &mut attrs).is_some() {
             return Ok(true);
         }
     }
@@ -683,8 +710,36 @@ fn run_numstat(repo_path: &str, cached: bool) -> Vec<FileStat> {
 
 #[cfg(test)]
 mod tests {
-    use super::hunk_header;
+    use super::{build_pathspec_search, hunk_header};
+    use crate::model::PathFilter;
+    use gix::bstr::BStr;
     use similar::TextDiff;
+
+    fn pathspec_matches(spec: &str, path: &str) -> bool {
+        let mut search = build_pathspec_search(&PathFilter::new(spec)).expect("parse");
+        let mut attrs = |_: &_, _: _, _: _, _: &mut _| true;
+        search.pattern_matching_relative_path(<&BStr>::from(path.as_bytes()), Some(false), &mut attrs).is_some()
+    }
+
+    #[test]
+    fn pathspec_directory_matches_files_under_it() {
+        assert!(pathspec_matches("src/ui", "src/ui/log_view.rs"));
+        assert!(pathspec_matches("src/ui", "src/ui/mod.rs"));
+    }
+
+    #[test]
+    fn pathspec_directory_rejects_siblings() {
+        assert!(!pathspec_matches("src/ui", "src/app.rs"));
+        assert!(!pathspec_matches("src/ui", "Cargo.toml"));
+    }
+
+    #[test]
+    fn pathspec_glob_matches_extension() {
+        assert!(pathspec_matches("*.rs", "src/main.rs"));
+        assert!(pathspec_matches("*.rs", "src/ui/log_view.rs"));
+        assert!(!pathspec_matches("*.rs", "Cargo.toml"));
+    }
+
 
     #[test]
     fn header_spans_full_group_not_just_first_op() {

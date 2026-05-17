@@ -24,7 +24,9 @@ use std::{
 #[derive(Parser, Debug)]
 #[command(version, about, long_about = None)]
 struct Cli {
-    /// Limit the log to commits that touch this path (substring match).
+    /// Limit the log to commits touching this pathspec. Matches
+    /// `git log -- <pathspec>` semantics (supports globs and
+    /// `:!exclude` magic).
     path: Option<String>,
 
     /// Render the ASCII commit graph column. Off by default because the
