@@ -88,6 +88,9 @@ impl CommitSearchState {
         self.query.clear();
         self.matches.clear();
         self.current = 0;
+        // Reset the narrowing cursor so the next type does a full rescan
+        // instead of attempting to narrow a now-empty matches set.
+        self.last_query.clear();
     }
 
     pub fn advance(&mut self, delta: isize) -> Option<usize> {
@@ -152,6 +155,21 @@ impl DiffSearchState {
             display_index: self.display_index(),
         }
     }
+}
+
+/// Substring-match a commit against a pre-lowercased query. The summary
+/// check tends to hit first in practice, so it goes first.
+fn commit_matches(c: &CommitRecord, q: &str) -> bool {
+    c.search.summary_lower.contains(q) || c.search.author_lower.contains(q)
+}
+
+/// Decide whether the current commit-search update can be served by
+/// narrowing the previous match set instead of rescanning the whole
+/// index. Two conditions: the walk hasn't been reloaded under us
+/// (generations match), and the new query is a strict extension of the
+/// previous non-empty one.
+fn should_narrow(prev_query: &str, prev_generation: u64, query: &str, generation: u64) -> bool {
+    generation == prev_generation && !prev_query.is_empty() && query.starts_with(prev_query)
 }
 
 /// Cyclically advance `*current` by `delta`. Returns the new match position
@@ -364,10 +382,11 @@ impl App {
                 if gen != self.walk_gen {
                     return;
                 }
+                let before = self.log.rows.len();
                 self.log.rows.extend(commits.into_iter().map(LogRow::Commit));
-                if !self.search.query.is_empty() {
-                    self.update_commit_matches();
-                }
+                // Incrementally widen the match set with just the new rows
+                // rather than rescanning the whole index every batch.
+                self.extend_commit_matches(before..self.log.rows.len());
             }
             HistoryMsg::WalkDone { gen } => {
                 if gen == self.walk_gen {
@@ -694,26 +713,55 @@ impl App {
         if q.is_empty() {
             self.search.matches.clear();
             self.search.current = 0;
+            self.search.last_query.clear();
             return;
         }
-        // No need to prompt the worker — it's already streaming the rest of
-        // history in the background, and update_commit_matches re-runs on
-        // every Commits batch the app receives.
-        self.search.matches = self
-            .log
-            .rows
-            .iter()
-            .enumerate()
-            .filter_map(|(i, row)| match row {
-                LogRow::Commit(c)
-                    if c.search.summary_lower.contains(&q) || c.search.author_lower.contains(q.as_str()) =>
-                {
-                    Some(i)
-                }
-                _ => None,
-            })
-            .collect();
+
+        // Incremental narrowing: if the new query is a strict extension of
+        // the previous one *and* the index hasn't been reloaded under us,
+        // we can filter the prior match set instead of rescanning every
+        // row. On a 100k-commit index that takes typing latency from
+        // O(commits) to O(matches).
+        if should_narrow(&self.search.last_query, self.search.last_generation, &q, self.walk_gen) {
+            let rows = &self.log.rows;
+            self.search.matches.retain(|&i| match rows.get(i) {
+                Some(LogRow::Commit(c)) => commit_matches(c, &q),
+                _ => false,
+            });
+        } else {
+            self.search.matches = self
+                .log
+                .rows
+                .iter()
+                .enumerate()
+                .filter_map(|(i, row)| match row {
+                    LogRow::Commit(c) if commit_matches(c, &q) => Some(i),
+                    _ => None,
+                })
+                .collect();
+        }
+
         self.search.current = 0;
+        self.search.last_query = q;
+        self.search.last_generation = self.walk_gen;
+    }
+
+    /// Scan only rows in `new_range`, appending any that match the current
+    /// query. Called when the worker streams in a new batch so existing
+    /// matches don't get re-tested.
+    fn extend_commit_matches(&mut self, new_range: std::ops::Range<usize>) {
+        if self.search.query.is_empty() {
+            return;
+        }
+        let q = self.search.query.to_lowercase();
+        let rows = &self.log.rows;
+        for i in new_range {
+            if let Some(LogRow::Commit(c)) = rows.get(i) {
+                if commit_matches(c, &q) {
+                    self.search.matches.push(i);
+                }
+            }
+        }
     }
 
     fn update_diff_matches(&mut self) {
@@ -906,3 +954,40 @@ fn yank_to_clipboard(text: &str) {
 
 #[cfg(not(any(target_os = "macos", target_os = "linux")))]
 fn yank_to_clipboard(_text: &str) {}
+
+#[cfg(test)]
+mod tests {
+    use super::should_narrow;
+
+    #[test]
+    fn narrow_when_query_extends_within_same_generation() {
+        assert!(should_narrow("foo", 1, "foob", 1));
+        assert!(should_narrow("a", 5, "abc", 5));
+    }
+
+    #[test]
+    fn rescan_when_query_shrinks() {
+        assert!(!should_narrow("foobar", 1, "foo", 1));
+        assert!(!should_narrow("ab", 1, "a", 1));
+    }
+
+    #[test]
+    fn rescan_when_query_changes_completely() {
+        assert!(!should_narrow("foo", 1, "bar", 1));
+    }
+
+    #[test]
+    fn rescan_after_reload_changes_generation() {
+        // Even though the new query strictly extends the old, a reload
+        // means the row indices the previous match set referenced may not
+        // line up anymore.
+        assert!(!should_narrow("foo", 1, "foobar", 2));
+    }
+
+    #[test]
+    fn rescan_when_no_previous_query() {
+        // An empty previous query means there's no prior match set to
+        // narrow; the new query must scan the whole index.
+        assert!(!should_narrow("", 1, "f", 1));
+    }
+}
