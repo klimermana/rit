@@ -85,6 +85,7 @@ The diff/status content is stored as a domain `DiffLine { kind, text }` and only
 ## Known limitations
 
 - Diff text doesn't include git's `index <oid>..<oid> <mode>` header line, rename headers (`similarity index N%`), or `\ No newline at end of file` markers — rit renders the hunks themselves but not those metadata flourishes.
+- In-diff search (`/` while the diff pane is focused) matches the body content only — the leading `+`/`-`/` ` of each line is rendered at display time, not stored, so `/+foo` won't find an addition; use `/foo`.
 - No mouse support.
 - Linux/macOS only for clipboard yank; everything else is portable.
 

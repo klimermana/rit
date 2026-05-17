@@ -317,7 +317,21 @@ mod tests {
 
 pub fn diff_line_to_ratatui(line: &DiffLine) -> Line<'static> {
     let style = style_for(line.kind);
-    Line::from(Span::styled(line.text.clone(), style))
+    // Add / Del / Context store their text *without* the unified-diff
+    // prefix character — the renderer prepends it here based on `kind`.
+    // This drops one per-line `format!` allocation from the producer
+    // side (worth thousands on a large diff).
+    let prefix = match line.kind {
+        DiffLineKind::Add => "+",
+        DiffLineKind::Del => "-",
+        DiffLineKind::Context => " ",
+        _ => "",
+    };
+    if prefix.is_empty() {
+        Line::from(Span::styled(line.text.clone(), style))
+    } else {
+        Line::from(vec![Span::styled(prefix, style), Span::styled(line.text.clone(), style)])
+    }
 }
 
 fn style_for(kind: DiffLineKind) -> Style {

@@ -241,17 +241,20 @@ Avoid re-`to_lowercase()` on every batch.
 is "one fewer Unicode lowercase pass per batch arrival" — small but
 mechanical.
 
-### 5g — DiffLine prefix encoding refactor
+### 5g — DiffLine prefix encoding refactor ✅
 
 Move `+` / `-` / ` ` out of `DiffLine.text`, prepend at render time
 based on `kind`.
 
-- **Behaviour change**: diff search of `+foo` will no longer match the
-  leading `+` in the diff pane (decision locked in).
-- README "Known limitations" gets a one-line note in this same commit.
+- **Behaviour change**: diff search of `+foo` no longer matches the
+  leading `+` (README "Known limitations" updated in the same commit).
+- The producer drops one `format!` per body line (~5000 fewer
+  allocations on the large bench fixture).
 
-**Bench**: `diff_generation/large_5000_lines` (large win — 40k+
-`format!` allocations dropped on a 20k-line diff).
+**Bench result** (`diff_generation` vs pre-cleanup):
+  `diff_generation/large_5000_lines` **−32%** (296 µs → 202 µs)
+  `diff_generation/small_10_lines` within noise
+  `working_tree_diff/staged_plus_unstaged` -57% (already at 5c)
 
 ### 5h — Pathspec tree-diff cache
 

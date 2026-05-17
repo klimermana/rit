@@ -653,6 +653,11 @@ impl DiffSink<'_> {
 }
 
 /// Render a pure-addition file diff (new file in the new revision).
+///
+/// Body lines are stored without the leading `+` — the renderer prepends
+/// the marker at draw time based on `DiffLineKind::Add`. The per-line
+/// `format!` was a measurable allocation in the original implementation
+/// on large diffs.
 fn render_file_addition(sink: &mut DiffSink<'_>, path: &str, new: &[u8]) {
     push_file_headers(sink.lines, path, Some("new file"));
     let (additions, deletions) = match classify_skip(&[], new) {
@@ -665,7 +670,7 @@ fn render_file_addition(sink: &mut DiffSink<'_>, path: &str, new: &[u8]) {
             for line in new.to_str_lossy().lines() {
                 sink.stats.insertions += 1;
                 count += 1;
-                sink.lines.push(DiffLine::new(DiffLineKind::Add, format!("+{}", line)));
+                sink.lines.push(DiffLine::new(DiffLineKind::Add, line));
             }
             (count, 0)
         }
@@ -674,6 +679,8 @@ fn render_file_addition(sink: &mut DiffSink<'_>, path: &str, new: &[u8]) {
 }
 
 /// Render a pure-deletion file diff (file present in old, absent in new).
+/// Body lines are stored without the leading `-` (same convention as
+/// `render_file_addition`).
 fn render_file_deletion(sink: &mut DiffSink<'_>, path: &str, old: &[u8]) {
     push_file_headers(sink.lines, path, Some("deleted file"));
     let (additions, deletions) = match classify_skip(old, &[]) {
@@ -686,7 +693,7 @@ fn render_file_deletion(sink: &mut DiffSink<'_>, path: &str, old: &[u8]) {
             for line in old.to_str_lossy().lines() {
                 sink.stats.deletions += 1;
                 count += 1;
-                sink.lines.push(DiffLine::new(DiffLineKind::Del, format!("-{}", line)));
+                sink.lines.push(DiffLine::new(DiffLineKind::Del, line));
             }
             (0, count)
         }
@@ -818,15 +825,15 @@ fn push_change(
         ChangeTag::Insert => {
             stats.insertions += 1;
             *file_add += 1;
-            lines.push(DiffLine::new(DiffLineKind::Add, format!("+{}", v)));
+            lines.push(DiffLine::new(DiffLineKind::Add, v));
         }
         ChangeTag::Delete => {
             stats.deletions += 1;
             *file_del += 1;
-            lines.push(DiffLine::new(DiffLineKind::Del, format!("-{}", v)));
+            lines.push(DiffLine::new(DiffLineKind::Del, v));
         }
         ChangeTag::Equal => {
-            lines.push(DiffLine::new(DiffLineKind::Context, format!(" {}", v)));
+            lines.push(DiffLine::new(DiffLineKind::Context, v));
         }
     }
 }
@@ -1453,15 +1460,20 @@ mod tests {
 
         let doc = super::compute_working_tree_diff(&repo, DiffTarget::WorkingTree);
 
+        // Diff body lines store text *without* the unified-diff prefix
+        // (`+`/`-`/` `); the renderer adds it at draw time. So the
+        // staged-section assertion below looks for "four" as an `Add`
+        // line, and the unstaged-section assertion looks for "BETA".
         let body_text: String = doc.body.iter().map(|l| l.text.as_str()).collect::<Vec<_>>().join("\n");
-        // Staged section contains the staged file's diff headers + a + line for "four".
         assert!(body_text.contains("── Staged"), "staged section title present");
         assert!(body_text.contains("diff --git a/staged.txt b/staged.txt"));
-        assert!(body_text.contains("+four"));
-        // Unstaged section contains the unstaged file's diff headers + the BETA change.
+        // The added line "four" lives in the body as an Add line.
+        let has_four_add = doc.body.iter().any(|l| matches!(l.kind, super::DiffLineKind::Add) && l.text == "four");
+        assert!(has_four_add, "staged diff contains Add line 'four'");
         assert!(body_text.contains("── Unstaged"), "unstaged section title present");
         assert!(body_text.contains("diff --git a/unstaged.txt b/unstaged.txt"));
-        assert!(body_text.contains("+BETA"));
+        let has_beta_add = doc.body.iter().any(|l| matches!(l.kind, super::DiffLineKind::Add) && l.text == "BETA");
+        assert!(has_beta_add, "unstaged diff contains Add line 'BETA'");
 
         // Both files contribute to the diffstat / aggregated stats.
         let paths: Vec<&str> = doc.files.iter().map(|f| f.path.as_str()).collect();
