@@ -12,7 +12,15 @@
 | 4b | `3114846` | `compute_short_status_lines_gix` returns `Result`; caller renders "Status query failed: …" instead of reporting clean. |
 | 4c | `2f95511` | `change_path` / `staged_change_path` return `String` (was `Option<String>`); callers collapse to one-liners. |
 | 4d | `8c01e50` | `relative_time` clamps future dates to "now" instead of emitting negative-seconds strings. 2 new tests. |
-| 5 | _pending_ | Performance fixes (5a–5h) |
+| 5a | `ec92268` | `commits_len()` O(1): `rows.len() - 1` instead of filter-count. Per-frame call. |
+| 5b | `f1b0e3d` | Drop 12× `o.data.clone()`; borrow blob through `&o.data`. Behaviour change: file-find failure now skips file (was emitting empty headers). |
+| 5c | `547aeb9` | Single `repo.status()` pass in `compute_working_tree_diff` via `sweep_status`. **−57.7%** on `working_tree_diff/staged_plus_unstaged`. |
+| 5d | `17df89b` | `Arc<HashMap>` for `RefsLoaded` refs_map. −2.4% on `indexing/200`. |
+| 5e | `db32e6b` | `RefsLoaded` backfill bounded by `first_batch_rows`. O(rows) → O(64). |
+| 5f | `83e37ae` | `extend_commit_matches` reuses `last_query`; one fewer Unicode lowercase per batch. |
+| 5g | `7a29c11` | DiffLine prefix moved to render-time. README "Known limitations" updated. **−32%** on `diff_generation/large_5000_lines`. |
+| 5h | `764fe0e` | Pathspec tree-diff LRU cache + new `pathspec_walk_then_diff` bench. Cumulative Stage 5 wins land. |
+| 6 | _pending_ | Structural refactor (6a–6e) |
 
 Project plan derived from the 2026-05-17 code review. Implements every
 item raised in the review (correctness, perf, refactor) and turns the
@@ -322,12 +330,14 @@ Free function
 `jump_first_at_or_after(&[usize], &mut usize, cursor: usize) -> Option<usize>`.
 Two callers.
 
-### 6e — Consolidate test fixtures
+### 6e — Consolidate test fixtures ✅
 
-`src/test_support.rs` gated on
-`#[cfg(any(test, feature = "test-support"))]`. Re-export from `lib.rs`
-so benches can use it. `benches/common/mod.rs` either deletes its
-copies or thinly delegates.
+`src/test_support.rs` gated on `#[cfg(test)]`, re-exported from
+`lib.rs` as `pub(crate)`. Inline fixture helpers in `git/mod.rs`
+deleted; tests import via `use crate::test_support::*`.
+
+Benches keep their own `common/mod.rs` (separate crate; the
+feature-flag indirection isn't worth it for ~50 lines of fixture).
 
 **Gate for every 6.x**
 

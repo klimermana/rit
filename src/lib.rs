@@ -9,3 +9,6 @@ pub mod app;
 pub mod git;
 pub mod model;
 pub mod ui;
+
+#[cfg(test)]
+pub(crate) mod test_support;

@@ -1219,81 +1219,21 @@ fn compute_working_tree_diff(repo: &gix::Repository, target: DiffTarget) -> Diff
 #[cfg(test)]
 mod tests {
     use super::{
-        GitMsg, HistoryMsg, MAX_INLINE_DIFF_BYTES, SkipReason, TreeDiffCache, Walker, build_commit_info,
-        build_pathspec_search, classify_skip, hunk_header, quick_is_dirty, relative_time,
+        GitMsg, MAX_INLINE_DIFF_BYTES, SkipReason, TreeDiffCache, Walker, build_commit_info, build_pathspec_search,
+        classify_skip, hunk_header, quick_is_dirty, relative_time,
     };
-    use crate::model::{CommitRecord, PathFilter};
+    use crate::{
+        model::PathFilter,
+        test_support::{commit_all, commit_all_as, drain_commits, make_fixture_repo, run_git, write_file},
+    };
     use gix::bstr::BStr;
     use similar::TextDiff;
-    use std::{collections::HashMap, path::Path, sync::Arc};
+    use std::{collections::HashMap, sync::Arc};
 
     fn pathspec_matches(spec: &str, path: &str) -> bool {
         let mut search = build_pathspec_search(&PathFilter::new(spec)).expect("parse");
         let mut attrs = |_: &_, _: _, _: _, _: &mut _| true;
         search.pattern_matching_relative_path(<&BStr>::from(path.as_bytes()), Some(false), &mut attrs).is_some()
-    }
-
-    // ---- Fixture-repo helpers for the integration tests below ----
-
-    fn run_git(cwd: &Path, args: &[&str]) {
-        let out = std::process::Command::new("git")
-            .arg("-C")
-            .arg(cwd)
-            .args(args)
-            .output()
-            .expect("git binary should be available");
-        assert!(out.status.success(), "git {:?} failed: {}", args, String::from_utf8_lossy(&out.stderr));
-    }
-
-    fn make_fixture_repo() -> (tempfile::TempDir, gix::Repository) {
-        let td = tempfile::tempdir().expect("create temp dir");
-        let path = td.path();
-        run_git(path, &["init", "-q", "-b", "main"]);
-        run_git(path, &["config", "user.email", "test@example.com"]);
-        run_git(path, &["config", "user.name", "Test User"]);
-        run_git(path, &["config", "commit.gpgsign", "false"]);
-        let repo = gix::open(path).expect("open fixture repo");
-        (td, repo)
-    }
-
-    fn write_file(repo_path: &Path, rel: &str, content: &str) {
-        let p = repo_path.join(rel);
-        if let Some(parent) = p.parent() {
-            std::fs::create_dir_all(parent).expect("mkdir -p");
-        }
-        std::fs::write(p, content).expect("write file");
-    }
-
-    fn commit_all(repo_path: &Path, msg: &str) {
-        run_git(repo_path, &["add", "-A"]);
-        run_git(repo_path, &["commit", "-q", "-m", msg]);
-    }
-
-    fn commit_all_as(repo_path: &Path, msg: &str, author: &str, email: &str) {
-        run_git(repo_path, &["add", "-A"]);
-        run_git(
-            repo_path,
-            &[
-                "-c",
-                &format!("user.name={}", author),
-                "-c",
-                &format!("user.email={}", email),
-                "commit",
-                "-q",
-                "-m",
-                msg,
-            ],
-        );
-    }
-
-    fn drain_commits(rx: &crossbeam_channel::Receiver<GitMsg>) -> Vec<CommitRecord> {
-        let mut out: Vec<CommitRecord> = Vec::new();
-        while let Ok(msg) = rx.try_recv() {
-            if let GitMsg::History(HistoryMsg::Commits { commits, .. }) = msg {
-                out.extend(commits);
-            }
-        }
-        out
     }
 
     #[test]
