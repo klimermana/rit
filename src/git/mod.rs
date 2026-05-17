@@ -571,19 +571,21 @@ fn diff_trees<'r>(
         match change {
             Change::Addition { entry_mode, oid, path, .. } if entry_mode.is_blob() => {
                 let p = path.to_str_lossy().into_owned();
-                let new = repo.find_object(*oid).map(|o| o.data.clone()).unwrap_or_default();
-                render_file_addition(sink, &p, &new);
+                if let Ok(new) = repo.find_object(*oid) {
+                    render_file_addition(sink, &p, &new.data);
+                }
             }
             Change::Deletion { entry_mode, oid, path, .. } if entry_mode.is_blob() => {
                 let p = path.to_str_lossy().into_owned();
-                let old = repo.find_object(*oid).map(|o| o.data.clone()).unwrap_or_default();
-                render_file_deletion(sink, &p, &old);
+                if let Ok(old) = repo.find_object(*oid) {
+                    render_file_deletion(sink, &p, &old.data);
+                }
             }
             Change::Modification { entry_mode, previous_oid, oid, path, .. } if entry_mode.is_blob() => {
                 let p = path.to_str_lossy().into_owned();
-                let old = repo.find_object(*previous_oid).map(|o| o.data.clone()).unwrap_or_default();
-                let new = repo.find_object(*oid).map(|o| o.data.clone()).unwrap_or_default();
-                render_file_modification(sink, &p, &old, &new);
+                if let (Ok(old), Ok(new)) = (repo.find_object(*previous_oid), repo.find_object(*oid)) {
+                    render_file_modification(sink, &p, &old.data, &new.data);
+                }
             }
             _ => {}
         }
@@ -862,21 +864,24 @@ fn render_staged_change(repo: &gix::Repository, sink: &mut DiffSink<'_>, change:
     match change {
         Change::Addition { location, id, .. } => {
             let path = location.to_string();
-            let new = repo.find_object(id.into_owned()).map(|o| o.data.clone()).unwrap_or_default();
-            render_file_addition(sink, &path, &new);
+            if let Ok(new) = repo.find_object(id.into_owned()) {
+                render_file_addition(sink, &path, &new.data);
+            }
             1
         }
         Change::Deletion { location, id, .. } => {
             let path = location.to_string();
-            let old = repo.find_object(id.into_owned()).map(|o| o.data.clone()).unwrap_or_default();
-            render_file_deletion(sink, &path, &old);
+            if let Ok(old) = repo.find_object(id.into_owned()) {
+                render_file_deletion(sink, &path, &old.data);
+            }
             1
         }
         Change::Modification { location, previous_id, id, .. } => {
             let path = location.to_string();
-            let old = repo.find_object(previous_id.into_owned()).map(|o| o.data.clone()).unwrap_or_default();
-            let new = repo.find_object(id.into_owned()).map(|o| o.data.clone()).unwrap_or_default();
-            render_file_modification(sink, &path, &old, &new);
+            if let (Ok(old), Ok(new)) = (repo.find_object(previous_id.into_owned()), repo.find_object(id.into_owned()))
+            {
+                render_file_modification(sink, &path, &old.data, &new.data);
+            }
             1
         }
         Change::Rewrite { location, source_id, id, .. } => {
@@ -884,9 +889,9 @@ fn render_staged_change(repo: &gix::Repository, sink: &mut DiffSink<'_>, change:
             // rename header `R old -> new` is a follow-up; today both git
             // and we show this as a modification at the new path.
             let path = location.to_string();
-            let old = repo.find_object(source_id.into_owned()).map(|o| o.data.clone()).unwrap_or_default();
-            let new = repo.find_object(id.into_owned()).map(|o| o.data.clone()).unwrap_or_default();
-            render_file_modification(sink, &path, &old, &new);
+            if let (Ok(old), Ok(new)) = (repo.find_object(source_id.into_owned()), repo.find_object(id.into_owned())) {
+                render_file_modification(sink, &path, &old.data, &new.data);
+            }
             1
         }
     }
@@ -929,15 +934,17 @@ fn render_unstaged_diff(repo: &gix::Repository, sink: &mut DiffSink<'_>) -> usiz
         }
         match status {
             index_as_worktree::EntryStatus::Change(index_as_worktree::Change::Removed) => {
-                let old = repo.find_object(entry.id).map(|o| o.data.clone()).unwrap_or_default();
-                render_file_deletion(sink, &path, &old);
+                if let Ok(old) = repo.find_object(entry.id) {
+                    render_file_deletion(sink, &path, &old.data);
+                }
                 emitted += 1;
             }
             index_as_worktree::EntryStatus::Change(index_as_worktree::Change::Modification { .. })
             | index_as_worktree::EntryStatus::Change(index_as_worktree::Change::Type { .. }) => {
-                let old = repo.find_object(entry.id).map(|o| o.data.clone()).unwrap_or_default();
                 let new = workdir.as_ref().and_then(|wd| std::fs::read(wd.join(&path)).ok()).unwrap_or_default();
-                render_file_modification(sink, &path, &old, &new);
+                if let Ok(old) = repo.find_object(entry.id) {
+                    render_file_modification(sink, &path, &old.data, &new);
+                }
                 emitted += 1;
             }
             // Conflicts, intent-to-add, submodule modifications, and

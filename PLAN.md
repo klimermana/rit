@@ -187,13 +187,16 @@ criterion lines in the commit body.
 Per-frame call; no direct bench but the simplification stands on its
 own.
 
-### 5b — Drop `o.data.clone()` (9 sites)
+### 5b — Drop `o.data.clone()` (12 sites) ✅
 
 `git/mod.rs:571,576,581-582,858,864,870-871,925,931-932`. Borrow the
 blob directly: `if let Ok(o) = repo.find_object(*oid) { render_*(sink, &p, &o.data); }`.
 
 **Bench**: `diff_generation` (both `large_5000_lines` and
-`working_tree_diff/staged_plus_unstaged`).
+`working_tree_diff/staged_plus_unstaged`). Bench delta is within
+measurement noise (±1-2% across two runs) — the change is
+mechanically correct (fewer allocations) but the saved Vec clones
+are small enough not to dominate the bench timing.
 
 ### 5c — Single-pass `repo.status` in `compute_working_tree_diff`
 
