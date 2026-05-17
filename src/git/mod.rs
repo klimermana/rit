@@ -462,8 +462,12 @@ fn relative_time(unix_secs: i64) -> CompactString {
     let now = Utc::now();
     let t = Utc.timestamp_opt(unix_secs, 0).single().unwrap_or(now);
     let s = now.signed_duration_since(t).num_seconds();
-    if s < 60 {
-        format!("{}s ago", s).into()
+    // Clock-skewed or future-dated commits collapse to "now" — otherwise
+    // the < 60 branch would print "-12s ago" and similar.
+    if s < 0 {
+        "now".into()
+    } else if s < 60 {
+        format!("{s}s ago").into()
     } else if s < 3600 {
         format!("{}m ago", s / 60).into()
     } else if s < 86400 {
@@ -1076,7 +1080,7 @@ fn compute_working_tree_diff(repo: &gix::Repository, target: DiffTarget) -> Diff
 mod tests {
     use super::{
         GitMsg, HistoryMsg, MAX_INLINE_DIFF_BYTES, SkipReason, Walker, build_commit_info, build_pathspec_search,
-        classify_skip, hunk_header, quick_is_dirty,
+        classify_skip, hunk_header, quick_is_dirty, relative_time,
     };
     use crate::model::{CommitRecord, PathFilter};
     use gix::bstr::BStr;
@@ -1240,6 +1244,22 @@ mod tests {
         let groups: Vec<_> = diff.grouped_ops(3).into_iter().collect();
         assert_eq!(groups.len(), 1);
         assert_eq!(hunk_header(&groups[0]), "@@ -1,2 +0,0 @@");
+    }
+
+    #[test]
+    fn relative_time_clamps_future_dated_to_now() {
+        // A commit timestamped far in the future shouldn't render as
+        // "-12345s ago" — the < 0 case collapses to "now".
+        let far_future = chrono::Utc::now().timestamp() + 86400 * 365 * 10;
+        assert_eq!(relative_time(far_future).as_str(), "now");
+    }
+
+    #[test]
+    fn relative_time_recent_past_renders_relative() {
+        // Sanity that the happy path still works after the future-clamp
+        // branch was added.
+        let recent = chrono::Utc::now().timestamp() - 120;
+        assert_eq!(relative_time(recent).as_str(), "2m ago");
     }
 
     #[test]

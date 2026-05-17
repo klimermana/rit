@@ -135,7 +135,7 @@ Run `./fix` at the end.
 
 ---
 
-## Stage 4 — Correctness fixes (one commit each)
+## Stage 4 — Correctness fixes (one commit each) ✅
 
 ### 4a — `hunk_header` empty-range fix ✅
 
@@ -162,7 +162,7 @@ if practical, otherwise a manual note in the commit body.
 
 **Gate**: build clean, tests pass.
 
-### 4d — `relative_time` clamps future dates
+### 4d — `relative_time` clamps future dates ✅
 
 `git/mod.rs:461`. Negative `s` → return `"now"`.
 
