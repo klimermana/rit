@@ -1,5 +1,11 @@
 # rit hardening + cleanup plan
 
+## Progress log
+
+| Stage | Commit | Description |
+|---|---|---|
+| 0 | _pending_ | Prep + baselines |
+
 Project plan derived from the 2026-05-17 code review. Implements every
 item raised in the review (correctness, perf, refactor) and turns the
 already-written-but-dormant clippy config into something that actually
@@ -25,32 +31,38 @@ fires.
 
 ---
 
-## Stage 0 — Prep & baselines
+## Stage 0 — Prep & baselines ✅
 
-1. Verify clean tree.
-2. Add a new bench parameter `indexing/with_pathspec` to
+1. ✅ Verify clean tree.
+2. ✅ Add a new bench parameter `indexing/with_pathspec` to
    `benches/indexing.rs` so the Stage 5h change has something to compare
    against.
-3. Save the baseline every perf commit will compare against:
+3. ✅ Save the baseline every perf commit will compare against:
    ```
    cargo bench -- --save-baseline pre-cleanup
    ```
-4. Record the current clippy-warning counts:
-   - As-shipped (defaults only): `cargo clippy --quiet --no-deps 2>&1 | grep -c '^warning:'`
-   - Intended config preview:
-     ```
-     cargo clippy --quiet --no-deps -- \
-       -W clippy::indexing_slicing -W clippy::unwrap_used \
-       -W clippy::allow_attributes -W clippy::panic
-     ```
+4. ✅ Record the current clippy-warning counts:
+   - As-shipped (defaults only): **2** warnings
+   - Intended config preview (the curated list from `Cargo.toml`): **51** warnings
+
+**Baseline numbers** (`pre-cleanup`):
+
+| Bench | Mean |
+|---|---|
+| `indexing/50` | 2.54 ms |
+| `indexing/200` | 7.60 ms |
+| `indexing_with_pathspec/50` | 5.83 ms |
+| `indexing_with_pathspec/200` | 23.96 ms |
+| `diff_generation/small_10_lines` | 58.6 µs |
+| `diff_generation/large_5000_lines` | 296.3 µs |
+| `working_tree_diff/staged_plus_unstaged` | 869.7 µs |
 
 **Gate**
 
-- `git status` clean.
-- `target/criterion/*/pre-cleanup/` directories exist for every bench
+- ✅ `git status` clean.
+- ✅ `target/criterion/*/pre-cleanup/` directories exist for every bench
   (including the new pathspec one).
-- Both warning counts recorded in the Stage 0 commit body for later
-  comparison.
+- ✅ Both warning counts recorded above for later comparison.
 
 ---
 
