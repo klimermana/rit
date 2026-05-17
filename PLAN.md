@@ -222,12 +222,15 @@ The win matches the saved clone: one HashMap clone replaced by an
 atomic Arc bump. Even with empty refs the indexing path takes a
 measurable step down on the larger fixture.
 
-### 5e — Backfill `RefsLoaded` only over first-batch rows
+### 5e — Backfill `RefsLoaded` only over first-batch rows ✅
 
 Worker tags `RefsLoaded` with the row count where refs became live;
 app's backfill loop is bounded by that.
 
-**Gate**: rendering still shows refs on the first batch in tests.
+**Gate**: 32 tests pass. Backfill is scoped to the first
+`INITIAL_BATCH` rows (≤ 64) instead of the entire log. On a
+100k-commit repo this turns the post-refs loop from O(rows) into
+O(64).
 
 ### 5f — `extend_commit_matches` reuses lowercased `last_query`
 

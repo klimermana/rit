@@ -34,9 +34,16 @@ pub enum HistoryMsg {
     /// Shared via `Arc` so the walker (which keeps its own clone for the
     /// next batch's build_commit_info) and this message don't duplicate
     /// the map for ref-heavy repos.
+    ///
+    /// `first_batch_rows` is the count of commit rows the app received
+    /// before refs were live — i.e. the rows that need backfill. Every
+    /// commit after that index was built with the refs already loaded.
+    /// On a 100k-commit repo this turns the backfill loop from
+    /// O(all-rows) into O(first-batch) ≈ O(64).
     RefsLoaded {
         generation: u64,
         refs_map: Arc<HashMap<ObjectId, Vec<RefLabel>>>,
+        first_batch_rows: usize,
     },
     WalkDone {
         generation: u64,

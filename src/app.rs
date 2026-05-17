@@ -398,10 +398,15 @@ impl App {
                     self.walk_done = true;
                 }
             }
-            HistoryMsg::RefsLoaded { generation, refs_map } => {
+            HistoryMsg::RefsLoaded { generation, refs_map, first_batch_rows } => {
                 if generation == self.walk_gen {
-                    // Backfill ref labels on commits already in the log.
-                    for row in &mut self.log.rows {
+                    // Backfill ref labels only on commits that arrived before
+                    // refs were live. The working-tree row is at index 0
+                    // (not a Commit), so the prefix runs `[1..=first_batch_rows]`.
+                    // Subsequent batches were built with the refs already in
+                    // hand and don't need touching.
+                    let backfill_end = (first_batch_rows + 1).min(self.log.rows.len());
+                    for row in self.log.rows.iter_mut().take(backfill_end) {
                         if let LogRow::Commit(c) = row
                             && let Some(labels) = refs_map.get(&c.id)
                         {

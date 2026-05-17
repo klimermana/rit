@@ -110,14 +110,18 @@ fn run_git_thread_inner(
 
         if !walker.done {
             let n = if refs_loaded { PAGE_BATCH } else { INITIAL_BATCH };
-            walker.load_more(n, &msg_tx)?;
+            let emitted = walker.load_more(n, &msg_tx)?;
             // After the first batch, load refs and backfill so branch/tag
             // decorations appear without blocking startup.
             if !refs_loaded {
                 refs_loaded = true;
                 let refs_map = Arc::new(load_refs(&repo));
                 walker.refs_map = Arc::clone(&refs_map);
-                _ = msg_tx.send(GitMsg::History(HistoryMsg::RefsLoaded { generation: walker.generation, refs_map }));
+                _ = msg_tx.send(GitMsg::History(HistoryMsg::RefsLoaded {
+                    generation: walker.generation,
+                    refs_map,
+                    first_batch_rows: emitted,
+                }));
             }
             continue;
         }
@@ -218,15 +222,18 @@ impl<'r> Walker<'r> {
         })
     }
 
-    fn load_more(&mut self, requested: usize, msg_tx: &Sender<GitMsg>) -> Result<()> {
+    /// Pull and emit one batch. Returns the count of commits emitted —
+    /// the worker uses this to tell `RefsLoaded` how far the
+    /// refs-less prefix extends so the app can bound its backfill loop.
+    fn load_more(&mut self, requested: usize, msg_tx: &Sender<GitMsg>) -> Result<usize> {
         if self.done {
             _ = msg_tx.send(GitMsg::History(HistoryMsg::WalkDone { generation: self.generation }));
-            return Ok(());
+            return Ok(0);
         }
         let Some(iter) = self.iter.as_mut() else {
             self.done = true;
             _ = msg_tx.send(GitMsg::History(HistoryMsg::WalkDone { generation: self.generation }));
-            return Ok(());
+            return Ok(0);
         };
 
         let target = requested.max(1);
@@ -262,13 +269,14 @@ impl<'r> Walker<'r> {
             }
         }
 
+        let emitted = batch.len();
         if !batch.is_empty() {
             _ = msg_tx.send(GitMsg::History(HistoryMsg::Commits { generation: self.generation, commits: batch }));
         }
         if self.done {
             _ = msg_tx.send(GitMsg::History(HistoryMsg::WalkDone { generation: self.generation }));
         }
-        Ok(())
+        Ok(emitted)
     }
 }
 
