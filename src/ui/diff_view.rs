@@ -111,18 +111,40 @@ fn diff_title(app: &App) -> String {
         },
         None => return " Diff ".to_string(),
     };
-    if let Some(stats) = app.diff.document.as_ref().map(|d| &d.stats) {
-        format!(
-            " Diff: {}  {} file{} changed  +{}  -{}{} ",
-            label,
-            stats.files,
-            if stats.files == 1 { "" } else { "s" },
-            stats.insertions,
-            stats.deletions,
-            mode_tag,
-        )
+    let Some(doc) = app.diff.document.as_ref() else {
+        return format!(" Diff: {}{} ", label, mode_tag);
+    };
+    let stats = &doc.stats;
+    let trunc_tag = truncation_tag(&doc.flags);
+    format!(
+        " Diff: {}  {} file{} changed  +{}  -{}{}{} ",
+        label,
+        stats.files,
+        if stats.files == 1 { "" } else { "s" },
+        stats.insertions,
+        stats.deletions,
+        mode_tag,
+        trunc_tag,
+    )
+}
+
+/// Suffix appended to the diff title when any guardrail kicked in. Empty
+/// string when `flags.truncated` is false.
+fn truncation_tag(flags: &crate::model::DiffFlags) -> String {
+    if !flags.truncated {
+        return String::new();
+    }
+    let mut parts: Vec<String> = Vec::new();
+    if flags.skipped_binary_files > 0 {
+        parts.push(format!("{} binary", flags.skipped_binary_files));
+    }
+    if flags.skipped_large_files > 0 {
+        parts.push(format!("{} large", flags.skipped_large_files));
+    }
+    if parts.is_empty() {
+        "  [truncated]".to_string()
     } else {
-        format!(" Diff: {}{} ", label, mode_tag)
+        format!("  [truncated: {}]", parts.join(", "))
     }
 }
 

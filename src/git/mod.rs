@@ -17,6 +17,14 @@ use gix::{bstr::ByteSlice, ObjectId};
 use similar::ChangeTag;
 use std::collections::{BTreeMap, HashMap};
 
+/// Cutoffs that keep `compute_commit_diff` responsive on pathological
+/// commits. Anything past these limits gets a one-line summary instead of
+/// a fully inlined hunk-by-hunk diff; the `DiffFlags` on the resulting
+/// `DiffDocument` reports what was skipped so the UI can surface it.
+const MAX_INLINE_DIFF_BYTES: usize = 256 * 1024;
+const MAX_INLINE_DIFF_LINES: usize = 20_000;
+const MAX_INLINE_DIFF_FILES: usize = 200;
+
 /// Combined request envelope so the app can keep one channel pair to the
 /// (currently single) worker thread, while the type system still shows
 /// which side -- history or inspect -- owns each operation.
@@ -495,14 +503,15 @@ fn compute_commit_diff_inner(repo: &gix::Repository, id: ObjectId, target: DiffT
     let cur_tree = commit_obj.tree()?;
     let parent_ids: Vec<ObjectId> = decoded.parents().collect();
 
+    let mut flags = DiffFlags::default();
     if parent_ids.is_empty() {
-        diff_trees(repo, &repo.empty_tree(), &cur_tree, &mut body, &mut stats, &mut files)?;
+        diff_trees(repo, &repo.empty_tree(), &cur_tree, &mut body, &mut stats, &mut files, &mut flags)?;
     } else {
         let par_tree = repo.find_object(parent_ids[0])?.try_into_commit()?.tree()?;
-        diff_trees(repo, &par_tree, &cur_tree, &mut body, &mut stats, &mut files)?;
+        diff_trees(repo, &par_tree, &cur_tree, &mut body, &mut stats, &mut files, &mut flags)?;
     }
 
-    Ok(DiffDocument { target, header, body, files, stats, flags: DiffFlags::default() })
+    Ok(DiffDocument { target, header, body, files, stats, flags })
 }
 
 fn diff_trees<'r>(
@@ -512,6 +521,7 @@ fn diff_trees<'r>(
     lines: &mut Vec<DiffLine>,
     stats: &mut DiffStats,
     files: &mut Vec<FileStat>,
+    flags: &mut DiffFlags,
 ) -> Result<()> {
     use gix::{diff::tree::recorder::Change, objs::TreeRefIter};
 
@@ -526,62 +536,121 @@ fn diff_trees<'r>(
     )?;
 
     for change in &recorder.records {
+        // File-count cap: emit a summary row once, then stop materialising
+        // file diffs entirely. The diffstat in `files` keeps accumulating
+        // so the summary header still shows the right counts.
+        if stats.files >= MAX_INLINE_DIFF_FILES {
+            if !flags.truncated {
+                flags.truncated = true;
+                lines.push(DiffLine::new(
+                    DiffLineKind::Faint,
+                    format!(
+                        "… {} files changed; remaining file diffs suppressed (>{} files)",
+                        stats.files, MAX_INLINE_DIFF_FILES,
+                    ),
+                ));
+            }
+            // Still count this file in stats/diffstat without emitting a hunk.
+            if let Some(p) = change_path(change) {
+                stats.files += 1;
+                files.push(FileStat { path: p, additions: 0, deletions: 0 });
+            }
+            continue;
+        }
+
+        // Line-count cap: same idea, but per accumulated body lines.
+        if lines.len() >= MAX_INLINE_DIFF_LINES {
+            if !flags.truncated {
+                flags.truncated = true;
+                lines.push(DiffLine::new(
+                    DiffLineKind::Faint,
+                    format!("… diff truncated at {} lines; remaining files summarised", MAX_INLINE_DIFF_LINES),
+                ));
+            }
+            if let Some(p) = change_path(change) {
+                stats.files += 1;
+                files.push(FileStat { path: p, additions: 0, deletions: 0 });
+            }
+            continue;
+        }
+
         match change {
             Change::Addition { entry_mode, oid, path, .. } if entry_mode.is_blob() => {
                 let p = path.to_str_lossy().into_owned();
-                lines.push(DiffLine::new(DiffLineKind::FileHeader, format!("diff --git a/{p} b/{p}")));
-                lines.push(DiffLine::new(DiffLineKind::FileMeta, "new file"));
-                lines.push(DiffLine::new(DiffLineKind::OldMarker, "--- /dev/null"));
-                lines.push(DiffLine::new(DiffLineKind::NewMarker, format!("+++ b/{p}")));
-                let mut file_add = 0usize;
-                if let Ok(blob) = repo.find_object(*oid) {
-                    let content = blob.data.to_str_lossy();
-                    for line in content.lines() {
-                        stats.insertions += 1;
-                        file_add += 1;
-                        lines.push(DiffLine::new(DiffLineKind::Add, format!("+{}", line)));
+                let blob_data = repo.find_object(*oid).map(|o| o.data.clone()).unwrap_or_default();
+                let skip = classify_skip(&blob_data, &[]);
+                push_file_headers(lines, &p, Some("new file"));
+                let (file_add, file_del) = match skip {
+                    Some(reason) => {
+                        push_skip_summary(lines, flags, reason, blob_data.len());
+                        (0, 0)
                     }
-                }
+                    None => {
+                        let content = blob_data.to_str_lossy();
+                        let mut file_add = 0usize;
+                        for line in content.lines() {
+                            stats.insertions += 1;
+                            file_add += 1;
+                            lines.push(DiffLine::new(DiffLineKind::Add, format!("+{}", line)));
+                        }
+                        (file_add, 0usize)
+                    }
+                };
                 stats.files += 1;
-                files.push(FileStat { path: p, additions: file_add, deletions: 0 });
+                files.push(FileStat { path: p, additions: file_add, deletions: file_del });
             }
             Change::Deletion { entry_mode, oid, path, .. } if entry_mode.is_blob() => {
                 let p = path.to_str_lossy().into_owned();
-                lines.push(DiffLine::new(DiffLineKind::FileHeader, format!("diff --git a/{p} b/{p}")));
-                lines.push(DiffLine::new(DiffLineKind::FileMeta, "deleted file"));
-                lines.push(DiffLine::new(DiffLineKind::OldMarker, format!("--- a/{p}")));
-                lines.push(DiffLine::new(DiffLineKind::NewMarker, "+++ /dev/null"));
-                let mut file_del = 0usize;
-                if let Ok(blob) = repo.find_object(*oid) {
-                    let content = blob.data.to_str_lossy();
-                    for line in content.lines() {
-                        stats.deletions += 1;
-                        file_del += 1;
-                        lines.push(DiffLine::new(DiffLineKind::Del, format!("-{}", line)));
+                let blob_data = repo.find_object(*oid).map(|o| o.data.clone()).unwrap_or_default();
+                let skip = classify_skip(&blob_data, &[]);
+                push_file_headers(lines, &p, Some("deleted file"));
+                let (file_add, file_del) = match skip {
+                    Some(reason) => {
+                        push_skip_summary(lines, flags, reason, blob_data.len());
+                        (0, 0)
                     }
-                }
+                    None => {
+                        let content = blob_data.to_str_lossy();
+                        let mut file_del = 0usize;
+                        for line in content.lines() {
+                            stats.deletions += 1;
+                            file_del += 1;
+                            lines.push(DiffLine::new(DiffLineKind::Del, format!("-{}", line)));
+                        }
+                        (0usize, file_del)
+                    }
+                };
                 stats.files += 1;
-                files.push(FileStat { path: p, additions: 0, deletions: file_del });
+                files.push(FileStat { path: p, additions: file_add, deletions: file_del });
             }
             Change::Modification { entry_mode, previous_oid, oid, path, .. } if entry_mode.is_blob() => {
                 let p = path.to_str_lossy().into_owned();
-                lines.push(DiffLine::new(DiffLineKind::FileHeader, format!("diff --git a/{p} b/{p}")));
-                lines.push(DiffLine::new(DiffLineKind::OldMarker, format!("--- a/{p}")));
-                lines.push(DiffLine::new(DiffLineKind::NewMarker, format!("+++ b/{p}")));
-                let old =
-                    repo.find_object(*previous_oid).map(|o| o.data.to_str_lossy().into_owned()).unwrap_or_default();
-                let new = repo.find_object(*oid).map(|o| o.data.to_str_lossy().into_owned()).unwrap_or_default();
-                let diff = similar::TextDiff::from_lines(old.as_str(), new.as_str());
-                let mut file_add = 0usize;
-                let mut file_del = 0usize;
-                for group in diff.grouped_ops(3) {
-                    lines.push(DiffLine::new(DiffLineKind::HunkHeader, hunk_header(&group)));
-                    for op in &group {
-                        for ch in diff.iter_changes(op) {
-                            push_change(lines, stats, &mut file_add, &mut file_del, ch.tag(), ch.value());
-                        }
+                let old = repo.find_object(*previous_oid).map(|o| o.data.clone()).unwrap_or_default();
+                let new = repo.find_object(*oid).map(|o| o.data.clone()).unwrap_or_default();
+                let skip = classify_skip(&old, &new);
+                push_file_headers(lines, &p, None);
+                let (file_add, file_del) = match skip {
+                    Some(reason) => {
+                        push_skip_summary(lines, flags, reason, old.len().max(new.len()));
+                        (0, 0)
                     }
-                }
+                    None => {
+                        let old_s = old.to_str_lossy();
+                        let new_s = new.to_str_lossy();
+                        let diff = similar::TextDiff::from_lines(old_s.as_ref(), new_s.as_ref());
+                        let mut file_add = 0usize;
+                        let mut file_del = 0usize;
+                        for group in diff.grouped_ops(3) {
+                            lines.push(DiffLine::new(DiffLineKind::HunkHeader, hunk_header(&group)));
+                            for op in &group {
+                                for ch in diff.iter_changes(op) {
+                                    push_change(lines, stats, &mut file_add, &mut file_del, ch.tag(), ch.value());
+                                }
+                            }
+                        }
+                        (file_add, file_del)
+                    }
+                };
                 stats.files += 1;
                 files.push(FileStat { path: p, additions: file_add, deletions: file_del });
             }
@@ -589,6 +658,65 @@ fn diff_trees<'r>(
         }
     }
     Ok(())
+}
+
+/// Reason a file's inline diff was omitted. Each maps to a single
+/// faint-rendered line in the output and bumps a counter on `DiffFlags`.
+enum SkipReason {
+    Binary,
+    Oversize,
+}
+
+/// Decide whether a file should be summarised rather than fully diffed.
+/// `old` and `new` are raw blob bytes (either may be empty for pure
+/// add/delete).
+fn classify_skip(old: &[u8], new: &[u8]) -> Option<SkipReason> {
+    // NUL-byte sniff matches the convention used in compute_numstat_gix.
+    if old.contains(&0) || new.contains(&0) {
+        return Some(SkipReason::Binary);
+    }
+    if old.len() > MAX_INLINE_DIFF_BYTES || new.len() > MAX_INLINE_DIFF_BYTES {
+        return Some(SkipReason::Oversize);
+    }
+    None
+}
+
+fn push_skip_summary(lines: &mut Vec<DiffLine>, flags: &mut DiffFlags, reason: SkipReason, biggest_side_bytes: usize) {
+    let text = match reason {
+        SkipReason::Binary => {
+            flags.skipped_binary_files += 1;
+            "Binary file — diff suppressed".to_string()
+        }
+        SkipReason::Oversize => {
+            flags.skipped_large_files += 1;
+            let kib = biggest_side_bytes / 1024;
+            format!("Large file ({kib} KiB) — diff suppressed (>{} KiB)", MAX_INLINE_DIFF_BYTES / 1024)
+        }
+    };
+    flags.truncated = true;
+    lines.push(DiffLine::new(DiffLineKind::Faint, text));
+}
+
+fn push_file_headers(lines: &mut Vec<DiffLine>, path: &str, mode_meta: Option<&str>) {
+    lines.push(DiffLine::new(DiffLineKind::FileHeader, format!("diff --git a/{path} b/{path}")));
+    if let Some(m) = mode_meta {
+        lines.push(DiffLine::new(DiffLineKind::FileMeta, m));
+    }
+    let (old_marker, new_marker) = match mode_meta {
+        Some("new file") => ("--- /dev/null".to_string(), format!("+++ b/{path}")),
+        Some("deleted file") => (format!("--- a/{path}"), "+++ /dev/null".to_string()),
+        _ => (format!("--- a/{path}"), format!("+++ b/{path}")),
+    };
+    lines.push(DiffLine::new(DiffLineKind::OldMarker, old_marker));
+    lines.push(DiffLine::new(DiffLineKind::NewMarker, new_marker));
+}
+
+fn change_path(change: &gix::diff::tree::recorder::Change) -> Option<String> {
+    use gix::diff::tree::recorder::Change;
+    let path = match change {
+        Change::Addition { path, .. } | Change::Deletion { path, .. } | Change::Modification { path, .. } => path,
+    };
+    Some(path.to_str_lossy().into_owned())
 }
 
 /// Build a `@@ -old_start,old_len +new_start,new_len @@` header that covers
@@ -927,7 +1055,7 @@ fn numstat_for_blobs(old: &[u8], new: &[u8]) -> (usize, usize) {
 
 #[cfg(test)]
 mod tests {
-    use super::{build_pathspec_search, hunk_header};
+    use super::{build_pathspec_search, classify_skip, hunk_header, SkipReason, MAX_INLINE_DIFF_BYTES};
     use crate::model::PathFilter;
     use gix::bstr::BStr;
     use similar::TextDiff;
@@ -1007,5 +1135,36 @@ mod tests {
         assert_eq!(headers[0], "@@ -1,6 +1,6 @@");
         // Second hunk: lines around index 27 -> 1-based 28, 3 above and 2 below.
         assert_eq!(headers[1], "@@ -25,6 +25,6 @@");
+    }
+
+    #[test]
+    fn classify_skip_flags_binary_by_nul_byte() {
+        assert!(matches!(classify_skip(b"hello\0world", b"new"), Some(SkipReason::Binary)));
+        assert!(matches!(classify_skip(b"old", b"\x00binary"), Some(SkipReason::Binary)));
+    }
+
+    #[test]
+    fn classify_skip_flags_oversize() {
+        // Either side larger than MAX_INLINE_DIFF_BYTES triggers the cap.
+        let big = vec![b'a'; MAX_INLINE_DIFF_BYTES + 1];
+        assert!(matches!(classify_skip(&big, b""), Some(SkipReason::Oversize)));
+        assert!(matches!(classify_skip(b"", &big), Some(SkipReason::Oversize)));
+    }
+
+    #[test]
+    fn classify_skip_passes_normal_text_pair() {
+        assert!(classify_skip(b"hello\n", b"world\n").is_none());
+        // Right at the boundary -- equal to the cap should still pass.
+        let at_cap = vec![b'a'; MAX_INLINE_DIFF_BYTES];
+        assert!(classify_skip(&at_cap, b"").is_none());
+    }
+
+    #[test]
+    fn classify_skip_binary_wins_over_size() {
+        // A binary file that's also oversized should report Binary first
+        // -- the user cares about "this is binary" more than "this is big".
+        let mut big_binary = vec![b'a'; MAX_INLINE_DIFF_BYTES + 1];
+        big_binary[0] = 0;
+        assert!(matches!(classify_skip(&big_binary, b""), Some(SkipReason::Binary)));
     }
 }
