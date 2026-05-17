@@ -25,7 +25,7 @@
 | 6b | `d1c53d7` | `app.rs` 1065 → 5 files (mod 595, state 227, input 185, search 69, clipboard 44). |
 | 6c | `db22712` | Unified `SearchState`. `DiffSearchState` is now a type alias; `CommitSearchState` composes `state` + narrowing fields. |
 | 6d | `d91c0fa` | `jump_first_at_or_after` helper folds the two cursor-jump methods into 4-line dispatchers. |
-| 7 | `(this commit)` | Final validation: full build/clippy/test/bench pass, summary table added below. |
+| 7 | `1286524` | Final validation: full build/clippy/test/bench pass, summary table added below. |
 
 ## Final summary
 
