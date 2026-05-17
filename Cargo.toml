@@ -39,7 +39,7 @@ harness = false
 name = "diff_generation"
 harness = false
 
-[workspace.lints.clippy]
+[lints.clippy]
 # Don't Panic - prevent panics from unwraps and unsafe slicing or indexing
 string_slice = "warn"
 indexing_slicing = "warn"

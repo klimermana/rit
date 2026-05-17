@@ -53,3 +53,16 @@ can be evaluated against real data instead of intuition.
 - `cargo build` — debug build (fast)
 - `cargo test --tests` — run the 28 unit + integration tests
 - `cargo build --benches` — verify bench code compiles without running benches
+
+## Lints
+
+The curated `[lints.clippy]` block in `Cargo.toml` is set at `warn`
+locally so individual commits aren't blocked. CI should treat lints as
+errors:
+
+```
+cargo clippy --no-deps -- -D warnings
+```
+
+Every `#[allow(...)]` should be `#[expect(..., reason = "...")]` — the
+`allow_attributes_without_reason` lint enforces this.
