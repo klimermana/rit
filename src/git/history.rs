@@ -8,7 +8,7 @@
 
 use crate::model::{CommitRecord, RefLabel, RepoInfo};
 use gix::ObjectId;
-use std::collections::HashMap;
+use std::{collections::HashMap, sync::Arc};
 
 /// Requests the history side answers. There is intentionally no
 /// `LoadMore` — the worker streams batches continuously in the
@@ -31,9 +31,12 @@ pub enum HistoryMsg {
     },
     /// Deferred ref labels — sent after the first commit batch so the UI
     /// can backfill branch/tag decorations without blocking startup.
+    /// Shared via `Arc` so the walker (which keeps its own clone for the
+    /// next batch's build_commit_info) and this message don't duplicate
+    /// the map for ref-heavy repos.
     RefsLoaded {
         generation: u64,
-        refs_map: HashMap<ObjectId, Vec<RefLabel>>,
+        refs_map: Arc<HashMap<ObjectId, Vec<RefLabel>>>,
     },
     WalkDone {
         generation: u64,

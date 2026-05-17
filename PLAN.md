@@ -209,12 +209,18 @@ each starting their own status pass.
 **−57.7%** (869.7 µs → 371.3 µs). The marquee perf win of the
 cleanup — three status walks collapsed to one.
 
-### 5d — `Arc<HashMap<...>>` for `RefsLoaded`
+### 5d — `Arc<HashMap<...>>` for `RefsLoaded` ✅
 
 Wrap the refs map so the walker, channel message, and app share one
 allocation.
 
-**Bench**: `indexing` (modest win on ref-heavy repos).
+**Bench** (`indexing` vs pre-cleanup):
+  `indexing/50`                     +0.4% (noise)
+  `indexing/200`                    **−2.4%** (real)
+  `indexing/with_pathspec/{50,200}` within noise
+The win matches the saved clone: one HashMap clone replaced by an
+atomic Arc bump. Even with empty refs the indexing path takes a
+measurable step down on the larger fixture.
 
 ### 5e — Backfill `RefsLoaded` only over first-batch rows
 

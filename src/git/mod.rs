@@ -15,7 +15,7 @@ use compact_str::CompactString;
 use crossbeam_channel::{Receiver, Sender};
 use gix::{ObjectId, bstr::ByteSlice};
 use similar::ChangeTag;
-use std::collections::HashMap;
+use std::{collections::HashMap, sync::Arc};
 
 /// Cutoffs that keep `compute_commit_diff` responsive on pathological
 /// commits. Anything past these limits gets a one-line summary instead of
@@ -71,7 +71,7 @@ fn run_git_thread_inner(
         dirty: quick_is_dirty(&repo),
     }));
 
-    let mut walker = Walker::new(&repo, path_filter.clone(), 0, graph_enabled, HashMap::new())?;
+    let mut walker = Walker::new(&repo, path_filter.clone(), 0, graph_enabled, Arc::new(HashMap::new()))?;
     let mut refs_loaded = false;
 
     // Self-paced indexing loop:
@@ -115,8 +115,8 @@ fn run_git_thread_inner(
             // decorations appear without blocking startup.
             if !refs_loaded {
                 refs_loaded = true;
-                let refs_map = load_refs(&repo);
-                walker.refs_map = refs_map.clone();
+                let refs_map = Arc::new(load_refs(&repo));
+                walker.refs_map = Arc::clone(&refs_map);
                 _ = msg_tx.send(GitMsg::History(HistoryMsg::RefsLoaded { generation: walker.generation, refs_map }));
             }
             continue;
@@ -149,7 +149,7 @@ fn process_request<'r>(
     match req {
         GitReq::History(HistoryReq::Reload) => {
             let next_gen = walker.generation.wrapping_add(1);
-            let refs_map = load_refs(repo);
+            let refs_map = Arc::new(load_refs(repo));
             // The new Walker's `'r` lifetime ties to `repo`, same as
             // the caller's walker — overwriting in place is fine.
             *walker = Walker::new(repo, path_filter.clone(), next_gen, graph_enabled, refs_map)?;
@@ -178,7 +178,7 @@ fn process_request<'r>(
 
 struct Walker<'r> {
     repo: &'r gix::Repository,
-    refs_map: HashMap<ObjectId, Vec<RefLabel>>,
+    refs_map: Arc<HashMap<ObjectId, Vec<RefLabel>>>,
     /// `None` when the `--graph` CLI flag is off — keeps the per-commit lane
     /// bookkeeping out of the hot path entirely.
     graph_state: Option<graph::GraphState>,
@@ -197,7 +197,7 @@ impl<'r> Walker<'r> {
         path_filter: Option<PathFilter>,
         generation: u64,
         graph_enabled: bool,
-        refs_map: HashMap<ObjectId, Vec<RefLabel>>,
+        refs_map: Arc<HashMap<ObjectId, Vec<RefLabel>>>,
     ) -> Result<Self> {
         let (iter, done) = match repo.head_id() {
             Ok(head_id) => (Some(head_id.ancestors().all()?), false),
@@ -1132,7 +1132,7 @@ mod tests {
     use crate::model::{CommitRecord, PathFilter};
     use gix::bstr::BStr;
     use similar::TextDiff;
-    use std::{collections::HashMap, path::Path};
+    use std::{collections::HashMap, path::Path, sync::Arc};
 
     fn pathspec_matches(spec: &str, path: &str) -> bool {
         let mut search = build_pathspec_search(&PathFilter::new(spec)).expect("parse");
@@ -1360,7 +1360,7 @@ mod tests {
         commit_all(path, "modify doc");
 
         let pf = PathFilter::new("src");
-        let mut walker = Walker::new(&repo, Some(pf), 0, false, HashMap::new()).expect("walker");
+        let mut walker = Walker::new(&repo, Some(pf), 0, false, Arc::new(HashMap::new())).expect("walker");
         let (tx, rx) = crossbeam_channel::bounded::<GitMsg>(256);
         walker.load_more(100, &tx).expect("load_more");
 
@@ -1387,7 +1387,7 @@ mod tests {
         commit_all(path, "modify api/baz");
 
         let pf = PathFilter::new("src/api");
-        let mut walker = Walker::new(&repo, Some(pf), 0, false, HashMap::new()).expect("walker");
+        let mut walker = Walker::new(&repo, Some(pf), 0, false, Arc::new(HashMap::new())).expect("walker");
         let (tx, rx) = crossbeam_channel::bounded::<GitMsg>(256);
         walker.load_more(100, &tx).expect("load_more");
 
