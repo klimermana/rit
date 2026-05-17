@@ -159,12 +159,12 @@ fn process_request<'r>(
         GitReq::Inspect(InspectReq::LoadDiff(target)) => {
             let document = match target {
                 DiffTarget::Commit(id) => compute_commit_diff(repo, id),
-                DiffTarget::WorkingTree => compute_working_tree_diff(repo_path, target),
+                DiffTarget::WorkingTree => compute_working_tree_diff(repo, repo_path, target),
             };
             let _ = msg_tx.send(GitMsg::Inspect(InspectMsg::DiffLoaded(document)));
         }
         GitReq::Inspect(InspectReq::LoadStatus) => {
-            let document = compute_status(repo_path);
+            let document = compute_status(repo, repo_path);
             let _ = msg_tx.send(GitMsg::Inspect(InspectMsg::StatusLoaded(document)));
         }
         GitReq::Inspect(InspectReq::RefreshWorkingTreeMeta) => {
@@ -637,38 +637,25 @@ fn format_timestamp(unix_secs: i64) -> String {
     Utc.timestamp_opt(unix_secs, 0).single().unwrap_or_else(Utc::now).format("%a %b %e %T %Y +0000").to_string()
 }
 
-// Working-tree status is still produced by shelling out to `git`. The
-// equivalent gix port would have to reimplement staged/unstaged human-readable
-// diff formatting on top of gix::status iterators — significantly more code
-// than the rest of the worker. Left as a follow-up.
-fn compute_status(repo_path: &str) -> StatusDocument {
-    StatusDocument { lines: compute_status_lines(repo_path) }
+// `git status --short` and per-file numstat are now produced natively via
+// `gix::status`. The two `git diff [--cached]` shell-outs inside
+// `compute_status_lines` below still remain — replicating git's exact
+// human-readable diff text (including the `index <oid>..<oid> <mode>` line,
+// rename headers, and binary-file callouts) is out of scope for this commit
+// and is left as a follow-up.
+fn compute_status(repo: &gix::Repository, repo_path: &str) -> StatusDocument {
+    StatusDocument { lines: compute_status_lines(repo, repo_path) }
 }
 
-fn compute_status_lines(repo_path: &str) -> Vec<DiffLine> {
+fn compute_status_lines(repo: &gix::Repository, repo_path: &str) -> Vec<DiffLine> {
     use std::process::Command;
     let mut lines: Vec<DiffLine> = Vec::new();
 
     lines.push(DiffLine::new(DiffLineKind::SectionTitle, "Working Tree Status"));
     lines.push(DiffLine::new(DiffLineKind::Blank, ""));
 
-    if let Ok(out) = Command::new("git").args(["-C", repo_path, "status", "--short"]).output() {
-        let s = String::from_utf8_lossy(&out.stdout);
-        if s.trim().is_empty() {
-            lines.push(DiffLine::new(DiffLineKind::Good, "Nothing to commit, working tree clean"));
-        } else {
-            for line in s.lines() {
-                let kind = if line.starts_with("M ") || line.starts_with("A ") || line.starts_with("D ") {
-                    DiffLineKind::StatusOurs
-                } else if line.starts_with(" M") || line.starts_with(" D") || line.starts_with("??") {
-                    DiffLineKind::StatusTheirs
-                } else {
-                    DiffLineKind::Faint
-                };
-                lines.push(DiffLine::new(kind, line));
-            }
-        }
-    }
+    let short = compute_short_status_lines_gix(repo);
+    lines.extend(short);
 
     lines.push(DiffLine::new(DiffLineKind::Blank, ""));
     lines.push(DiffLine::new(DiffLineKind::SectionStaged, "── Staged ──────────────────────────────────────────────"));
@@ -704,6 +691,94 @@ fn compute_status_lines(repo_path: &str) -> Vec<DiffLine> {
     lines
 }
 
+/// Compute the equivalent of `git status --short` natively via `gix::status`.
+///
+/// Each tracked path's two-column status (staged column / unstaged column) is
+/// folded together so files modified in both stages emit a single `MM <path>`
+/// row, matching git. Untracked entries surface as `?? <path>` rows.
+fn compute_short_status_lines_gix(repo: &gix::Repository) -> Vec<DiffLine> {
+    use gix::status::{index_worktree, plumbing::index_as_worktree, UntrackedFiles};
+    use std::collections::BTreeMap;
+
+    // Per-path: (staged_char, unstaged_char). Space means "no change in that
+    // column". Untracked is special-cased as ('?', '?').
+    let mut by_path: BTreeMap<String, (char, char)> = BTreeMap::new();
+    // Errors (e.g. detached worktree without an index) just yield an empty
+    // status; the caller still prints the surrounding section frame.
+    if let Ok(platform) = repo.status(gix::progress::Discard) {
+        let iter = match platform.untracked_files(UntrackedFiles::Collapsed).into_iter(Vec::new()) {
+            Ok(it) => it,
+            Err(_) => return vec![DiffLine::new(DiffLineKind::Good, "Nothing to commit, working tree clean")],
+        };
+        for item in iter.flatten() {
+            match item {
+                gix::status::Item::TreeIndex(change) => {
+                    // Staged (HEAD vs index) — affects the first column.
+                    use gix::diff::index::Change;
+                    let (path, c) = match change {
+                        Change::Addition { location, .. } => (location.to_string(), 'A'),
+                        Change::Deletion { location, .. } => (location.to_string(), 'D'),
+                        Change::Modification { location, .. } => (location.to_string(), 'M'),
+                        Change::Rewrite { location, copy, .. } => (location.to_string(), if copy { 'C' } else { 'R' }),
+                    };
+                    let entry = by_path.entry(path).or_insert((' ', ' '));
+                    entry.0 = c;
+                }
+                gix::status::Item::IndexWorktree(iw) => match iw {
+                    index_worktree::Item::Modification { rela_path, status, .. } => {
+                        let c = match status {
+                            index_as_worktree::EntryStatus::Change(index_as_worktree::Change::Removed) => 'D',
+                            index_as_worktree::EntryStatus::Change(
+                                index_as_worktree::Change::Modification { .. }
+                                | index_as_worktree::Change::Type { .. }
+                                | index_as_worktree::Change::SubmoduleModification(_),
+                            ) => 'M',
+                            index_as_worktree::EntryStatus::Conflict { .. } => 'U',
+                            index_as_worktree::EntryStatus::IntentToAdd => 'A',
+                            // NeedsUpdate is a stat-refresh hint, not a user-visible change.
+                            index_as_worktree::EntryStatus::NeedsUpdate(_) => continue,
+                        };
+                        let entry = by_path.entry(rela_path.to_string()).or_insert((' ', ' '));
+                        entry.1 = c;
+                    }
+                    index_worktree::Item::DirectoryContents { entry, .. } => {
+                        // Only true untracked entries show up as `?? <path>`.
+                        if matches!(entry.status, gix::dir::entry::Status::Untracked) {
+                            by_path.entry(entry.rela_path.to_string()).or_insert(('?', '?'));
+                        }
+                    }
+                    // Rewrites/copies between index and worktree would require
+                    // a separately-configured iterator; treat the two halves
+                    // as plain add+delete events, which is how the rest of
+                    // this iteration already sees them.
+                    index_worktree::Item::Rewrite { .. } => {}
+                },
+            }
+        }
+    }
+
+    if by_path.is_empty() {
+        return vec![DiffLine::new(DiffLineKind::Good, "Nothing to commit, working tree clean")];
+    }
+
+    let mut out = Vec::with_capacity(by_path.len());
+    for (path, (a, b)) in by_path {
+        let text = format!("{a}{b} {path}");
+        let kind = if a == '?' && b == '?' {
+            DiffLineKind::StatusTheirs
+        } else if a != ' ' && b == ' ' {
+            DiffLineKind::StatusOurs
+        } else if a == ' ' && b != ' ' {
+            DiffLineKind::StatusTheirs
+        } else {
+            // Combined states like `MM` or anything unusual: render faintly.
+            DiffLineKind::Faint
+        };
+        out.push(DiffLine::new(kind, text));
+    }
+    out
+}
+
 fn classify_raw_diff_line(line: &str) -> DiffLine {
     let kind = if line.starts_with("+++")
         || line.starts_with("---")
@@ -723,10 +798,10 @@ fn classify_raw_diff_line(line: &str) -> DiffLine {
     DiffLine::new(kind, line)
 }
 
-fn compute_working_tree_diff(repo_path: &str, target: DiffTarget) -> DiffDocument {
-    let body = compute_status_lines(repo_path);
+fn compute_working_tree_diff(repo: &gix::Repository, repo_path: &str, target: DiffTarget) -> DiffDocument {
+    let body = compute_status_lines(repo, repo_path);
     let mut by_path: BTreeMap<String, (usize, usize)> = BTreeMap::new();
-    for fs in run_numstat(repo_path, true).into_iter().chain(run_numstat(repo_path, false)) {
+    for fs in compute_numstat_gix(repo) {
         let entry = by_path.entry(fs.path).or_insert((0, 0));
         entry.0 += fs.additions;
         entry.1 += fs.deletions;
@@ -744,28 +819,110 @@ fn compute_working_tree_diff(repo_path: &str, target: DiffTarget) -> DiffDocumen
     DiffDocument { target, header: Vec::new(), body, files, stats: totals, flags: DiffFlags::default() }
 }
 
-fn run_numstat(repo_path: &str, cached: bool) -> Vec<FileStat> {
-    use std::process::Command;
-    let mut args: Vec<&str> = vec!["-C", repo_path, "diff", "--numstat"];
-    if cached {
-        args.push("--cached");
-    }
-    let out = match Command::new("git").args(&args).output() {
-        Ok(o) => o,
-        Err(_) => return Vec::new(),
+/// Compute per-file numstat (additions / deletions) for the union of
+/// HEAD-vs-index (staged) and index-vs-worktree (unstaged) changes,
+/// replacing `git diff --numstat [--cached]`.
+///
+/// Line-level diffing is delegated to `similar::TextDiff` against blobs
+/// fetched from the object database (for tracked content) or read from the
+/// worktree (for unstaged content). Binary content is treated as a single
+/// addition or deletion line, which mirrors how git's numstat reports `-` —
+/// but here we surface a number so the caller's stats arithmetic still works.
+fn compute_numstat_gix(repo: &gix::Repository) -> Vec<FileStat> {
+    use gix::status::{index_worktree, plumbing::index_as_worktree, UntrackedFiles};
+
+    let mut out: Vec<FileStat> = Vec::new();
+
+    let Ok(platform) = repo.status(gix::progress::Discard) else {
+        return out;
     };
-    let s = String::from_utf8_lossy(&out.stdout);
-    let mut result = Vec::new();
-    for line in s.lines() {
-        let mut parts = line.splitn(3, '\t');
-        let (Some(a), Some(d), Some(p)) = (parts.next(), parts.next(), parts.next()) else {
-            continue;
-        };
-        let additions = a.parse().unwrap_or(0);
-        let deletions = d.parse().unwrap_or(0);
-        result.push(FileStat { path: p.to_string(), additions, deletions });
+    let iter = match platform.untracked_files(UntrackedFiles::None).into_iter(Vec::new()) {
+        Ok(it) => it,
+        Err(_) => return out,
+    };
+
+    let workdir = repo.workdir().map(|p| p.to_owned());
+
+    for item in iter.flatten() {
+        match item {
+            gix::status::Item::TreeIndex(change) => {
+                use gix::diff::index::Change;
+                let (path, old_id, new_id) = match change {
+                    Change::Addition { location, id, .. } => {
+                        (location.to_string(), None, Some(id.into_owned()))
+                    }
+                    Change::Deletion { location, id, .. } => {
+                        (location.to_string(), Some(id.into_owned()), None)
+                    }
+                    Change::Modification { location, previous_id, id, .. } => {
+                        (location.to_string(), Some(previous_id.into_owned()), Some(id.into_owned()))
+                    }
+                    Change::Rewrite { location, source_id, id, .. } => {
+                        (location.to_string(), Some(source_id.into_owned()), Some(id.into_owned()))
+                    }
+                };
+                let old = old_id
+                    .and_then(|id| repo.find_object(id).ok().map(|o| o.data.clone()))
+                    .unwrap_or_default();
+                let new = new_id
+                    .and_then(|id| repo.find_object(id).ok().map(|o| o.data.clone()))
+                    .unwrap_or_default();
+                let (additions, deletions) = numstat_for_blobs(&old, &new);
+                out.push(FileStat { path, additions, deletions });
+            }
+            gix::status::Item::IndexWorktree(iw) => {
+                if let index_worktree::Item::Modification { rela_path, status, entry, .. } = iw {
+                    let path = rela_path.to_string();
+                    match status {
+                        index_as_worktree::EntryStatus::Change(index_as_worktree::Change::Removed) => {
+                            let old = repo.find_object(entry.id).ok().map(|o| o.data.clone()).unwrap_or_default();
+                            let (additions, deletions) = numstat_for_blobs(&old, &[]);
+                            out.push(FileStat { path, additions, deletions });
+                        }
+                        index_as_worktree::EntryStatus::Change(index_as_worktree::Change::Modification { .. })
+                        | index_as_worktree::EntryStatus::Change(index_as_worktree::Change::Type { .. }) => {
+                            let old = repo.find_object(entry.id).ok().map(|o| o.data.clone()).unwrap_or_default();
+                            let new_bytes = workdir
+                                .as_ref()
+                                .and_then(|wd| std::fs::read(wd.join(&path)).ok())
+                                .unwrap_or_default();
+                            let (additions, deletions) = numstat_for_blobs(&old, &new_bytes);
+                            out.push(FileStat { path, additions, deletions });
+                        }
+                        // Conflicts, intent-to-add, submodule modifications, and stat-only
+                        // refreshes don't contribute numstat numbers comparable to git's.
+                        _ => {}
+                    }
+                }
+            }
+        }
     }
-    result
+
+    out
+}
+
+fn numstat_for_blobs(old: &[u8], new: &[u8]) -> (usize, usize) {
+    // Crude binary detection: a NUL byte in either side means we can't do a
+    // line-diff. Report it as a wholesale rewrite (1 add + 1 del) so the
+    // caller still surfaces a non-zero entry.
+    if old.contains(&0) || new.contains(&0) {
+        let a = if new.is_empty() { 0 } else { 1 };
+        let d = if old.is_empty() { 0 } else { 1 };
+        return (a, d);
+    }
+    let old_s = String::from_utf8_lossy(old);
+    let new_s = String::from_utf8_lossy(new);
+    let diff = similar::TextDiff::from_lines(old_s.as_ref(), new_s.as_ref());
+    let mut additions = 0usize;
+    let mut deletions = 0usize;
+    for change in diff.iter_all_changes() {
+        match change.tag() {
+            ChangeTag::Insert => additions += 1,
+            ChangeTag::Delete => deletions += 1,
+            ChangeTag::Equal => {}
+        }
+    }
+    (additions, deletions)
 }
 
 #[cfg(test)]
