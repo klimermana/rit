@@ -141,6 +141,12 @@ fn working_tree_spans(row: &WorkingTreeRow, app: &App) -> Vec<Span<'static>> {
         Style::default().fg(Color::Green),
     ));
     spans.push(Span::raw(" "));
-    spans.push(Span::styled("Not Committed Yet", Style::default().fg(Color::DarkGray).add_modifier(Modifier::BOLD)));
+    let (text, style) = match row.dirty {
+        Some(true) => ("Uncommitted changes", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
+        Some(false) => ("Working tree clean", Style::default().fg(Color::Green)),
+        // Pre-dirty-check fallback; matches the historical "Not Committed Yet" label.
+        None => ("Not Committed Yet", Style::default().fg(Color::DarkGray).add_modifier(Modifier::BOLD)),
+    };
+    spans.push(Span::styled(text, style));
     spans
 }

@@ -66,7 +66,10 @@ fn run_git_thread_inner(
     };
 
     let _ = msg_tx.send(GitMsg::History(HistoryMsg::RepoInfo(repo_info_for(&repo))));
-    let _ = msg_tx.send(GitMsg::Inspect(InspectMsg::WorkingTreeMeta { author: working_tree_author(&repo) }));
+    let _ = msg_tx.send(GitMsg::Inspect(InspectMsg::WorkingTreeMeta {
+        author: working_tree_author(&repo),
+        dirty: quick_is_dirty(&repo),
+    }));
 
     let mut walker = Walker::new(&repo, path_filter.clone(), 0, graph_enabled, HashMap::new())?;
     let mut refs_loaded = false;
@@ -163,7 +166,10 @@ fn process_request<'r>(
             let _ = msg_tx.send(GitMsg::Inspect(InspectMsg::StatusLoaded(document)));
         }
         GitReq::Inspect(InspectReq::RefreshWorkingTreeMeta) => {
-            let _ = msg_tx.send(GitMsg::Inspect(InspectMsg::WorkingTreeMeta { author: working_tree_author(repo) }));
+            let _ = msg_tx.send(GitMsg::Inspect(InspectMsg::WorkingTreeMeta {
+                author: working_tree_author(repo),
+                dirty: quick_is_dirty(repo),
+            }));
         }
     }
     Ok(true)
@@ -420,6 +426,36 @@ fn working_tree_author(repo: &gix::Repository) -> String {
         }
     }
     std::env::var("USER").or_else(|_| std::env::var("USERNAME")).unwrap_or_else(|_| "you".to_string())
+}
+
+/// Fast at-a-glance dirty check: walk `gix::status` and return on the
+/// first observed change (staged, unstaged, or untracked). Returns `None`
+/// when the status query itself errors — the UI keeps its previous
+/// indicator in that case rather than flashing to "clean".
+fn quick_is_dirty(repo: &gix::Repository) -> Option<bool> {
+    use gix::status::{index_worktree, plumbing::index_as_worktree, Item, UntrackedFiles};
+    let platform = repo.status(gix::progress::Discard).ok()?;
+    let iter = platform.untracked_files(UntrackedFiles::Collapsed).into_iter(Vec::new()).ok()?;
+    for item in iter.flatten() {
+        match item {
+            Item::TreeIndex(_) => return Some(true),
+            Item::IndexWorktree(iw) => match iw {
+                index_worktree::Item::Modification { status, .. } => {
+                    // NeedsUpdate is a stat-cache refresh hint, not a user-visible change.
+                    if !matches!(status, index_as_worktree::EntryStatus::NeedsUpdate(_)) {
+                        return Some(true);
+                    }
+                }
+                index_worktree::Item::DirectoryContents { entry, .. } => {
+                    if matches!(entry.status, gix::dir::entry::Status::Untracked) {
+                        return Some(true);
+                    }
+                }
+                index_worktree::Item::Rewrite { .. } => return Some(true),
+            },
+        }
+    }
+    Some(false)
 }
 
 fn relative_time(unix_secs: i64) -> CompactString {
@@ -1033,8 +1069,8 @@ fn compute_working_tree_diff(repo: &gix::Repository, target: DiffTarget) -> Diff
 #[cfg(test)]
 mod tests {
     use super::{
-        build_commit_info, build_pathspec_search, classify_skip, hunk_header, GitMsg, HistoryMsg, SkipReason, Walker,
-        MAX_INLINE_DIFF_BYTES,
+        build_commit_info, build_pathspec_search, classify_skip, hunk_header, quick_is_dirty, GitMsg, HistoryMsg,
+        SkipReason, Walker, MAX_INLINE_DIFF_BYTES,
     };
     use crate::model::{CommitRecord, PathFilter};
     use gix::bstr::BStr;
@@ -1353,5 +1389,26 @@ mod tests {
         assert_eq!(doc.stats.files, 0);
         assert_eq!(doc.stats.insertions, 0);
         assert_eq!(doc.stats.deletions, 0);
+    }
+
+    #[test]
+    fn quick_is_dirty_reports_clean_then_dirty() {
+        let (td, repo) = make_fixture_repo();
+        let path = td.path();
+
+        // Baseline commit; clean worktree afterwards.
+        write_file(path, "tracked.txt", "hi\n");
+        commit_all(path, "baseline");
+        assert_eq!(quick_is_dirty(&repo), Some(false), "freshly committed worktree should be clean");
+
+        // Modify a tracked file -> unstaged change.
+        write_file(path, "tracked.txt", "hi\nthere\n");
+        assert_eq!(quick_is_dirty(&repo), Some(true), "tracked-file mod should flip to dirty");
+
+        // Commit and add an untracked file -> still dirty.
+        commit_all(path, "second");
+        assert_eq!(quick_is_dirty(&repo), Some(false), "after commit, back to clean");
+        std::fs::write(path.join("new_untracked.txt"), "x").expect("write");
+        assert_eq!(quick_is_dirty(&repo), Some(true), "untracked file should count as dirty");
     }
 }

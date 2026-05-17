@@ -17,6 +17,10 @@ const DATE_COL_WIDTH: usize = 8;
 
 pub struct WorkingTreeRow {
     pub author: CompactString,
+    /// `None` before the first dirty check completes; the renderer falls
+    /// back to a neutral label in that case. `Some(true)` if anything
+    /// (staged / unstaged / untracked) differs from HEAD.
+    pub dirty: Option<bool>,
 }
 
 pub enum LogRow {
@@ -244,7 +248,7 @@ pub struct App {
 
 impl App {
     pub fn new(tx: Sender<GitReq>, rx: Receiver<GitMsg>, input_rx: Receiver<Event>) -> Self {
-        let rows = vec![LogRow::WorkingTree(WorkingTreeRow { author: "you".into() })];
+        let rows = vec![LogRow::WorkingTree(WorkingTreeRow { author: "you".into(), dirty: None })];
         Self {
             log: LogState { rows, selected: 0, scroll: 0, view_height: 1 },
             search: CommitSearchState::new(),
@@ -430,9 +434,15 @@ impl App {
                 self.status.loading = false;
                 self.status.document = Some(document);
             }
-            InspectMsg::WorkingTreeMeta { author } => {
+            InspectMsg::WorkingTreeMeta { author, dirty } => {
                 if let Some(LogRow::WorkingTree(w)) = self.log.rows.first_mut() {
                     w.author = author.into();
+                    // Only update the dirty bit when the worker actually
+                    // produced one; preserve the previous indicator on
+                    // status-query errors.
+                    if dirty.is_some() {
+                        w.dirty = dirty;
+                    }
                 }
             }
         }
@@ -614,7 +624,7 @@ impl App {
             Some(LogRow::WorkingTree(w)) => w.author.clone(),
             _ => "you".into(),
         };
-        self.log.rows = vec![LogRow::WorkingTree(WorkingTreeRow { author })];
+        self.log.rows = vec![LogRow::WorkingTree(WorkingTreeRow { author, dirty: None })];
         self.log.selected = 0;
         self.log.scroll = 0;
         self.diff.document = None;

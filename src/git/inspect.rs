@@ -27,5 +27,12 @@ pub enum InspectReq {
 pub enum InspectMsg {
     DiffLoaded(DiffDocument),
     StatusLoaded(StatusDocument),
-    WorkingTreeMeta { author: String },
+    WorkingTreeMeta {
+        author: String,
+        /// `None` when the dirty check failed (e.g. no worktree or status
+        /// query errored); the UI keeps its previous indicator in that
+        /// case. `Some(true)` if anything (staged / unstaged / untracked)
+        /// differs from HEAD; `Some(false)` for a clean tree.
+        dirty: Option<bool>,
+    },
 }
