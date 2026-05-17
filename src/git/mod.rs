@@ -109,13 +109,23 @@ pub enum GitReq {
     Reload,
 }
 
-pub fn run_git_thread(req_rx: Receiver<GitReq>, msg_tx: Sender<GitMsg>, path_filter: Option<String>) {
-    if let Err(e) = run_git_thread_inner(req_rx, msg_tx.clone(), path_filter) {
+pub fn run_git_thread(
+    req_rx: Receiver<GitReq>,
+    msg_tx: Sender<GitMsg>,
+    path_filter: Option<String>,
+    graph_enabled: bool,
+) {
+    if let Err(e) = run_git_thread_inner(req_rx, msg_tx.clone(), path_filter, graph_enabled) {
         let _ = msg_tx.send(GitMsg::Error(format!("git worker died: {}", e)));
     }
 }
 
-fn run_git_thread_inner(req_rx: Receiver<GitReq>, msg_tx: Sender<GitMsg>, path_filter: Option<String>) -> Result<()> {
+fn run_git_thread_inner(
+    req_rx: Receiver<GitReq>,
+    msg_tx: Sender<GitMsg>,
+    path_filter: Option<String>,
+    graph_enabled: bool,
+) -> Result<()> {
     let repo = match gix::discover(".") {
         Ok(r) => r,
         Err(e) => {
@@ -129,7 +139,7 @@ fn run_git_thread_inner(req_rx: Receiver<GitReq>, msg_tx: Sender<GitMsg>, path_f
     let _ = msg_tx.send(GitMsg::RepoInfo(repo_info_for(&repo)));
     let _ = msg_tx.send(GitMsg::WorkingTreeMeta { author: working_tree_author(&repo) });
 
-    let mut walker = Walker::new(&repo, path_filter.as_deref(), 0)?;
+    let mut walker = Walker::new(&repo, path_filter.as_deref(), 0, graph_enabled)?;
 
     while let Ok(req) = req_rx.recv() {
         match req {
@@ -158,7 +168,7 @@ fn run_git_thread_inner(req_rx: Receiver<GitReq>, msg_tx: Sender<GitMsg>, path_f
             }
             GitReq::Reload => {
                 let next_gen = walker.gen.wrapping_add(1);
-                walker = Walker::new(&repo, path_filter.as_deref(), next_gen)?;
+                walker = Walker::new(&repo, path_filter.as_deref(), next_gen, graph_enabled)?;
             }
         }
     }
@@ -169,7 +179,9 @@ fn run_git_thread_inner(req_rx: Receiver<GitReq>, msg_tx: Sender<GitMsg>, path_f
 struct Walker<'r> {
     repo: &'r gix::Repository,
     refs_map: HashMap<ObjectId, Vec<RefLabel>>,
-    graph_state: graph::GraphState,
+    /// `None` when the `--graph` CLI flag is off — keeps the per-commit lane
+    /// bookkeeping out of the hot path entirely.
+    graph_state: Option<graph::GraphState>,
     iter: Option<gix::revision::Walk<'r>>,
     done: bool,
     path_filter: Option<String>,
@@ -177,7 +189,7 @@ struct Walker<'r> {
 }
 
 impl<'r> Walker<'r> {
-    fn new(repo: &'r gix::Repository, path_filter: Option<&str>, gen: u64) -> Result<Self> {
+    fn new(repo: &'r gix::Repository, path_filter: Option<&str>, gen: u64, graph_enabled: bool) -> Result<Self> {
         let refs_map = load_refs(repo);
         let (iter, done) = match repo.head_id() {
             Ok(head_id) => (Some(head_id.ancestors().all()?), false),
@@ -186,7 +198,7 @@ impl<'r> Walker<'r> {
         Ok(Self {
             repo,
             refs_map,
-            graph_state: graph::GraphState::default(),
+            graph_state: graph_enabled.then(graph::GraphState::default),
             iter,
             done,
             path_filter: path_filter.map(|s| s.to_string()),
@@ -232,7 +244,7 @@ impl<'r> Walker<'r> {
             }
 
             if let Some(commit_info) =
-                build_commit_info(self.repo, info.id, &parent_ids, &self.refs_map, &mut self.graph_state)
+                build_commit_info(self.repo, info.id, &parent_ids, &self.refs_map, self.graph_state.as_mut())
             {
                 batch.push(commit_info);
             }
@@ -253,7 +265,7 @@ fn build_commit_info(
     id: ObjectId,
     parent_ids: &[ObjectId],
     refs_map: &HashMap<ObjectId, Vec<RefLabel>>,
-    graph_state: &mut graph::GraphState,
+    graph_state: Option<&mut graph::GraphState>,
 ) -> Option<CommitInfo> {
     let obj = repo.find_object(id).ok()?;
     let commit = obj.try_into_commit().ok()?;
@@ -268,7 +280,7 @@ fn build_commit_info(
     let summary = decoded.message().summary().to_str_lossy().into_owned();
     let summary_lower = summary.to_lowercase();
     let refs = refs_map.get(&id).cloned().unwrap_or_default();
-    let graph_prefix = graph_state.next(id, parent_ids);
+    let graph_prefix = graph_state.map(|gs| gs.next(id, parent_ids)).unwrap_or_default();
 
     Some(CommitInfo {
         id,

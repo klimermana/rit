@@ -24,11 +24,17 @@ use std::{
 struct Cli {
     /// Limit the log to commits that touch this path (substring match).
     path: Option<String>,
+
+    /// Render the ASCII commit graph column. Off by default because the
+    /// per-commit lane bookkeeping is non-trivial on deep monorepos.
+    #[arg(short = 'g', long = "graph")]
+    graph: bool,
 }
 
 fn main() -> Result<()> {
     let cli = Cli::parse();
     let path_filter = cli.path;
+    let graph_enabled = cli.graph;
 
     // Restore terminal on panic.
     let original_hook = panic::take_hook();
@@ -53,7 +59,7 @@ fn main() -> Result<()> {
 
     let git_tx = msg_tx.clone();
     std::thread::spawn(move || {
-        git::run_git_thread(req_rx, git_tx, path_filter);
+        git::run_git_thread(req_rx, git_tx, path_filter, graph_enabled);
     });
 
     std::thread::spawn(move || {

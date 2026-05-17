@@ -26,6 +26,8 @@ pub struct CommitInfo {
     pub summary: String,
     pub summary_lower: String,
     pub refs: Vec<RefLabel>,
+    /// ASCII graph prefix. Empty unless the `--graph` CLI flag was passed —
+    /// the renderer only emits a graph column when this is non-empty.
     pub graph: CompactString,
 }
 

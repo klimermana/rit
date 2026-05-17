@@ -75,6 +75,9 @@ pub fn draw_log(frame: &mut Frame, app: &App, area: Rect, focused: bool) {
 
 fn commit_spans(commit: &CommitInfo, app: &App, search_query: &str, highlight_style: Style) -> Vec<Span<'static>> {
     let mut spans: Vec<Span<'static>> = Vec::new();
+    if !commit.graph.is_empty() {
+        spans.push(Span::styled(format!("{} ", commit.graph), Style::default().fg(Color::DarkGray)));
+    }
     spans.push(Span::styled(
         commit.short_id.to_string(),
         Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD),
