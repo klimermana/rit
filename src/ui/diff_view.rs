@@ -1,6 +1,6 @@
 use crate::{
     app::{App, LogRow},
-    git::{DiffLine, DiffLineKind, DiffStats, DiffTarget, FileStat},
+    model::{DiffLine, DiffLineKind, DiffStats, DiffTarget, FileStat},
     ui::{diff_line_to_ratatui, highlight_matches_in_span},
 };
 use ratatui::{
@@ -21,33 +21,32 @@ pub fn draw_diff(frame: &mut Frame, app: &App, area: Rect, focused: bool) {
     let inner = block.inner(area);
     frame.render_widget(block, area);
 
-    if app.diff.loading && app.diff.header_lines.is_none() && app.diff.body_lines.is_none() {
+    if app.diff.loading && app.diff.document.is_none() {
         let para = Paragraph::new("Loading diff...").style(Style::default().fg(Color::Gray));
         frame.render_widget(para, inner);
         return;
     }
 
-    if app.diff.header_lines.is_none() && app.diff.body_lines.is_none() {
+    let Some(document) = app.diff.document.as_ref() else {
         let msg = if app.log.rows.is_empty() { "Select a commit to view diff" } else { "No diff available" };
         let para = Paragraph::new(msg).style(Style::default().fg(Color::Gray));
         frame.render_widget(para, inner);
         return;
-    }
+    };
 
     // Compute section lengths without building any Line objects yet.
-    let header_slice: &[DiffLine] = app.diff.header_lines.as_deref().unwrap_or(&[]);
-    let body_slice: &[DiffLine] = if app.diff.show_hunks { app.diff.body_lines.as_deref().unwrap_or(&[]) } else { &[] };
+    let header_slice: &[DiffLine] = &document.header;
+    let body_slice: &[DiffLine] = if app.diff.show_hunks { &document.body } else { &[] };
     let header_len = header_slice.len();
 
     // Diffstat is small (one row per file, plus 3 framing lines) so build it
     // eagerly; the wins come from not materialising the body.
-    let diffstat: Vec<Line<'static>> = match (&app.diff.files, &app.diff.stats) {
-        (Some(files), Some(stats)) if !files.is_empty() => {
-            let mut out = Vec::with_capacity(files.len() + 3);
-            append_diffstat(&mut out, files, stats);
-            out
-        }
-        _ => Vec::new(),
+    let diffstat: Vec<Line<'static>> = if !document.files.is_empty() {
+        let mut out = Vec::with_capacity(document.files.len() + 3);
+        append_diffstat(&mut out, &document.files, &document.stats);
+        out
+    } else {
+        Vec::new()
     };
     let diffstat_len = diffstat.len();
     let body_offset = header_len + diffstat_len;
@@ -112,7 +111,7 @@ fn diff_title(app: &App) -> String {
         },
         None => return " Diff ".to_string(),
     };
-    if let Some(stats) = &app.diff.stats {
+    if let Some(stats) = app.diff.document.as_ref().map(|d| &d.stats) {
         format!(
             " Diff: {}  {} file{} changed  +{}  -{}{} ",
             label,

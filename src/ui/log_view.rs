@@ -1,5 +1,6 @@
 use crate::{
-    app::{App, CommitInfo, LogRow, RefKind, WorkingTreeRow},
+    app::{App, LogRow, WorkingTreeRow},
+    model::{CommitRecord, RefKind},
     ui::highlight_matches_in_span,
 };
 use ratatui::{
@@ -73,7 +74,7 @@ pub fn draw_log(frame: &mut Frame, app: &App, area: Rect, focused: bool) {
     frame.render_widget(Paragraph::new(rows), inner);
 }
 
-fn commit_spans(commit: &CommitInfo, app: &App, search_query: &str, highlight_style: Style) -> Vec<Span<'static>> {
+fn commit_spans(commit: &CommitRecord, app: &App, search_query: &str, highlight_style: Style) -> Vec<Span<'static>> {
     let mut spans: Vec<Span<'static>> = Vec::new();
     if !commit.graph.is_empty() {
         spans.push(Span::styled(format!("{} ", commit.graph), Style::default().fg(Color::DarkGray)));
@@ -84,7 +85,7 @@ fn commit_spans(commit: &CommitInfo, app: &App, search_query: &str, highlight_st
     ));
     spans.push(Span::raw(" "));
     spans.push(Span::styled(
-        format!("{:<width$}", commit.date, width = app.date_col_width()),
+        format!("{:<width$}", commit.authored_relative, width = app.date_col_width()),
         Style::default().fg(Color::Blue),
     ));
     spans.push(Span::raw(" "));

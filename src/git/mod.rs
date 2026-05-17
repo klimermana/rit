@@ -1,6 +1,9 @@
 pub mod graph;
 
-use crate::app::{CommitInfo, RefKind, RefLabel};
+use crate::model::{
+    CommitRecord, CommitSearchText, DiffDocument, DiffFlags, DiffLine, DiffLineKind, DiffStats, DiffTarget, FileStat,
+    PathFilter, RefKind, RefLabel, RepoInfo, StatusDocument,
+};
 use anyhow::Result;
 use chrono::{TimeZone, Utc};
 use compact_str::CompactString;
@@ -11,87 +14,16 @@ use std::collections::{BTreeMap, HashMap};
 
 const AUTHOR_DISPLAY_CHARS: usize = 20;
 
-pub struct DiffStats {
-    pub files: usize,
-    pub insertions: usize,
-    pub deletions: usize,
-}
-
-#[derive(Clone)]
-pub struct FileStat {
-    pub path: String,
-    pub additions: usize,
-    pub deletions: usize,
-}
-
-#[derive(Clone, Copy, PartialEq, Eq)]
-pub enum DiffLineKind {
-    // Commit metadata
-    CommitHeader,
-    Meta,
-    Message,
-    Blank,
-    // Per-file headers
-    FileHeader,
-    FileMeta,
-    OldMarker,
-    NewMarker,
-    HunkHeader,
-    // Diff bodies
-    Add,
-    Del,
-    Context,
-    // Diffstat block
-    Diffstat,
-    DiffstatTotal,
-    // Status view
-    SectionTitle,
-    SectionStaged,
-    SectionUnstaged,
-    Faint,
-    Good,
-    StatusOurs,
-    StatusTheirs,
-}
-
-pub struct DiffLine {
-    pub kind: DiffLineKind,
-    pub text: String,
-}
-
-impl DiffLine {
-    fn new(kind: DiffLineKind, text: impl Into<String>) -> Self {
-        Self { kind, text: text.into() }
-    }
-}
-
-pub struct RepoInfo {
-    pub name: String,
-    pub branch: String,
-}
-
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub enum DiffTarget {
-    Commit(ObjectId),
-    WorkingTree,
-}
-
 pub enum GitMsg {
     RepoInfo(RepoInfo),
     /// `gen` matches the worker's current walk generation. The app drops
     /// commits whose generation predates the most recent reload.
     Commits {
         gen: u64,
-        commits: Vec<CommitInfo>,
+        commits: Vec<CommitRecord>,
     },
-    Diff {
-        target: DiffTarget,
-        header_lines: Vec<DiffLine>,
-        body_lines: Vec<DiffLine>,
-        stats: DiffStats,
-        files: Vec<FileStat>,
-    },
-    Status(Vec<DiffLine>),
+    Diff(DiffDocument),
+    Status(StatusDocument),
     WorkingTreeMeta {
         author: String,
     },
@@ -118,7 +50,7 @@ pub enum GitReq {
 pub fn run_git_thread(
     req_rx: Receiver<GitReq>,
     msg_tx: Sender<GitMsg>,
-    path_filter: Option<String>,
+    path_filter: Option<PathFilter>,
     graph_enabled: bool,
 ) {
     if let Err(e) = run_git_thread_inner(req_rx, msg_tx.clone(), path_filter, graph_enabled) {
@@ -129,7 +61,7 @@ pub fn run_git_thread(
 fn run_git_thread_inner(
     req_rx: Receiver<GitReq>,
     msg_tx: Sender<GitMsg>,
-    path_filter: Option<String>,
+    path_filter: Option<PathFilter>,
     graph_enabled: bool,
 ) -> Result<()> {
     let repo = match gix::discover(".") {
@@ -145,7 +77,7 @@ fn run_git_thread_inner(
     let _ = msg_tx.send(GitMsg::RepoInfo(repo_info_for(&repo)));
     let _ = msg_tx.send(GitMsg::WorkingTreeMeta { author: working_tree_author(&repo) });
 
-    let mut walker = Walker::new(&repo, path_filter.as_deref(), 0, graph_enabled, HashMap::new())?;
+    let mut walker = Walker::new(&repo, path_filter.clone(), 0, graph_enabled, HashMap::new())?;
     let mut refs_loaded = false;
 
     while let Ok(req) = req_rx.recv() {
@@ -161,21 +93,15 @@ fn run_git_thread_inner(
                 }
             }
             GitReq::FetchDiff(target) => {
-                let payload = match target {
+                let document = match target {
                     DiffTarget::Commit(id) => compute_commit_diff(&repo, id),
-                    DiffTarget::WorkingTree => compute_working_tree_diff(&repo_path),
+                    DiffTarget::WorkingTree => compute_working_tree_diff(&repo_path, target),
                 };
-                let _ = msg_tx.send(GitMsg::Diff {
-                    target,
-                    header_lines: payload.header,
-                    body_lines: payload.body,
-                    stats: payload.stats,
-                    files: payload.files,
-                });
+                let _ = msg_tx.send(GitMsg::Diff(document));
             }
             GitReq::FetchStatus => {
-                let lines = compute_status(&repo_path);
-                let _ = msg_tx.send(GitMsg::Status(lines));
+                let document = compute_status(&repo_path);
+                let _ = msg_tx.send(GitMsg::Status(document));
             }
             GitReq::CheckWorkingTree => {
                 let _ = msg_tx.send(GitMsg::WorkingTreeMeta { author: working_tree_author(&repo) });
@@ -183,7 +109,7 @@ fn run_git_thread_inner(
             GitReq::Reload => {
                 let next_gen = walker.gen.wrapping_add(1);
                 let refs_map = load_refs(&repo);
-                walker = Walker::new(&repo, path_filter.as_deref(), next_gen, graph_enabled, refs_map)?;
+                walker = Walker::new(&repo, path_filter.clone(), next_gen, graph_enabled, refs_map)?;
                 refs_loaded = true;
             }
         }
@@ -200,14 +126,14 @@ struct Walker<'r> {
     graph_state: Option<graph::GraphState>,
     iter: Option<gix::revision::Walk<'r>>,
     done: bool,
-    path_filter: Option<String>,
+    path_filter: Option<PathFilter>,
     gen: u64,
 }
 
 impl<'r> Walker<'r> {
     fn new(
         repo: &'r gix::Repository,
-        path_filter: Option<&str>,
+        path_filter: Option<PathFilter>,
         gen: u64,
         graph_enabled: bool,
         refs_map: HashMap<ObjectId, Vec<RefLabel>>,
@@ -222,7 +148,7 @@ impl<'r> Walker<'r> {
             graph_state: graph_enabled.then(graph::GraphState::default),
             iter,
             done,
-            path_filter: path_filter.map(|s| s.to_string()),
+            path_filter,
             gen,
         })
     }
@@ -239,7 +165,7 @@ impl<'r> Walker<'r> {
         };
 
         let target = requested.max(1);
-        let mut batch: Vec<CommitInfo> = Vec::with_capacity(target.min(256));
+        let mut batch: Vec<CommitRecord> = Vec::with_capacity(target.min(256));
         // Cap iterator pulls so a path filter that rejects everything can't pin the
         // worker.
         let pull_cap = target.saturating_mul(64);
@@ -259,15 +185,15 @@ impl<'r> Walker<'r> {
             let parent_ids: Vec<ObjectId> = info.parent_ids.iter().copied().collect();
 
             if let Some(filter) = &self.path_filter {
-                if !commit_touches_path(self.repo, info.id, &parent_ids, filter) {
+                if !commit_touches_path(self.repo, info.id, &parent_ids, filter.as_str()) {
                     continue;
                 }
             }
 
-            if let Some(commit_info) =
+            if let Some(commit_record) =
                 build_commit_info(self.repo, info.id, &parent_ids, &self.refs_map, self.graph_state.as_mut())
             {
-                batch.push(commit_info);
+                batch.push(commit_record);
             }
         }
 
@@ -287,7 +213,7 @@ fn build_commit_info(
     parent_ids: &[ObjectId],
     refs_map: &HashMap<ObjectId, Vec<RefLabel>>,
     graph_state: Option<&mut graph::GraphState>,
-) -> Option<CommitInfo> {
+) -> Option<CommitRecord> {
     let obj = repo.find_object(id).ok()?;
     let commit = obj.try_into_commit().ok()?;
     let decoded = commit.decode().ok()?;
@@ -297,22 +223,23 @@ fn build_commit_info(
     let author_full = author.name.to_str_lossy().into_owned();
     let author_display: CompactString = truncate_chars(&author_full, AUTHOR_DISPLAY_CHARS).into();
     let author_lower: CompactString = author_display.to_lowercase();
-    let date = relative_time(author.time().map(|t| t.seconds).unwrap_or(0));
+    let authored_unix_secs = author.time().map(|t| t.seconds).unwrap_or(0);
+    let authored_relative = relative_time(authored_unix_secs);
     let summary = decoded.message().summary().to_str_lossy().into_owned();
     let summary_lower = summary.to_lowercase();
     let refs = refs_map.get(&id).cloned().unwrap_or_default();
     let graph_prefix = graph_state.map(|gs| gs.next(id, parent_ids)).unwrap_or_default();
 
-    Some(CommitInfo {
+    Some(CommitRecord {
         id,
         short_id,
+        authored_unix_secs,
+        authored_relative,
         author: author_display,
-        author_lower,
-        date,
         summary,
-        summary_lower,
         refs,
         graph: graph_prefix,
+        search: CommitSearchText { author_lower, summary_lower },
     })
 }
 
@@ -441,29 +368,23 @@ fn relative_time(unix_secs: i64) -> CompactString {
     }
 }
 
-struct DiffPayload {
-    header: Vec<DiffLine>,
-    body: Vec<DiffLine>,
-    stats: DiffStats,
-    files: Vec<FileStat>,
-}
-
-impl DiffPayload {
-    fn empty_error(e: anyhow::Error) -> Self {
-        Self {
-            header: vec![DiffLine::new(DiffLineKind::Faint, format!("Error: {}", e))],
-            body: Vec::new(),
-            stats: DiffStats { files: 0, insertions: 0, deletions: 0 },
-            files: Vec::new(),
-        }
+fn empty_error_document(target: DiffTarget, e: anyhow::Error) -> DiffDocument {
+    DiffDocument {
+        target,
+        header: vec![DiffLine::new(DiffLineKind::Faint, format!("Error: {}", e))],
+        body: Vec::new(),
+        files: Vec::new(),
+        stats: DiffStats { files: 0, insertions: 0, deletions: 0 },
+        flags: DiffFlags::default(),
     }
 }
 
-fn compute_commit_diff(repo: &gix::Repository, id: ObjectId) -> DiffPayload {
-    compute_commit_diff_inner(repo, id).unwrap_or_else(DiffPayload::empty_error)
+fn compute_commit_diff(repo: &gix::Repository, id: ObjectId) -> DiffDocument {
+    let target = DiffTarget::Commit(id);
+    compute_commit_diff_inner(repo, id, target).unwrap_or_else(|e| empty_error_document(target, e))
 }
 
-fn compute_commit_diff_inner(repo: &gix::Repository, id: ObjectId) -> Result<DiffPayload> {
+fn compute_commit_diff_inner(repo: &gix::Repository, id: ObjectId, target: DiffTarget) -> Result<DiffDocument> {
     let commit_obj = repo.find_object(id)?.try_into_commit()?;
     let decoded = commit_obj.decode()?;
     let mut header: Vec<DiffLine> = Vec::new();
@@ -501,7 +422,7 @@ fn compute_commit_diff_inner(repo: &gix::Repository, id: ObjectId) -> Result<Dif
         diff_trees(repo, &par_tree, &cur_tree, &mut body, &mut stats, &mut files)?;
     }
 
-    Ok(DiffPayload { header, body, stats, files })
+    Ok(DiffDocument { target, header, body, files, stats, flags: DiffFlags::default() })
 }
 
 fn diff_trees<'r>(
@@ -629,7 +550,11 @@ fn format_timestamp(unix_secs: i64) -> String {
 // equivalent gix port would have to reimplement staged/unstaged human-readable
 // diff formatting on top of gix::status iterators — significantly more code
 // than the rest of the worker. Left as a follow-up.
-fn compute_status(repo_path: &str) -> Vec<DiffLine> {
+fn compute_status(repo_path: &str) -> StatusDocument {
+    StatusDocument { lines: compute_status_lines(repo_path) }
+}
+
+fn compute_status_lines(repo_path: &str) -> Vec<DiffLine> {
     use std::process::Command;
     let mut lines: Vec<DiffLine> = Vec::new();
 
@@ -707,8 +632,8 @@ fn classify_raw_diff_line(line: &str) -> DiffLine {
     DiffLine::new(kind, line)
 }
 
-fn compute_working_tree_diff(repo_path: &str) -> DiffPayload {
-    let body = compute_status(repo_path);
+fn compute_working_tree_diff(repo_path: &str, target: DiffTarget) -> DiffDocument {
+    let body = compute_status_lines(repo_path);
     let mut by_path: BTreeMap<String, (usize, usize)> = BTreeMap::new();
     for fs in run_numstat(repo_path, true).into_iter().chain(run_numstat(repo_path, false)) {
         let entry = by_path.entry(fs.path).or_insert((0, 0));
@@ -725,7 +650,7 @@ fn compute_working_tree_diff(repo_path: &str) -> DiffPayload {
             FileStat { path, additions: a, deletions: d }
         })
         .collect();
-    DiffPayload { header: Vec::new(), body, stats: totals, files }
+    DiffDocument { target, header: Vec::new(), body, files, stats: totals, flags: DiffFlags::default() }
 }
 
 fn run_numstat(repo_path: &str, cached: bool) -> Vec<FileStat> {

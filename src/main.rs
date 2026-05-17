@@ -1,5 +1,6 @@
 mod app;
 mod git;
+mod model;
 mod ui;
 
 use anyhow::Result;
@@ -11,6 +12,7 @@ use crossterm::{
     execute,
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
 };
+use model::PathFilter;
 use ratatui::{backend::CrosstermBackend, Terminal};
 use std::{
     io::{self, BufWriter},
@@ -33,7 +35,7 @@ struct Cli {
 
 fn main() -> Result<()> {
     let cli = Cli::parse();
-    let path_filter = cli.path;
+    let path_filter = cli.path.map(PathFilter::new);
     let graph_enabled = cli.graph;
 
     // Restore terminal on panic.

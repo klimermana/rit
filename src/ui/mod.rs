@@ -4,7 +4,7 @@ pub mod log_view;
 
 use crate::{
     app::{App, SearchState},
-    git::{DiffLine, DiffLineKind},
+    model::{DiffLine, DiffLineKind},
 };
 use ratatui::{
     layout::{Constraint, Direction, Layout, Rect},
@@ -94,13 +94,14 @@ fn draw_status_view(frame: &mut Frame, app: &App, area: Rect) {
     frame.render_widget(block, area);
 
     let height = inner.height as usize;
-    let total = app.status.lines.len();
+    let lines: &[DiffLine] = app.status.document.as_ref().map(|d| d.lines.as_slice()).unwrap_or(&[]);
+    let total = lines.len();
     if total == 0 {
         return;
     }
     let scroll = app.status.scroll.min(total.saturating_sub(1));
     let end = (scroll + height).min(total);
-    let visible: Vec<Line> = app.status.lines[scroll..end].iter().map(diff_line_to_ratatui).collect();
+    let visible: Vec<Line> = lines[scroll..end].iter().map(diff_line_to_ratatui).collect();
     frame.render_widget(Paragraph::new(visible), inner);
 }
 

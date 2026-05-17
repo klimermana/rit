@@ -1,5 +1,6 @@
 use crate::{
-    git::{DiffLine, DiffStats, DiffTarget, FileStat, GitMsg, GitReq, RepoInfo},
+    git::{GitMsg, GitReq},
+    model::{CommitRecord, DiffDocument, DiffTarget, RepoInfo, StatusDocument},
     ui,
 };
 use anyhow::Result;
@@ -17,41 +18,13 @@ const HALF_PAGE: usize = 10;
 const AUTHOR_COL_WIDTH: usize = 20;
 const DATE_COL_WIDTH: usize = 8;
 
-pub struct CommitInfo {
-    pub id: gix::ObjectId,
-    pub short_id: CompactString,
-    pub author: CompactString,
-    pub author_lower: CompactString,
-    pub date: CompactString,
-    pub summary: String,
-    pub summary_lower: String,
-    pub refs: Vec<RefLabel>,
-    /// ASCII graph prefix. Empty unless the `--graph` CLI flag was passed —
-    /// the renderer only emits a graph column when this is non-empty.
-    pub graph: CompactString,
-}
-
 pub struct WorkingTreeRow {
     pub author: CompactString,
 }
 
 pub enum LogRow {
     WorkingTree(WorkingTreeRow),
-    Commit(CommitInfo),
-}
-
-#[derive(Clone)]
-pub struct RefLabel {
-    pub name: CompactString,
-    pub kind: RefKind,
-}
-
-#[derive(Clone, Copy, PartialEq, Eq)]
-pub enum RefKind {
-    Head,
-    LocalBranch,
-    RemoteBranch,
-    Tag,
+    Commit(CommitRecord),
 }
 
 pub enum Focus {
@@ -127,10 +100,7 @@ impl SearchState {
 pub struct DiffState {
     pub open: bool,
     pub target: Option<DiffTarget>,
-    pub header_lines: Option<Vec<DiffLine>>,
-    pub body_lines: Option<Vec<DiffLine>>,
-    pub files: Option<Vec<FileStat>>,
-    pub stats: Option<DiffStats>,
+    pub document: Option<DiffDocument>,
     pub scroll: usize,
     pub loading: bool,
     pub show_line_numbers: bool,
@@ -140,7 +110,7 @@ pub struct DiffState {
     /// In-diff search state (`/` while the diff pane is focused). Matches are
     /// virtual line indices into header + diffstat + body.
     pub search: SearchState,
-    /// Lazily-built lowercased mirrors of `header_lines` / `body_lines`,
+    /// Lazily-built lowercased mirrors of `document.header` / `document.body`,
     /// keyed by the same indices. Populated on first search so a 50k-line
     /// body isn't re-lowercased on every keystroke. Cleared whenever the
     /// underlying diff content changes.
@@ -150,7 +120,7 @@ pub struct DiffState {
 
 pub struct StatusState {
     pub open: bool,
-    pub lines: Vec<DiffLine>,
+    pub document: Option<StatusDocument>,
     pub scroll: usize,
     pub loading: bool,
 }
@@ -192,10 +162,7 @@ impl App {
             diff: DiffState {
                 open: false,
                 target: None,
-                header_lines: None,
-                body_lines: None,
-                files: None,
-                stats: None,
+                document: None,
                 scroll: 0,
                 loading: false,
                 show_line_numbers: true,
@@ -205,7 +172,7 @@ impl App {
                 header_lower: None,
                 body_lower: None,
             },
-            status: StatusState { open: false, lines: Vec::new(), scroll: 0, loading: false },
+            status: StatusState { open: false, document: None, scroll: 0, loading: false },
             focus: Focus::Log,
             show_help: false,
             yank_message: None,
@@ -317,13 +284,10 @@ impl App {
                     self.update_matches(SearchKind::Log);
                 }
             }
-            GitMsg::Diff { target, header_lines, body_lines, stats, files } => {
-                if self.diff.target == Some(target) {
+            GitMsg::Diff(document) => {
+                if self.diff.target == Some(document.target) {
                     self.diff.loading = false;
-                    self.diff.header_lines = Some(header_lines);
-                    self.diff.body_lines = Some(body_lines);
-                    self.diff.files = Some(files);
-                    self.diff.stats = Some(stats);
+                    self.diff.document = Some(document);
                     self.diff.scroll = 0;
                     // New content invalidates the lowercased mirrors.
                     self.diff.header_lower = None;
@@ -332,9 +296,9 @@ impl App {
                     self.update_matches(SearchKind::Diff);
                 }
             }
-            GitMsg::Status(lines) => {
+            GitMsg::Status(document) => {
                 self.status.loading = false;
-                self.status.lines = lines;
+                self.status.document = Some(document);
             }
             GitMsg::WorkingTreeMeta { author } => {
                 if let Some(LogRow::WorkingTree(w)) = self.log.rows.first_mut() {
@@ -428,7 +392,9 @@ impl App {
             (Char('j') | Down, Mod::NONE) => self.status.scroll = self.status.scroll.saturating_add(1),
             (Char('k') | Up, Mod::NONE) => self.status.scroll = self.status.scroll.saturating_sub(1),
             (Char('g'), Mod::NONE) => self.status.scroll = 0,
-            (Char('G'), Mod::NONE) => self.status.scroll = self.status.lines.len().saturating_sub(1),
+            (Char('G'), Mod::NONE) => {
+                self.status.scroll = self.status.document.as_ref().map_or(0, |d| d.lines.len()).saturating_sub(1);
+            }
             (Char('d'), Mod::CONTROL) => self.status.scroll = self.status.scroll.saturating_add(HALF_PAGE),
             (Char('u'), Mod::CONTROL) => self.status.scroll = self.status.scroll.saturating_sub(HALF_PAGE),
             _ => {}
@@ -464,7 +430,7 @@ impl App {
             (Focus::Log, Char('s'), Mod::NONE) => {
                 self.status.open = true;
                 self.status.scroll = 0;
-                if self.status.lines.is_empty() && !self.status.loading {
+                if self.status.document.is_none() && !self.status.loading {
                     self.status.loading = true;
                     let _ = self.tx.send(GitReq::FetchStatus);
                 }
@@ -526,15 +492,12 @@ impl App {
         self.log.rows = vec![LogRow::WorkingTree(WorkingTreeRow { author })];
         self.log.selected = 0;
         self.log.scroll = 0;
-        self.diff.header_lines = None;
-        self.diff.body_lines = None;
+        self.diff.document = None;
         self.diff.header_lower = None;
         self.diff.body_lower = None;
-        self.diff.files = None;
         self.diff.target = None;
-        self.diff.stats = None;
         self.diff.loading = false;
-        self.status.lines.clear();
+        self.status.document = None;
         self.status.loading = false;
         self.search.clear();
         self.diff.search.clear();
@@ -621,12 +584,9 @@ impl App {
         };
         if self.diff.target != Some(target) {
             self.diff.target = Some(target);
-            self.diff.header_lines = None;
-            self.diff.body_lines = None;
+            self.diff.document = None;
             self.diff.header_lower = None;
             self.diff.body_lower = None;
-            self.diff.files = None;
-            self.diff.stats = None;
             self.diff.loading = true;
             let _ = self.tx.send(GitReq::FetchDiff(target));
         }
@@ -656,7 +616,11 @@ impl App {
             .iter()
             .enumerate()
             .filter_map(|(i, row)| match row {
-                LogRow::Commit(c) if c.summary_lower.contains(&q) || c.author_lower.contains(q.as_str()) => Some(i),
+                LogRow::Commit(c)
+                    if c.search.summary_lower.contains(&q) || c.search.author_lower.contains(q.as_str()) =>
+                {
+                    Some(i)
+                }
                 _ => None,
             })
             .collect();
@@ -674,7 +638,7 @@ impl App {
         // the entire diff body on every keystroke.
         self.diff.ensure_lower_cache();
 
-        let header_len = self.diff.header_lines.as_ref().map(|v| v.len()).unwrap_or(0);
+        let header_len = self.diff.document.as_ref().map(|d| d.header.len()).unwrap_or(0);
         let body_offset = header_len + self.diff.diffstat_line_count();
         let mut matches = Vec::new();
 
@@ -773,14 +737,14 @@ impl DiffState {
     /// Total number of rendered lines: header + synthesised diffstat block +
     /// (when `show_hunks`) body.
     pub fn total_visible_lines(&self) -> usize {
-        let header = self.header_lines.as_ref().map(|v| v.len()).unwrap_or(0);
+        let header = self.document.as_ref().map(|d| d.header.len()).unwrap_or(0);
         let diffstat = self.diffstat_line_count();
-        let body = if self.show_hunks { self.body_lines.as_ref().map(|v| v.len()).unwrap_or(0) } else { 0 };
+        let body = if self.show_hunks { self.document.as_ref().map(|d| d.body.len()).unwrap_or(0) } else { 0 };
         header + diffstat + body
     }
 
     pub fn diffstat_line_count(&self) -> usize {
-        match &self.files {
+        match self.document.as_ref().map(|d| &d.files) {
             Some(files) if !files.is_empty() => {
                 // separator line `---`, one row per file, blank, totals line
                 files.len() + 3
@@ -793,15 +757,12 @@ impl DiffState {
     /// No-op once populated; cleared by `apply_msg` whenever new diff content
     /// arrives.
     pub fn ensure_lower_cache(&mut self) {
+        let Some(doc) = self.document.as_ref() else { return };
         if self.header_lower.is_none() {
-            if let Some(h) = &self.header_lines {
-                self.header_lower = Some(h.iter().map(|l| l.text.to_lowercase()).collect());
-            }
+            self.header_lower = Some(doc.header.iter().map(|l| l.text.to_lowercase()).collect());
         }
         if self.body_lower.is_none() {
-            if let Some(b) = &self.body_lines {
-                self.body_lower = Some(b.iter().map(|l| l.text.to_lowercase()).collect());
-            }
+            self.body_lower = Some(doc.body.iter().map(|l| l.text.to_lowercase()).collect());
         }
     }
 }
