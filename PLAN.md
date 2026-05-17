@@ -326,11 +326,26 @@ app/
 Pre-split: 1065 lines in one file. Post-split: largest is mod.rs at
 595 (App lifecycle, channel handling, state mutations).
 
-### 6c — Unify `CommitSearchState` / `DiffSearchState`
+### 6c — Unify `CommitSearchState` / `DiffSearchState` ✅
 
-Shared `SearchState` struct with `active`/`query`/`matches`/`current`
-and the shared methods. `CommitSearchState` becomes a wrapper that
-adds the narrowing fields.
+`SearchState` is now the single source of truth for
+`active`/`query`/`matches`/`current` plus all the shared methods
+(`new`, `clear`, `advance`, `current_pos`, `display_index`,
+`snapshot`). `DiffSearchState` is a `pub type` alias for it.
+`CommitSearchState` composes `SearchState` plus the narrowing
+fields:
+
+```rust
+pub struct CommitSearchState {
+    pub state: SearchState,
+    pub last_query: String,
+    pub last_generation: u64,
+}
+```
+
+Net: ~80 lines of duplicated impl deleted; the trade is that commit
+sites now write `self.search.state.query` etc. (35 call-site
+updates).
 
 ### 6d — Unify `*_jump_first_at_or_after_cursor`
 

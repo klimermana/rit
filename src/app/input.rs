@@ -21,7 +21,7 @@ impl App {
             self.handle_diff_search_key(key);
             return;
         }
-        if self.search.active {
+        if self.search.state.active {
             self.handle_commit_search_key(key);
             return;
         }
@@ -44,15 +44,15 @@ impl App {
         match (key.code, key.modifiers) {
             (Esc, _) => self.search.clear(),
             (Enter, _) => {
-                self.search.active = false;
+                self.search.state.active = false;
                 self.jump_commit_match(1);
             }
             (Backspace, _) => {
-                self.search.query.pop();
+                self.search.state.query.pop();
                 self.update_commit_matches();
             }
             (Char(c), Mod::NONE) | (Char(c), Mod::SHIFT) => {
-                self.search.query.push(c);
+                self.search.state.query.push(c);
                 self.update_commit_matches();
                 self.commit_jump_first_at_or_after_cursor();
             }
@@ -113,7 +113,7 @@ impl App {
             (_, Char('y'), Mod::NONE) => self.yank_selected_hash(),
             (Focus::Log, Char('/'), Mod::NONE) => {
                 self.search.clear();
-                self.search.active = true;
+                self.search.state.active = true;
             }
             (Focus::Diff, Char('/'), Mod::NONE) => {
                 self.diff.search.clear();
@@ -154,7 +154,7 @@ impl App {
                 self.migrate_search_to_log();
             }
             // Esc clears an active search result set (when diff is not open).
-            (_, Esc, Mod::NONE) if !self.search.query.is_empty() => {
+            (_, Esc, Mod::NONE) if !self.search.state.query.is_empty() => {
                 self.search.clear();
             }
             (Focus::Log, Char('q'), Mod::NONE) => self.should_quit = true,

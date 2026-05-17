@@ -36,30 +36,6 @@ pub struct LogState {
     pub view_height: usize,
 }
 
-/// Search state for the log pane. `matches` holds indices into
-/// `LogState.rows`. The `last_query` / `last_generation` pair drives the
-/// incremental-narrowing logic in `update_commit_matches` — when the user
-/// extends a query within the same walk generation, we filter the prior
-/// match set instead of rescanning every row.
-pub struct CommitSearchState {
-    pub active: bool,
-    pub query: String,
-    pub matches: Vec<usize>,
-    pub current: usize,
-    pub last_query: String,
-    pub last_generation: u64,
-}
-
-/// Search state for the diff pane. `matches` holds virtual line indices
-/// (header + diffstat + body) so the renderer can binary-search visible
-/// indices directly.
-pub struct DiffSearchState {
-    pub active: bool,
-    pub query: String,
-    pub matches: Vec<usize>,
-    pub current: usize,
-}
-
 /// Read-only view of either search's pageable bits, used by the status-bar
 /// renderer so it doesn't depend on the concrete state type.
 pub struct SearchSnapshot<'a> {
@@ -69,63 +45,22 @@ pub struct SearchSnapshot<'a> {
     pub display_index: usize,
 }
 
-impl Default for CommitSearchState {
+/// Fields shared by both panes' search state: input-mode flag, the
+/// current query string, the match indices, and the cycle cursor.
+pub struct SearchState {
+    pub active: bool,
+    pub query: String,
+    pub matches: Vec<usize>,
+    pub current: usize,
+}
+
+impl Default for SearchState {
     fn default() -> Self {
         Self::new()
     }
 }
 
-impl CommitSearchState {
-    pub fn new() -> Self {
-        Self {
-            active: false,
-            query: String::new(),
-            matches: Vec::new(),
-            current: 0,
-            last_query: String::new(),
-            last_generation: 0,
-        }
-    }
-
-    pub fn clear(&mut self) {
-        self.active = false;
-        self.query.clear();
-        self.matches.clear();
-        self.current = 0;
-        // Reset the narrowing cursor so the next type does a full rescan
-        // instead of attempting to narrow a now-empty matches set.
-        self.last_query.clear();
-    }
-
-    pub fn advance(&mut self, delta: isize) -> Option<usize> {
-        cycle(&self.matches, &mut self.current, delta)
-    }
-
-    pub fn current_pos(&self) -> Option<usize> {
-        self.matches.get(self.current).copied()
-    }
-
-    pub fn display_index(&self) -> usize {
-        if self.matches.is_empty() { 0 } else { self.current + 1 }
-    }
-
-    pub fn snapshot(&self) -> SearchSnapshot<'_> {
-        SearchSnapshot {
-            active: self.active,
-            query: &self.query,
-            matches_len: self.matches.len(),
-            display_index: self.display_index(),
-        }
-    }
-}
-
-impl Default for DiffSearchState {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-impl DiffSearchState {
+impl SearchState {
     pub fn new() -> Self {
         Self { active: false, query: String::new(), matches: Vec::new(), current: 0 }
     }
@@ -156,6 +91,50 @@ impl DiffSearchState {
             matches_len: self.matches.len(),
             display_index: self.display_index(),
         }
+    }
+}
+
+/// The diff pane uses bare `SearchState` — no narrowing logic.
+pub type DiffSearchState = SearchState;
+
+/// Search state for the log pane. Wraps `SearchState` with the
+/// narrowing fields used by `update_commit_matches`: when the user
+/// extends a query within the same walk generation, we filter the
+/// prior match set instead of rescanning every row.
+pub struct CommitSearchState {
+    pub state: SearchState,
+    pub last_query: String,
+    pub last_generation: u64,
+}
+
+impl Default for CommitSearchState {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl CommitSearchState {
+    pub fn new() -> Self {
+        Self { state: SearchState::new(), last_query: String::new(), last_generation: 0 }
+    }
+
+    pub fn clear(&mut self) {
+        self.state.clear();
+        // Reset the narrowing cursor so the next type does a full rescan
+        // instead of attempting to narrow a now-empty matches set.
+        self.last_query.clear();
+    }
+
+    pub fn advance(&mut self, delta: isize) -> Option<usize> {
+        self.state.advance(delta)
+    }
+
+    pub fn current_pos(&self) -> Option<usize> {
+        self.state.current_pos()
+    }
+
+    pub fn snapshot(&self) -> SearchSnapshot<'_> {
+        self.state.snapshot()
     }
 }
 

@@ -36,7 +36,7 @@ pub fn draw_log(frame: &mut Frame, app: &App, area: Rect, focused: bool) {
     let scroll = app.log.scroll;
     let end = (scroll + height).min(app.log.rows.len());
 
-    let search_query = app.search.query.to_lowercase();
+    let search_query = app.search.state.query.to_lowercase();
     let has_search = !search_query.is_empty();
     let current_match_row = app.search.current_pos();
 
@@ -45,7 +45,7 @@ pub fn draw_log(frame: &mut Frame, app: &App, area: Rect, focused: bool) {
     for (i, row) in app.log.rows.get(scroll..end).unwrap_or(&[]).iter().enumerate() {
         let global_idx = scroll + i;
         let is_selected = global_idx == app.log.selected;
-        let is_match = has_search && app.search.matches.binary_search(&global_idx).is_ok();
+        let is_match = has_search && app.search.state.matches.binary_search(&global_idx).is_ok();
         let is_current = has_search && current_match_row == Some(global_idx);
 
         // Same convention as the diff view: current match gets a bright

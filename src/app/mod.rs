@@ -368,10 +368,10 @@ impl App {
     }
 
     pub(crate) fn update_commit_matches(&mut self) {
-        let q = self.search.query.to_lowercase();
+        let q = self.search.state.query.to_lowercase();
         if q.is_empty() {
-            self.search.matches.clear();
-            self.search.current = 0;
+            self.search.state.matches.clear();
+            self.search.state.current = 0;
             self.search.last_query.clear();
             return;
         }
@@ -383,12 +383,12 @@ impl App {
         // O(commits) to O(matches).
         if should_narrow(&self.search.last_query, self.search.last_generation, &q, self.walk_gen) {
             let rows = &self.log.rows;
-            self.search.matches.retain(|&i| match rows.get(i) {
+            self.search.state.matches.retain(|&i| match rows.get(i) {
                 Some(LogRow::Commit(c)) => commit_matches(c, &q),
                 _ => false,
             });
         } else {
-            self.search.matches = self
+            self.search.state.matches = self
                 .log
                 .rows
                 .iter()
@@ -400,7 +400,7 @@ impl App {
                 .collect();
         }
 
-        self.search.current = 0;
+        self.search.state.current = 0;
         self.search.last_query = q;
         self.search.last_generation = self.walk_gen;
     }
@@ -409,7 +409,7 @@ impl App {
     /// query. Called when the worker streams in a new batch so existing
     /// matches don't get re-tested.
     fn extend_commit_matches(&mut self, new_range: std::ops::Range<usize>) {
-        if self.search.query.is_empty() {
+        if self.search.state.query.is_empty() {
             return;
         }
         // `last_query` is the already-lowercased mirror of `query`,
@@ -425,7 +425,7 @@ impl App {
             if let Some(LogRow::Commit(c)) = rows.get(i)
                 && commit_matches(c, q)
             {
-                self.search.matches.push(i);
+                self.search.state.matches.push(i);
             }
         }
     }
@@ -477,9 +477,9 @@ impl App {
 
     pub(crate) fn commit_jump_first_at_or_after_cursor(&mut self) {
         let cursor = self.log.selected;
-        let idx = self.search.matches.iter().position(|&i| i >= cursor).unwrap_or(0);
-        let Some(&pos) = self.search.matches.get(idx) else { return };
-        self.search.current = idx;
+        let idx = self.search.state.matches.iter().position(|&i| i >= cursor).unwrap_or(0);
+        let Some(&pos) = self.search.state.matches.get(idx) else { return };
+        self.search.state.current = idx;
         self.apply_commit_match_position(pos);
     }
 
@@ -525,15 +525,15 @@ impl App {
     /// against the current diff content. No-op when the commit search is
     /// empty (so callers can fire this unconditionally on focus change).
     pub(crate) fn migrate_search_to_diff(&mut self) {
-        if self.search.query.is_empty() {
+        if self.search.state.query.is_empty() {
             return;
         }
-        let q = std::mem::take(&mut self.search.query);
+        let q = std::mem::take(&mut self.search.state.query);
         // Drain leftover commit-search state so n/N on a future return to
         // log doesn't try to narrow against a now-empty match set.
-        self.search.active = false;
-        self.search.matches.clear();
-        self.search.current = 0;
+        self.search.state.active = false;
+        self.search.state.matches.clear();
+        self.search.state.current = 0;
         self.search.last_query.clear();
         self.search.last_generation = 0;
 
@@ -552,7 +552,7 @@ impl App {
         self.diff.search.matches.clear();
         self.diff.search.current = 0;
 
-        self.search.query = q;
+        self.search.state.query = q;
         self.update_commit_matches();
         self.commit_jump_first_at_or_after_cursor();
     }
