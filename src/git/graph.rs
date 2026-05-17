@@ -49,10 +49,19 @@ impl GraphState {
         }
 
         // Close all matching columns, then place first parent in commit_col.
+        // Both indexes are produced earlier in this function — `matching`
+        // by `enumerate()` over `self.lanes`, and `commit_col` is either
+        // an existing lane index or `self.lanes.len() - 1` right after a
+        // push. The `.get_mut`/`if let` form makes that explicit to
+        // clippy without runtime cost.
         for &col in &self.matching {
-            self.lanes[col] = None;
+            if let Some(slot) = self.lanes.get_mut(col) {
+                *slot = None;
+            }
         }
-        self.lanes[commit_col] = parents.first().copied();
+        if let Some(slot) = self.lanes.get_mut(commit_col) {
+            *slot = parents.first().copied();
+        }
 
         // Additional parents (merge commits) go into new lanes if not already tracked.
         for &parent in parents.iter().skip(1) {

@@ -42,7 +42,7 @@ pub fn draw_log(frame: &mut Frame, app: &App, area: Rect, focused: bool) {
 
     let mut rows: Vec<Line> = Vec::with_capacity(height);
 
-    for (i, row) in app.log.rows[scroll..end].iter().enumerate() {
+    for (i, row) in app.log.rows.get(scroll..end).unwrap_or(&[]).iter().enumerate() {
         let global_idx = scroll + i;
         let is_selected = global_idx == app.log.selected;
         let is_match = has_search && app.search.matches.binary_search(&global_idx).is_ok();
@@ -120,10 +120,7 @@ fn commit_spans(commit: &CommitRecord, app: &App, search_query: &str, highlight_
 /// Char-aware truncation so multibyte names don't get sliced mid-codepoint
 /// when they exceed the column width.
 fn truncate_chars(s: &str, max_chars: usize) -> String {
-    match s.char_indices().nth(max_chars) {
-        Some((boundary, _)) => s[..boundary].to_string(),
-        None => s.to_string(),
-    }
+    s.char_indices().nth(max_chars).and_then(|(boundary, _)| s.get(..boundary)).unwrap_or(s).to_string()
 }
 
 fn working_tree_spans(row: &WorkingTreeRow, app: &App) -> Vec<Span<'static>> {

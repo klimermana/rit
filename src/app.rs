@@ -42,17 +42,16 @@ pub struct LogState {
 }
 
 /// Search state for the log pane. `matches` holds indices into
-/// `LogState.rows`. The `last_query` / `last_generation` fields are reserved
-/// for the incremental-narrowing logic introduced by the search-over-indexed
-/// commit (still unused today).
+/// `LogState.rows`. The `last_query` / `last_generation` pair drives the
+/// incremental-narrowing logic in `update_commit_matches` — when the user
+/// extends a query within the same walk generation, we filter the prior
+/// match set instead of rescanning every row.
 pub struct CommitSearchState {
     pub active: bool,
     pub query: String,
     pub matches: Vec<usize>,
     pub current: usize,
-    #[allow(dead_code)]
     pub last_query: String,
-    #[allow(dead_code)]
     pub last_generation: u64,
 }
 
@@ -73,6 +72,12 @@ pub struct SearchSnapshot<'a> {
     pub query: &'a str,
     pub matches_len: usize,
     pub display_index: usize,
+}
+
+impl Default for CommitSearchState {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl CommitSearchState {
@@ -120,6 +125,12 @@ impl CommitSearchState {
             matches_len: self.matches.len(),
             display_index: self.display_index(),
         }
+    }
+}
+
+impl Default for DiffSearchState {
+    fn default() -> Self {
+        Self::new()
     }
 }
 
@@ -179,14 +190,12 @@ fn should_narrow(prev_query: &str, prev_generation: u64, query: &str, generation
 /// Cyclically advance `*current` by `delta`. Returns the new match position
 /// or `None` if `matches` is empty.
 fn cycle(matches: &[usize], current: &mut usize, delta: isize) -> Option<usize> {
-    let len = matches.len();
-    if len == 0 {
-        return None;
-    }
-    let len_i = len as isize;
-    let cur = *current as isize;
-    let next = ((cur + delta) % len_i + len_i) % len_i;
-    *current = next as usize;
+    let len_i = isize::try_from(matches.len()).ok().filter(|&n| n > 0)?;
+    let cur_i = isize::try_from(*current).ok()?;
+    // rem_euclid on a positive divisor yields a non-negative result, so
+    // `unsigned_abs` is a lossless conversion back to usize.
+    let next_i = (cur_i.saturating_add(delta)).rem_euclid(len_i);
+    *current = next_i.unsigned_abs();
     matches.get(*current).copied()
 }
 
@@ -282,11 +291,11 @@ impl App {
     }
 
     fn send_history(&self, req: HistoryReq) {
-        let _ = self.tx.send(GitReq::History(req));
+        _ = self.tx.send(GitReq::History(req));
     }
 
     fn send_inspect(&self, req: InspectReq) {
-        let _ = self.tx.send(GitReq::Inspect(req));
+        _ = self.tx.send(GitReq::Inspect(req));
     }
 
     pub fn run<B: Backend>(&mut self, terminal: &mut Terminal<B>) -> Result<()>
@@ -821,24 +830,18 @@ impl App {
     }
 
     fn commit_jump_first_at_or_after_cursor(&mut self) {
-        if self.search.matches.is_empty() {
-            return;
-        }
         let cursor = self.log.selected;
         let idx = self.search.matches.iter().position(|&i| i >= cursor).unwrap_or(0);
+        let Some(&pos) = self.search.matches.get(idx) else { return };
         self.search.current = idx;
-        let pos = self.search.matches[idx];
         self.apply_commit_match_position(pos);
     }
 
     fn diff_jump_first_at_or_after_cursor(&mut self) {
-        if self.diff.search.matches.is_empty() {
-            return;
-        }
         let cursor = self.diff.scroll;
         let idx = self.diff.search.matches.iter().position(|&i| i >= cursor).unwrap_or(0);
+        let Some(&pos) = self.diff.search.matches.get(idx) else { return };
         self.diff.search.current = idx;
-        let pos = self.diff.search.matches[idx];
         self.apply_diff_match_position(pos);
     }
 
@@ -914,8 +917,7 @@ impl App {
         };
         let hash = commit.id.to_string();
         yank_to_clipboard(&hash);
-        // hash is hex ASCII, so 12-byte prefix is safe.
-        let preview = if hash.len() >= 12 { &hash[..12] } else { hash.as_str() };
+        let preview = hash.get(..12).unwrap_or(hash.as_str());
         self.yank_message = Some(YankFeedback { text: format!("Copied: {}", preview), shown_at: Instant::now() });
     }
 
@@ -988,9 +990,9 @@ fn yank_to_clipboard(text: &str) {
     {
         if let Ok(mut child) = Command::new("pbcopy").stdin(Stdio::piped()).spawn() {
             if let Some(stdin) = child.stdin.as_mut() {
-                let _ = stdin.write_all(text.as_bytes());
+                _ = stdin.write_all(text.as_bytes());
             }
-            let _ = child.wait();
+            _ = child.wait();
         }
     }
     #[cfg(target_os = "linux")]
@@ -998,7 +1000,7 @@ fn yank_to_clipboard(text: &str) {
         let mut done = false;
         if let Ok(mut child) = Command::new("xclip").args(["-selection", "clipboard"]).stdin(Stdio::piped()).spawn() {
             if let Some(stdin) = child.stdin.as_mut() {
-                let _ = stdin.write_all(text.as_bytes());
+                _ = stdin.write_all(text.as_bytes());
             }
             if child.wait().is_ok() {
                 done = true;
@@ -1007,9 +1009,9 @@ fn yank_to_clipboard(text: &str) {
         if !done {
             if let Ok(mut child) = Command::new("xsel").args(["--clipboard", "--input"]).stdin(Stdio::piped()).spawn() {
                 if let Some(stdin) = child.stdin.as_mut() {
-                    let _ = stdin.write_all(text.as_bytes());
+                    _ = stdin.write_all(text.as_bytes());
                 }
-                let _ = child.wait();
+                _ = child.wait();
             }
         }
     }

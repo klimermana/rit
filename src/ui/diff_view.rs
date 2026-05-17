@@ -67,12 +67,16 @@ pub fn draw_diff(frame: &mut Frame, app: &App, area: Rect, focused: bool) {
     // Build Lines only for the visible window.
     let visible: Vec<Line> = (scroll..end)
         .map(|global_idx| {
+            // Branch is chosen from `global_idx` against the section
+            // lengths computed above, so each `.get` should always
+            // succeed; the fallback empty line is a defensive default
+            // rather than expected behavior.
             let line: Line<'static> = if global_idx < header_len {
-                diff_line_to_ratatui(&header_slice[global_idx])
+                header_slice.get(global_idx).map(diff_line_to_ratatui).unwrap_or_default()
             } else if global_idx < body_offset {
-                diffstat[global_idx - header_len].clone()
+                diffstat.get(global_idx - header_len).cloned().unwrap_or_default()
             } else {
-                diff_line_to_ratatui(&body_slice[global_idx - body_offset])
+                body_slice.get(global_idx - body_offset).map(diff_line_to_ratatui).unwrap_or_default()
             };
 
             let is_current = has_diff_search && current_match_line == Some(global_idx);
@@ -159,13 +163,10 @@ fn append_diffstat(out: &mut Vec<Line<'static>>, files: &[FileStat], stats: &Dif
 
     for f in files {
         let total = f.additions + f.deletions;
-        let bar_len =
-            if max_changes == 0 { 0 } else { ((total as f32 / max_changes as f32) * bar_cap as f32).round() as usize };
-        let bar_len = bar_len.min(bar_cap).max(if total > 0 { 1 } else { 0 });
+        let bar_len = bar_len_for(total, max_changes, bar_cap).min(bar_cap).max(usize::from(total > 0));
 
         // Split the bar between + and - proportionally.
-        let plus_len =
-            if total == 0 { 0 } else { ((f.additions as f32 / total as f32) * bar_len as f32).round() as usize };
+        let plus_len = bar_len_for(f.additions, total, bar_len);
         let minus_len = bar_len.saturating_sub(plus_len);
 
         let text = format!(
@@ -190,4 +191,16 @@ fn append_diffstat(out: &mut Vec<Line<'static>>, files: &[FileStat], stats: &Dif
     );
     out.push(diff_line_to_ratatui(&DiffLine { kind: DiffLineKind::DiffstatTotal, text: summary }));
     out.push(diff_line_to_ratatui(&DiffLine { kind: DiffLineKind::Blank, text: String::new() }));
+}
+
+/// Scale `part` against `whole`, rounding to the nearest integer in `0..=cap`.
+/// Returns 0 when `whole` is 0. Integer-only so the f32 cast lint stays out
+/// of the diffstat hot path.
+fn bar_len_for(part: usize, whole: usize, cap: usize) -> usize {
+    if whole == 0 {
+        return 0;
+    }
+    // Round half up: (part * cap + whole/2) / whole.
+    let scaled = part.saturating_mul(cap).saturating_add(whole / 2) / whole;
+    scaled.min(cap)
 }

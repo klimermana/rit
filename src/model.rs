@@ -37,8 +37,8 @@ pub struct CommitRecord {
     pub id: ObjectId,
     pub short_id: CompactString,
     /// Raw author-time epoch seconds. Currently unused by rendering but
-    /// stored so callers don't have to re-decode the commit.
-    #[allow(dead_code)]
+    /// stored so callers don't have to re-decode the commit. Kept as a
+    /// `pub` field so future consumers don't have to re-add it.
     pub authored_unix_secs: i64,
     /// Pre-formatted relative timestamp ("2d ago").
     pub authored_relative: CompactString,
@@ -91,15 +91,15 @@ pub struct DiffDocument {
     pub body: Vec<DiffLine>,
     pub files: Vec<FileStat>,
     pub stats: DiffStats,
-    /// Populated by the binary/oversized-diff guardrail commit; default for now.
-    #[allow(dead_code)]
+    /// Per-document guardrail state — surfaced in the diff title bar
+    /// via `truncation_tag`.
     pub flags: DiffFlags,
 }
 
-/// Out-of-band info about how the diff was produced. Currently always
-/// defaults; populated by the binary/oversize guardrail commit.
+/// Out-of-band info about how the diff was produced — the binary /
+/// oversize guardrail counts and a truncation flag the title bar
+/// consumes.
 #[derive(Clone, Default)]
-#[allow(dead_code)]
 pub struct DiffFlags {
     pub truncated: bool,
     pub skipped_binary_files: usize,

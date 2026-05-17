@@ -37,8 +37,8 @@ fn main() -> Result<()> {
     // Restore terminal on panic.
     let original_hook = panic::take_hook();
     panic::set_hook(Box::new(move |info| {
-        let _ = disable_raw_mode();
-        let _ = execute!(io::stderr(), LeaveAlternateScreen);
+        _ = disable_raw_mode();
+        _ = execute!(io::stderr(), LeaveAlternateScreen);
         original_hook(info);
     }));
 

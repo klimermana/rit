@@ -90,7 +90,7 @@ fn bench_diff_generation(c: &mut Criterion) {
         });
 
         drop(req_tx);
-        let _ = handle.join();
+        _ = handle.join();
     }
     group.finish();
 }
@@ -127,7 +127,7 @@ fn bench_working_tree_diff(c: &mut Criterion) {
     });
 
     drop(req_tx);
-    let _ = handle.join();
+    _ = handle.join();
     group.finish();
 }
 

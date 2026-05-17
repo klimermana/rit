@@ -56,10 +56,10 @@ fn bench_full_history_indexing(c: &mut Criterion) {
                     git::run_git_thread(req_rx, msg_tx, None, false);
                 });
 
-                let _ = drain_until_walk_done(&msg_rx);
+                _ = drain_until_walk_done(&msg_rx);
 
                 drop(req_tx);
-                let _ = handle.join();
+                _ = handle.join();
                 std::env::set_current_dir(prev).expect("cd back");
             });
         });
@@ -94,10 +94,10 @@ fn bench_pathspec_history_indexing(c: &mut Criterion) {
                     git::run_git_thread(req_rx, msg_tx, Some(PathFilter::new("file_*.txt")), false);
                 });
 
-                let _ = drain_until_walk_done(&msg_rx);
+                _ = drain_until_walk_done(&msg_rx);
 
                 drop(req_tx);
-                let _ = handle.join();
+                _ = handle.join();
                 std::env::set_current_dir(prev).expect("cd back");
             });
         });

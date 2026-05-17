@@ -23,23 +23,21 @@ fn use_vertical_split(width: u16, height: u16) -> bool {
 pub fn draw(frame: &mut Frame, app: &mut App) {
     let size = frame.area();
 
-    let chunks = Layout::default()
+    let [title_area, main_area, status_bar_area] = Layout::default()
         .direction(Direction::Vertical)
         .constraints([Constraint::Length(1), Constraint::Min(0), Constraint::Length(1)])
-        .split(size);
+        .areas(size);
 
     // Title bar
     let title = format!(" rit  {}  [{}] ", app.repo_name, app.branch_name);
     frame.render_widget(
         Paragraph::new(title).style(Style::default().bg(Color::DarkGray).fg(Color::White).add_modifier(Modifier::BOLD)),
-        chunks[0],
+        title_area,
     );
-
-    let main_area = chunks[1];
 
     if app.status.open {
         draw_status_view(frame, app, main_area);
-        draw_status_bar(frame, app, chunks[2]);
+        draw_status_bar(frame, app, status_bar_area);
         if app.show_help {
             help::draw_help(frame, size);
         }
@@ -48,17 +46,17 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
 
     let (log_area, diff_area_opt) = if app.diff.open {
         if use_vertical_split(size.width, size.height) {
-            let panes = Layout::default()
+            let [left, right] = Layout::default()
                 .direction(Direction::Horizontal)
                 .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
-                .split(main_area);
-            (panes[0], Some(panes[1]))
+                .areas(main_area);
+            (left, Some(right))
         } else {
-            let panes = Layout::default()
+            let [top, bottom] = Layout::default()
                 .direction(Direction::Vertical)
                 .constraints([Constraint::Percentage(60), Constraint::Percentage(40)])
-                .split(main_area);
-            (panes[0], Some(panes[1]))
+                .areas(main_area);
+            (top, Some(bottom))
         }
     } else {
         (main_area, None)
@@ -77,7 +75,7 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
         diff_view::draw_diff(frame, app, diff_area, is_diff_focused);
     }
 
-    draw_status_bar(frame, app, chunks[2]);
+    draw_status_bar(frame, app, status_bar_area);
 
     if app.show_help {
         help::draw_help(frame, size);
@@ -101,7 +99,7 @@ fn draw_status_view(frame: &mut Frame, app: &App, area: Rect) {
     }
     let scroll = app.status.scroll.min(total.saturating_sub(1));
     let end = (scroll + height).min(total);
-    let visible: Vec<Line> = lines[scroll..end].iter().map(diff_line_to_ratatui).collect();
+    let visible: Vec<Line> = lines.get(scroll..end).unwrap_or(&[]).iter().map(diff_line_to_ratatui).collect();
     frame.render_widget(Paragraph::new(visible), inner);
 }
 
@@ -180,20 +178,26 @@ pub fn highlight_matches_in_span(
     while search_from < text.len() {
         if let Some(match_len) = match_prefix_len(text, search_from, query) {
             if search_from > emit_from {
-                out.push(Span::styled(text[emit_from..search_from].to_string(), base_style));
+                if let Some(slice) = text.get(emit_from..search_from) {
+                    out.push(Span::styled(slice.to_string(), base_style));
+                }
             }
-            out.push(Span::styled(text[search_from..search_from + match_len].to_string(), highlight_style));
+            if let Some(slice) = text.get(search_from..search_from + match_len) {
+                out.push(Span::styled(slice.to_string(), highlight_style));
+            }
             search_from += match_len;
             emit_from = search_from;
         } else {
             // Skip to the next char boundary so we never slice mid-codepoint.
-            let step = text[search_from..].chars().next().map(|c| c.len_utf8()).unwrap_or(1);
+            let step = text.get(search_from..).and_then(|t| t.chars().next()).map(|c| c.len_utf8()).unwrap_or(1);
             search_from += step;
         }
     }
 
     if emit_from < text.len() {
-        out.push(Span::styled(text[emit_from..].to_string(), base_style));
+        if let Some(slice) = text.get(emit_from..) {
+            out.push(Span::styled(slice.to_string(), base_style));
+        }
     }
 }
 
@@ -204,7 +208,7 @@ pub fn highlight_matches_in_span(
 /// length.
 fn match_prefix_len(text: &str, start: usize, query: &str) -> Option<usize> {
     let mut q_chars = query.chars();
-    let suffix = &text[start..];
+    let suffix = text.get(start..)?;
     let mut consumed = 0usize;
 
     for (rel_byte, ch) in suffix.char_indices() {
