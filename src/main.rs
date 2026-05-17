@@ -1,10 +1,4 @@
-mod app;
-mod git;
-mod model;
-mod ui;
-
 use anyhow::Result;
-use app::App;
 use clap::Parser;
 use crossbeam_channel::{bounded, Sender};
 use crossterm::{
@@ -12,8 +6,8 @@ use crossterm::{
     execute,
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
 };
-use model::PathFilter;
 use ratatui::{backend::CrosstermBackend, Terminal};
+use rit::{app::App, git, model::PathFilter};
 use std::{
     io::{self, BufWriter},
     panic,
