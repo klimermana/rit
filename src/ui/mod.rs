@@ -155,8 +155,13 @@ fn search_status_line(snap: SearchSnapshot<'_>, idle_hint: &str) -> Option<Line<
 
 /// Splits `span` into sub-spans, wrapping each occurrence of `query`
 /// (already lowercased) with `highlight_style`. Non-matching portions keep
-/// the original span's style. Shared between the log and diff views so a
-/// single highlighter fixes both at once.
+/// the original span's style. Shared between the log and diff views.
+///
+/// Unicode-safe: walks the original text on char boundaries and folds case
+/// via `char::to_lowercase` so non-ASCII input (accents, dotted-I, etc.)
+/// can never produce a sub-char byte slice the way the old implementation
+/// did when it offsetted into the original with positions from a
+/// `text.to_lowercase()` copy.
 pub fn highlight_matches_in_span(
     out: &mut Vec<Span<'static>>,
     span: Span<'static>,
@@ -168,21 +173,141 @@ pub fn highlight_matches_in_span(
         return;
     }
     let text: &str = &span.content;
-    let text_lower = text.to_lowercase();
     let base_style = span.style;
-    let mut last = 0;
+    let mut search_from = 0usize;
+    let mut emit_from = 0usize;
 
-    while let Some(pos) = text_lower[last..].find(query) {
-        let abs = last + pos;
-        let end = abs + query.len();
-        if abs > last {
-            out.push(Span::styled(text[last..abs].to_string(), base_style));
+    while search_from < text.len() {
+        if let Some(match_len) = match_prefix_len(text, search_from, query) {
+            if search_from > emit_from {
+                out.push(Span::styled(text[emit_from..search_from].to_string(), base_style));
+            }
+            out.push(Span::styled(text[search_from..search_from + match_len].to_string(), highlight_style));
+            search_from += match_len;
+            emit_from = search_from;
+        } else {
+            // Skip to the next char boundary so we never slice mid-codepoint.
+            let step = text[search_from..].chars().next().map(|c| c.len_utf8()).unwrap_or(1);
+            search_from += step;
         }
-        out.push(Span::styled(text[abs..end].to_string(), highlight_style));
-        last = end;
     }
-    if last < text.len() {
-        out.push(Span::styled(text[last..].to_string(), base_style));
+
+    if emit_from < text.len() {
+        out.push(Span::styled(text[emit_from..].to_string(), base_style));
+    }
+}
+
+/// Returns the byte-length of the prefix of `text[start..]` whose lowercase
+/// folding equals `query` (which must already be lowercased). Returns
+/// `None` if no such prefix exists. Operates strictly on char boundaries
+/// so the caller can safely slice the original `text` by the returned
+/// length.
+fn match_prefix_len(text: &str, start: usize, query: &str) -> Option<usize> {
+    let mut q_chars = query.chars();
+    let suffix = &text[start..];
+    let mut consumed = 0usize;
+
+    for (rel_byte, ch) in suffix.char_indices() {
+        for lc in ch.to_lowercase() {
+            match q_chars.next() {
+                Some(qc) if qc == lc => continue,
+                // Mismatch in the middle of folding this char, or this char
+                // would produce extra lowercase output beyond the query.
+                // Treat both as "no match here" — the original char is one
+                // grapheme; we cannot highlight a partial slice of it.
+                _ => return None,
+            }
+        }
+        consumed = rel_byte + ch.len_utf8();
+        if q_chars.clone().next().is_none() {
+            return Some(consumed);
+        }
+    }
+    // Ran out of text before query was fully consumed.
+    if q_chars.next().is_none() { Some(consumed) } else { None }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn join(spans: &[Span<'static>]) -> Vec<(String, Option<Color>)> {
+        spans.iter().map(|s| (s.content.clone().into_owned(), s.style.bg)).collect()
+    }
+
+    fn highlight(text: &str, query: &str) -> Vec<(String, Option<Color>)> {
+        let hl = Style::default().bg(Color::Yellow);
+        let span = Span::styled(text.to_string(), Style::default());
+        let mut out = Vec::new();
+        highlight_matches_in_span(&mut out, span, &query.to_lowercase(), hl);
+        join(&out)
+    }
+
+    #[test]
+    fn empty_query_passes_span_through() {
+        let hl = Style::default().bg(Color::Yellow);
+        let mut out = Vec::new();
+        highlight_matches_in_span(&mut out, Span::raw("hello"), "", hl);
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].content, "hello");
+        assert_eq!(out[0].style.bg, None);
+    }
+
+    #[test]
+    fn ascii_case_insensitive_match() {
+        let parts = highlight("Hello World", "world");
+        assert_eq!(parts, vec![("Hello ".into(), None), ("World".into(), Some(Color::Yellow)),]);
+    }
+
+    #[test]
+    fn accented_chars_match_and_preserve_case() {
+        // 'é' lowercases to 'é' (single char each); query is "renée" so this
+        // should highlight the whole word in its original case.
+        let parts = highlight("Renée Dupont", "renée");
+        assert_eq!(parts, vec![("Renée".into(), Some(Color::Yellow)), (" Dupont".into(), None),]);
+    }
+
+    #[test]
+    fn multibyte_chars_dont_panic_or_corrupt() {
+        // Test the historical failure mode: the old impl would compute match
+        // offsets from text.to_lowercase() and slice the original. With
+        // non-ASCII content surrounding the match, that produced corrupt
+        // byte slices and could panic. Just exercising it without panic is
+        // the win; we also verify the match lands correctly.
+        let parts = highlight("café CAFÉ café", "café");
+        let highlighted: Vec<&str> =
+            parts.iter().filter(|(_, bg)| *bg == Some(Color::Yellow)).map(|(s, _)| s.as_str()).collect();
+        assert_eq!(highlighted, vec!["café", "CAFÉ", "café"]);
+    }
+
+    #[test]
+    fn match_after_multibyte_prefix() {
+        // The old impl miscomputed positions when multibyte chars preceded
+        // the match. Verify we land on the right substring.
+        let parts = highlight("🦀 hello world", "world");
+        let highlighted: Vec<&str> =
+            parts.iter().filter(|(_, bg)| *bg == Some(Color::Yellow)).map(|(s, _)| s.as_str()).collect();
+        assert_eq!(highlighted, vec!["world"]);
+    }
+
+    #[test]
+    fn no_match_in_unicode_returns_text_unchanged() {
+        let parts = highlight("Renée", "smith");
+        assert_eq!(parts.iter().filter(|(_, bg)| bg.is_some()).count(), 0);
+        let recombined: String = parts.iter().map(|(s, _)| s.clone()).collect();
+        assert_eq!(recombined, "Renée");
+    }
+
+    #[test]
+    fn turkish_dotted_i_does_not_panic() {
+        // "İ" (U+0130) lowercases to "i\u{0307}" — two chars from one. The
+        // old impl could attempt to slice the original at a position
+        // computed against the longer lowercase form. Just verify no panic
+        // and the original content round-trips (matches are conservative
+        // for chars whose case-fold differs in length).
+        let parts = highlight("İstanbul", "istanbul");
+        let recombined: String = parts.iter().map(|(s, _)| s.clone()).collect();
+        assert_eq!(recombined, "İstanbul");
     }
 }
 
