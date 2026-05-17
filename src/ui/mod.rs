@@ -7,11 +7,11 @@ use crate::{
     model::{DiffLine, DiffLineKind},
 };
 use ratatui::{
+    Frame,
     layout::{Constraint, Direction, Layout, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span},
     widgets::{Block, Borders, Paragraph},
-    Frame,
 };
 
 /// Mirrors tig: prefer side-by-side panes when the aspect ratio is wide
@@ -177,10 +177,10 @@ pub fn highlight_matches_in_span(
 
     while search_from < text.len() {
         if let Some(match_len) = match_prefix_len(text, search_from, query) {
-            if search_from > emit_from {
-                if let Some(slice) = text.get(emit_from..search_from) {
-                    out.push(Span::styled(slice.to_string(), base_style));
-                }
+            if search_from > emit_from
+                && let Some(slice) = text.get(emit_from..search_from)
+            {
+                out.push(Span::styled(slice.to_string(), base_style));
             }
             if let Some(slice) = text.get(search_from..search_from + match_len) {
                 out.push(Span::styled(slice.to_string(), highlight_style));
@@ -194,10 +194,10 @@ pub fn highlight_matches_in_span(
         }
     }
 
-    if emit_from < text.len() {
-        if let Some(slice) = text.get(emit_from..) {
-            out.push(Span::styled(slice.to_string(), base_style));
-        }
+    if emit_from < text.len()
+        && let Some(slice) = text.get(emit_from..)
+    {
+        out.push(Span::styled(slice.to_string(), base_style));
     }
 }
 
@@ -228,11 +228,7 @@ fn match_prefix_len(text: &str, start: usize, query: &str) -> Option<usize> {
         }
     }
     // Ran out of text before query was fully consumed.
-    if q_chars.next().is_none() {
-        Some(consumed)
-    } else {
-        None
-    }
+    if q_chars.next().is_none() { Some(consumed) } else { None }
 }
 
 #[cfg(test)]

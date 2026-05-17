@@ -26,17 +26,17 @@ pub enum HistoryReq {
 pub enum HistoryMsg {
     RepoInfo(RepoInfo),
     Commits {
-        gen: u64,
+        generation: u64,
         commits: Vec<CommitRecord>,
     },
     /// Deferred ref labels — sent after the first commit batch so the UI
     /// can backfill branch/tag decorations without blocking startup.
     RefsLoaded {
-        gen: u64,
+        generation: u64,
         refs_map: HashMap<ObjectId, Vec<RefLabel>>,
     },
     WalkDone {
-        gen: u64,
+        generation: u64,
     },
     Error(String),
 }

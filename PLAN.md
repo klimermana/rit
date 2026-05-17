@@ -6,7 +6,7 @@
 |---|---|---|
 | 0 | `fb5a6be` | Prep + baselines: pathspec bench, criterion `pre-cleanup` saved, 2 vs 51 clippy warnings recorded |
 | 1 | `cc37902` | Move `[workspace.lints.clippy]` → `[lints.clippy]`. 2 → 60 warnings now firing. CLAUDE.md CI note added. |
-| 2 | `ea8603a` | Resolve all 60 violations. `cargo clippy --no-deps` is silent. No `#[allow]` left — every dead-code site is either truly used (annotation removed), kept via `pub` field, or `#[expect(..., reason = "…")]`. |
+| 2 | `b85a710` | Resolve all 60 violations. `cargo clippy --no-deps` is silent. No `#[allow]` left — every dead-code site is either truly used (annotation removed), kept via `pub` field, or `#[expect(..., reason = "…")]`. |
 | 3 | _pending_ | Edition 2024 migration |
 
 Project plan derived from the 2026-05-17 code review. Implements every

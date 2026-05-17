@@ -4,11 +4,11 @@ use crate::{
     ui::{diff_line_to_ratatui, highlight_matches_in_span},
 };
 use ratatui::{
+    Frame,
     layout::Rect,
     style::{Color, Style},
     text::{Line, Span},
     widgets::{Block, Borders, Paragraph},
-    Frame,
 };
 
 pub fn draw_diff(frame: &mut Frame, app: &App, area: Rect, focused: bool) {
@@ -145,11 +145,7 @@ fn truncation_tag(flags: &crate::model::DiffFlags) -> String {
     if flags.skipped_large_files > 0 {
         parts.push(format!("{} large", flags.skipped_large_files));
     }
-    if parts.is_empty() {
-        "  [truncated]".to_string()
-    } else {
-        format!("  [truncated: {}]", parts.join(", "))
-    }
+    if parts.is_empty() { "  [truncated]".to_string() } else { format!("  [truncated: {}]", parts.join(", ")) }
 }
 
 fn append_diffstat(out: &mut Vec<Line<'static>>, files: &[FileStat], stats: &DiffStats) {

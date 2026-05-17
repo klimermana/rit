@@ -4,11 +4,11 @@ use crate::{
     ui::highlight_matches_in_span,
 };
 use ratatui::{
+    Frame,
     layout::Rect,
     style::{Color, Modifier, Style},
     text::{Line, Span},
     widgets::{Block, Borders, Paragraph},
-    Frame,
 };
 
 pub fn draw_log(frame: &mut Frame, app: &App, area: Rect, focused: bool) {

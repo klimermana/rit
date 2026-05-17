@@ -8,8 +8,8 @@
 
 mod common;
 
-use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion};
-use crossbeam_channel::{bounded, RecvTimeoutError};
+use criterion::{BenchmarkId, Criterion, criterion_group, criterion_main};
+use crossbeam_channel::{RecvTimeoutError, bounded};
 use rit::{
     git::{self, GitMsg, GitReq, HistoryMsg, InspectMsg, InspectReq},
     model::DiffTarget,

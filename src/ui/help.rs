@@ -1,9 +1,9 @@
 use ratatui::{
+    Frame,
     layout::Rect,
     style::{Color, Modifier, Style},
     text::{Line, Span},
     widgets::{Block, Borders, Clear, Paragraph},
-    Frame,
 };
 
 pub fn draw_help(frame: &mut Frame, area: Rect) {
@@ -31,7 +31,7 @@ pub fn draw_help(frame: &mut Frame, area: Rect) {
     let d = Style::default().fg(Color::White);
 
     macro_rules! row {
-        ($key:expr, $desc:expr) => {
+        ($key:expr_2021, $desc:expr_2021) => {
             Line::from(vec![Span::styled($key, k), Span::styled($desc, d)])
         };
     }

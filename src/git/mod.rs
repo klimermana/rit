@@ -13,7 +13,7 @@ use anyhow::Result;
 use chrono::{TimeZone, Utc};
 use compact_str::CompactString;
 use crossbeam_channel::{Receiver, Sender};
-use gix::{bstr::ByteSlice, ObjectId};
+use gix::{ObjectId, bstr::ByteSlice};
 use similar::ChangeTag;
 use std::collections::HashMap;
 
@@ -117,7 +117,7 @@ fn run_git_thread_inner(
                 refs_loaded = true;
                 let refs_map = load_refs(&repo);
                 walker.refs_map = refs_map.clone();
-                _ = msg_tx.send(GitMsg::History(HistoryMsg::RefsLoaded { gen: walker.gen, refs_map }));
+                _ = msg_tx.send(GitMsg::History(HistoryMsg::RefsLoaded { generation: walker.generation, refs_map }));
             }
             continue;
         }
@@ -148,7 +148,7 @@ fn process_request<'r>(
 ) -> Result<bool> {
     match req {
         GitReq::History(HistoryReq::Reload) => {
-            let next_gen = walker.gen.wrapping_add(1);
+            let next_gen = walker.generation.wrapping_add(1);
             let refs_map = load_refs(repo);
             // The new Walker's `'r` lifetime ties to `repo`, same as
             // the caller's walker — overwriting in place is fine.
@@ -188,14 +188,14 @@ struct Walker<'r> {
     /// `gix::pathspec::Search::pattern_matching_relative_path` mutates
     /// internal counters as it matches.
     pathspec: Option<gix::pathspec::Search>,
-    gen: u64,
+    generation: u64,
 }
 
 impl<'r> Walker<'r> {
     fn new(
         repo: &'r gix::Repository,
         path_filter: Option<PathFilter>,
-        gen: u64,
+        generation: u64,
         graph_enabled: bool,
         refs_map: HashMap<ObjectId, Vec<RefLabel>>,
     ) -> Result<Self> {
@@ -214,18 +214,18 @@ impl<'r> Walker<'r> {
             iter,
             done,
             pathspec,
-            gen,
+            generation,
         })
     }
 
     fn load_more(&mut self, requested: usize, msg_tx: &Sender<GitMsg>) -> Result<()> {
         if self.done {
-            _ = msg_tx.send(GitMsg::History(HistoryMsg::WalkDone { gen: self.gen }));
+            _ = msg_tx.send(GitMsg::History(HistoryMsg::WalkDone { generation: self.generation }));
             return Ok(());
         }
         let Some(iter) = self.iter.as_mut() else {
             self.done = true;
-            _ = msg_tx.send(GitMsg::History(HistoryMsg::WalkDone { gen: self.gen }));
+            _ = msg_tx.send(GitMsg::History(HistoryMsg::WalkDone { generation: self.generation }));
             return Ok(());
         };
 
@@ -249,10 +249,10 @@ impl<'r> Walker<'r> {
 
             let parent_ids: Vec<ObjectId> = info.parent_ids.iter().copied().collect();
 
-            if let Some(search) = self.pathspec.as_mut() {
-                if !commit_touches_pathspec(self.repo, info.id, &parent_ids, search) {
-                    continue;
-                }
+            if let Some(search) = self.pathspec.as_mut()
+                && !commit_touches_pathspec(self.repo, info.id, &parent_ids, search)
+            {
+                continue;
             }
 
             if let Some(commit_record) =
@@ -263,10 +263,10 @@ impl<'r> Walker<'r> {
         }
 
         if !batch.is_empty() {
-            _ = msg_tx.send(GitMsg::History(HistoryMsg::Commits { gen: self.gen, commits: batch }));
+            _ = msg_tx.send(GitMsg::History(HistoryMsg::Commits { generation: self.generation, commits: batch }));
         }
         if self.done {
-            _ = msg_tx.send(GitMsg::History(HistoryMsg::WalkDone { gen: self.gen }));
+            _ = msg_tx.send(GitMsg::History(HistoryMsg::WalkDone { generation: self.generation }));
         }
         Ok(())
     }
@@ -433,7 +433,7 @@ fn working_tree_author(repo: &gix::Repository) -> String {
 /// when the status query itself errors — the UI keeps its previous
 /// indicator in that case rather than flashing to "clean".
 fn quick_is_dirty(repo: &gix::Repository) -> Option<bool> {
-    use gix::status::{index_worktree, plumbing::index_as_worktree, Item, UntrackedFiles};
+    use gix::status::{Item, UntrackedFiles, index_worktree, plumbing::index_as_worktree};
     let platform = repo.status(gix::progress::Discard).ok()?;
     let iter = platform.untracked_files(UntrackedFiles::Collapsed).into_iter(Vec::new()).ok()?;
     for item in iter.flatten() {
@@ -902,7 +902,7 @@ fn staged_change_path(change: &gix::diff::index::Change) -> Option<String> {
 /// and the worktree file from disk, then defer to the same render_file_*
 /// helpers used everywhere else.
 fn render_unstaged_diff(repo: &gix::Repository, sink: &mut DiffSink<'_>) -> usize {
-    use gix::status::{index_worktree, plumbing::index_as_worktree, Item, UntrackedFiles};
+    use gix::status::{Item, UntrackedFiles, index_worktree, plumbing::index_as_worktree};
     let Ok(platform) = repo.status(gix::progress::Discard) else {
         return 0;
     };
@@ -948,7 +948,7 @@ fn render_unstaged_diff(repo: &gix::Repository, sink: &mut DiffSink<'_>) -> usiz
 /// folded together so files modified in both stages emit a single `MM <path>`
 /// row, matching git. Untracked entries surface as `?? <path>` rows.
 fn compute_short_status_lines_gix(repo: &gix::Repository) -> Vec<DiffLine> {
-    use gix::status::{index_worktree, plumbing::index_as_worktree, UntrackedFiles};
+    use gix::status::{UntrackedFiles, index_worktree, plumbing::index_as_worktree};
     use std::collections::BTreeMap;
 
     // Per-path: (staged_char, unstaged_char). Space means "no change in that
@@ -1070,8 +1070,8 @@ fn compute_working_tree_diff(repo: &gix::Repository, target: DiffTarget) -> Diff
 #[cfg(test)]
 mod tests {
     use super::{
-        build_commit_info, build_pathspec_search, classify_skip, hunk_header, quick_is_dirty, GitMsg, HistoryMsg,
-        SkipReason, Walker, MAX_INLINE_DIFF_BYTES,
+        GitMsg, HistoryMsg, MAX_INLINE_DIFF_BYTES, SkipReason, Walker, build_commit_info, build_pathspec_search,
+        classify_skip, hunk_header, quick_is_dirty,
     };
     use crate::model::{CommitRecord, PathFilter};
     use gix::bstr::BStr;

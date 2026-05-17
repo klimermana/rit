@@ -7,8 +7,8 @@
 
 mod common;
 
-use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
-use crossbeam_channel::{bounded, RecvTimeoutError};
+use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
+use crossbeam_channel::{RecvTimeoutError, bounded};
 use rit::{
     git::{self, GitMsg, GitReq, HistoryMsg},
     model::PathFilter,

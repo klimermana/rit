@@ -5,9 +5,9 @@ use crate::{
 };
 use anyhow::Result;
 use compact_str::CompactString;
-use crossbeam_channel::{after, never, select, Receiver, Sender};
+use crossbeam_channel::{Receiver, Sender, after, never, select};
 use crossterm::event::{Event, KeyCode, KeyEvent, KeyModifiers};
-use ratatui::{backend::Backend, Terminal};
+use ratatui::{Terminal, backend::Backend};
 use std::time::{Duration, Instant};
 
 const YANK_FEEDBACK_DURATION: Duration = Duration::from_secs(2);
@@ -111,11 +111,7 @@ impl CommitSearchState {
     }
 
     pub fn display_index(&self) -> usize {
-        if self.matches.is_empty() {
-            0
-        } else {
-            self.current + 1
-        }
+        if self.matches.is_empty() { 0 } else { self.current + 1 }
     }
 
     pub fn snapshot(&self) -> SearchSnapshot<'_> {
@@ -155,11 +151,7 @@ impl DiffSearchState {
     }
 
     pub fn display_index(&self) -> usize {
-        if self.matches.is_empty() {
-            0
-        } else {
-            self.current + 1
-        }
+        if self.matches.is_empty() { 0 } else { self.current + 1 }
     }
 
     pub fn snapshot(&self) -> SearchSnapshot<'_> {
@@ -356,10 +348,10 @@ impl App {
     }
 
     fn expire_yank(&mut self) {
-        if let Some(y) = &self.yank_message {
-            if y.shown_at.elapsed() >= YANK_FEEDBACK_DURATION {
-                self.yank_message = None;
-            }
+        if let Some(y) = &self.yank_message
+            && y.shown_at.elapsed() >= YANK_FEEDBACK_DURATION
+        {
+            self.yank_message = None;
         }
     }
 
@@ -391,8 +383,8 @@ impl App {
                 self.repo_name = name;
                 self.branch_name = branch;
             }
-            HistoryMsg::Commits { gen, commits } => {
-                if gen != self.walk_gen {
+            HistoryMsg::Commits { generation, commits } => {
+                if generation != self.walk_gen {
                     return;
                 }
                 let before = self.log.rows.len();
@@ -401,19 +393,19 @@ impl App {
                 // rather than rescanning the whole index every batch.
                 self.extend_commit_matches(before..self.log.rows.len());
             }
-            HistoryMsg::WalkDone { gen } => {
-                if gen == self.walk_gen {
+            HistoryMsg::WalkDone { generation } => {
+                if generation == self.walk_gen {
                     self.walk_done = true;
                 }
             }
-            HistoryMsg::RefsLoaded { gen, refs_map } => {
-                if gen == self.walk_gen {
+            HistoryMsg::RefsLoaded { generation, refs_map } => {
+                if generation == self.walk_gen {
                     // Backfill ref labels on commits already in the log.
                     for row in &mut self.log.rows {
-                        if let LogRow::Commit(c) = row {
-                            if let Some(labels) = refs_map.get(&c.id) {
-                                c.refs = labels.clone();
-                            }
+                        if let LogRow::Commit(c) = row
+                            && let Some(labels) = refs_map.get(&c.id)
+                        {
+                            c.refs = labels.clone();
                         }
                     }
                 }
@@ -776,10 +768,10 @@ impl App {
         let q = self.search.query.to_lowercase();
         let rows = &self.log.rows;
         for i in new_range {
-            if let Some(LogRow::Commit(c)) = rows.get(i) {
-                if commit_matches(c, &q) {
-                    self.search.matches.push(i);
-                }
+            if let Some(LogRow::Commit(c)) = rows.get(i)
+                && commit_matches(c, &q)
+            {
+                self.search.matches.push(i);
             }
         }
     }
