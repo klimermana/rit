@@ -3,7 +3,7 @@ pub mod help;
 pub mod log_view;
 
 use crate::{
-    app::{App, SearchState},
+    app::{App, SearchSnapshot},
     model::{DiffLine, DiffLineKind},
 };
 use ratatui::{
@@ -108,10 +108,10 @@ fn draw_status_view(frame: &mut Frame, app: &App, area: Rect) {
 fn draw_status_bar(frame: &mut Frame, app: &App, area: Rect) {
     // Diff search takes precedence over log search when both have a query —
     // the diff pane is the foreground context whenever it's open.
-    let text = if let Some(line) = search_status_line(&app.diff.search, "diff search") {
+    let text = if let Some(line) = search_status_line(app.diff.search.snapshot(), "diff search") {
         line
     } else if let Some(line) = search_status_line(
-        &app.search,
+        app.search.snapshot(),
         if app.diff.open { "search  Tab:switch  q/Esc:close-diff" } else { "search  Enter:open-diff" },
     ) {
         line
@@ -136,16 +136,16 @@ fn draw_status_bar(frame: &mut Frame, app: &App, area: Rect) {
 /// Renders the status-bar line for an active or pending search.
 /// Returns `None` when the search has neither input mode active nor a stored
 /// query — i.e. nothing to show.
-fn search_status_line(state: &SearchState, idle_hint: &str) -> Option<Line<'static>> {
-    if state.active {
+fn search_status_line(snap: SearchSnapshot<'_>, idle_hint: &str) -> Option<Line<'static>> {
+    if snap.active {
         Some(Line::from(vec![
-            Span::raw(format!(" [{}/{}] /", state.display_index(), state.matches.len())),
-            Span::styled(state.query.clone(), Style::default().fg(Color::Yellow)),
+            Span::raw(format!(" [{}/{}] /", snap.display_index, snap.matches_len)),
+            Span::styled(snap.query.to_string(), Style::default().fg(Color::Yellow)),
             Span::raw("█"),
         ]))
-    } else if !state.query.is_empty() {
+    } else if !snap.query.is_empty() {
         Some(Line::from(Span::styled(
-            format!(" [{}/{}] n:next  N:prev  Esc:clear {}", state.display_index(), state.matches.len(), idle_hint,),
+            format!(" [{}/{}] n:next  N:prev  Esc:clear {}", snap.display_index, snap.matches_len, idle_hint),
             Style::default().fg(Color::Yellow),
         )))
     } else {
