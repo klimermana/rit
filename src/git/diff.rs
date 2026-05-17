@@ -59,7 +59,13 @@ fn compute_commit_diff_inner(
         format!("CommitDate: {}", format_timestamp(committer.time()?.seconds)),
     ));
     header.push(DiffLine::new(DiffLineKind::Blank, ""));
-    header.push(DiffLine::new(DiffLineKind::Message, format!("    {}", decoded.message_summary().to_str_lossy())));
+    let message = decoded.message();
+    header.push(DiffLine::new(DiffLineKind::Message, format!("    {}", message.title.to_str_lossy())));
+    if let Some(body) = message.body {
+        for line in body.to_str_lossy().lines() {
+            header.push(DiffLine::new(DiffLineKind::Message, format!("    {line}")));
+        }
+    }
     header.push(DiffLine::new(DiffLineKind::Blank, ""));
 
     let parent_ids: Vec<ObjectId> = decoded.parents().collect();
