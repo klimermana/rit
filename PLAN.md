@@ -156,7 +156,7 @@ explicit "status query failed" line instead of the clean message.
 **Gate**: 28 existing tests pass; add one test covering an error path
 if practical, otherwise a manual note in the commit body.
 
-### 4c — Drop `Option` from `change_path` / `staged_change_path`
+### 4c — Drop `Option` from `change_path` / `staged_change_path` ✅
 
 `git/mod.rs:765`, `:888`. Return `String` directly. Update 3 callers.
 

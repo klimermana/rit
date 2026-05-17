@@ -560,9 +560,7 @@ fn diff_trees<'r>(
     for change in &recorder.records {
         // File-count and line-count caps apply before we even fetch blobs.
         if sink.guardrail_exceeded() {
-            if let Some(p) = change_path(change) {
-                sink.account_skipped_file(p);
-            }
+            sink.account_skipped_file(change_path(change));
             continue;
         }
 
@@ -763,12 +761,12 @@ fn push_file_headers(lines: &mut Vec<DiffLine>, path: &str, mode_meta: Option<&s
     lines.push(DiffLine::new(DiffLineKind::NewMarker, new_marker));
 }
 
-fn change_path(change: &gix::diff::tree::recorder::Change) -> Option<String> {
+fn change_path(change: &gix::diff::tree::recorder::Change) -> String {
     use gix::diff::tree::recorder::Change;
     let path = match change {
         Change::Addition { path, .. } | Change::Deletion { path, .. } | Change::Modification { path, .. } => path,
     };
-    Some(path.to_str_lossy().into_owned())
+    path.to_str_lossy().into_owned()
 }
 
 /// Build a `@@ -old_start,old_len +new_start,new_len @@` header that covers
@@ -846,9 +844,7 @@ fn render_staged_diff(repo: &gix::Repository, sink: &mut DiffSink<'_>) -> usize 
     for item in iter.flatten() {
         let Item::TreeIndex(change) = item else { continue };
         if sink.guardrail_exceeded() {
-            if let Some(p) = staged_change_path(&change) {
-                sink.account_skipped_file(p);
-            }
+            sink.account_skipped_file(staged_change_path(&change));
             emitted += 1;
             continue;
         }
@@ -892,7 +888,7 @@ fn render_staged_change(repo: &gix::Repository, sink: &mut DiffSink<'_>, change:
     }
 }
 
-fn staged_change_path(change: &gix::diff::index::Change) -> Option<String> {
+fn staged_change_path(change: &gix::diff::index::Change) -> String {
     use gix::diff::index::Change;
     let loc = match change {
         Change::Addition { location, .. }
@@ -900,7 +896,7 @@ fn staged_change_path(change: &gix::diff::index::Change) -> Option<String> {
         | Change::Modification { location, .. }
         | Change::Rewrite { location, .. } => location,
     };
-    Some(loc.to_string())
+    loc.to_string()
 }
 
 /// Render unstaged changes (index vs worktree) into the sink. For each
