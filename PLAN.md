@@ -291,19 +291,24 @@ becomes the baseline for future work.
 
 ## Stage 6 — Structural refactor (zero behaviour change)
 
-### 6a — Split `src/git/mod.rs`
+### 6a — Split `src/git/mod.rs` ✅
 
 ```
 git/
-  mod.rs          re-exports + GitReq/GitMsg + constants
-  worker.rs       run_git_thread, process_request, batch loop
+  mod.rs          GitReq/GitMsg envelope + worker loop + TreeDiffCache
   walk.rs         Walker, build_commit_info, pathspec helpers
   diff.rs         commit-diff renderer, DiffSink, hunk_header,
                   classify_skip, render_file_*
-  status.rs       working-tree diff, short-status renderer
+  status.rs       working-tree diff, sweep_status, short-status
   meta.rs         repo_info_for, working_tree_author, quick_is_dirty,
                   load_refs, relative_time, format_timestamp
 ```
+
+`worker.rs` collapsed into `mod.rs` since the run-loop is intertwined
+with `TreeDiffCache` ownership and adding another file just for it
+would have added imports without clarifying anything.
+Pre-split: 1545 lines in one file. Post-split: 337 in mod.rs, 440 in
+diff.rs, 370 in status.rs, 295 in walk.rs, 124 in meta.rs.
 
 ### 6b — Split `src/app.rs`
 
