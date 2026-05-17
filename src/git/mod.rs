@@ -98,6 +98,12 @@ pub enum GitMsg {
     WalkDone {
         gen: u64,
     },
+    /// Deferred ref labels — sent after the first commit batch so the UI
+    /// can backfill branch/tag decorations without blocking startup.
+    RefsLoaded {
+        gen: u64,
+        refs_map: HashMap<ObjectId, Vec<RefLabel>>,
+    },
     Error(String),
 }
 
@@ -139,12 +145,20 @@ fn run_git_thread_inner(
     let _ = msg_tx.send(GitMsg::RepoInfo(repo_info_for(&repo)));
     let _ = msg_tx.send(GitMsg::WorkingTreeMeta { author: working_tree_author(&repo) });
 
-    let mut walker = Walker::new(&repo, path_filter.as_deref(), 0, graph_enabled)?;
+    let mut walker = Walker::new(&repo, path_filter.as_deref(), 0, graph_enabled, HashMap::new())?;
+    let mut refs_loaded = false;
 
     while let Ok(req) = req_rx.recv() {
         match req {
             GitReq::LoadMore(n) => {
                 walker.load_more(n, &msg_tx)?;
+                // After the first batch, load refs and backfill.
+                if !refs_loaded {
+                    refs_loaded = true;
+                    let refs_map = load_refs(&repo);
+                    walker.refs_map = refs_map.clone();
+                    let _ = msg_tx.send(GitMsg::RefsLoaded { gen: walker.gen, refs_map });
+                }
             }
             GitReq::FetchDiff(target) => {
                 let payload = match target {
@@ -168,7 +182,9 @@ fn run_git_thread_inner(
             }
             GitReq::Reload => {
                 let next_gen = walker.gen.wrapping_add(1);
-                walker = Walker::new(&repo, path_filter.as_deref(), next_gen, graph_enabled)?;
+                let refs_map = load_refs(&repo);
+                walker = Walker::new(&repo, path_filter.as_deref(), next_gen, graph_enabled, refs_map)?;
+                refs_loaded = true;
             }
         }
     }
@@ -189,8 +205,13 @@ struct Walker<'r> {
 }
 
 impl<'r> Walker<'r> {
-    fn new(repo: &'r gix::Repository, path_filter: Option<&str>, gen: u64, graph_enabled: bool) -> Result<Self> {
-        let refs_map = load_refs(repo);
+    fn new(
+        repo: &'r gix::Repository,
+        path_filter: Option<&str>,
+        gen: u64,
+        graph_enabled: bool,
+        refs_map: HashMap<ObjectId, Vec<RefLabel>>,
+    ) -> Result<Self> {
         let (iter, done) = match repo.head_id() {
             Ok(head_id) => (Some(head_id.ancestors().all()?), false),
             Err(_) => (None, true),

@@ -346,6 +346,18 @@ impl App {
                     self.walk_done = true;
                 }
             }
+            GitMsg::RefsLoaded { gen, refs_map } => {
+                if gen == self.walk_gen {
+                    // Backfill ref labels on commits already in the log.
+                    for row in &mut self.log.rows {
+                        if let LogRow::Commit(c) = row {
+                            if let Some(labels) = refs_map.get(&c.id) {
+                                c.refs = labels.clone();
+                            }
+                        }
+                    }
+                }
+            }
             GitMsg::Error(e) => {
                 self.error = Some(e);
                 self.walk_done = true;
