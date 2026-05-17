@@ -21,7 +21,7 @@ pub use state::{
 use crate::{
     app::{
         clipboard::yank_to_clipboard,
-        search::{commit_matches, should_narrow},
+        search::{commit_matches, jump_first_at_or_after, should_narrow},
     },
     git::{GitMsg, GitReq, HistoryMsg, HistoryReq, InspectMsg, InspectReq},
     model::{DiffTarget, RepoInfo},
@@ -477,18 +477,18 @@ impl App {
 
     pub(crate) fn commit_jump_first_at_or_after_cursor(&mut self) {
         let cursor = self.log.selected;
-        let idx = self.search.state.matches.iter().position(|&i| i >= cursor).unwrap_or(0);
-        let Some(&pos) = self.search.state.matches.get(idx) else { return };
-        self.search.state.current = idx;
-        self.apply_commit_match_position(pos);
+        let s = &mut self.search.state;
+        if let Some(pos) = jump_first_at_or_after(&s.matches, &mut s.current, cursor) {
+            self.apply_commit_match_position(pos);
+        }
     }
 
     pub(crate) fn diff_jump_first_at_or_after_cursor(&mut self) {
         let cursor = self.diff.scroll;
-        let idx = self.diff.search.matches.iter().position(|&i| i >= cursor).unwrap_or(0);
-        let Some(&pos) = self.diff.search.matches.get(idx) else { return };
-        self.diff.search.current = idx;
-        self.apply_diff_match_position(pos);
+        let s = &mut self.diff.search;
+        if let Some(pos) = jump_first_at_or_after(&s.matches, &mut s.current, cursor) {
+            self.apply_diff_match_position(pos);
+        }
     }
 
     fn apply_commit_match_position(&mut self, pos: usize) {

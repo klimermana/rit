@@ -347,11 +347,12 @@ Net: ~80 lines of duplicated impl deleted; the trade is that commit
 sites now write `self.search.state.query` etc. (35 call-site
 updates).
 
-### 6d — Unify `*_jump_first_at_or_after_cursor`
+### 6d — Unify `*_jump_first_at_or_after_cursor` ✅
 
-Free function
-`jump_first_at_or_after(&[usize], &mut usize, cursor: usize) -> Option<usize>`.
-Two callers.
+`search::jump_first_at_or_after(matches, &mut current, cursor) ->
+Option<usize>` replaces the two near-duplicate methods. Each caller
+now does one borrow of its `SearchState`, calls the helper, and
+forwards the result to its pane's `apply_*_match_position`.
 
 ### 6e — Consolidate test fixtures ✅
 

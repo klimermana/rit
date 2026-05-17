@@ -19,6 +19,17 @@ pub fn should_narrow(prev_query: &str, prev_generation: u64, query: &str, genera
     generation == prev_generation && !prev_query.is_empty() && query.starts_with(prev_query)
 }
 
+/// Pick the first match at-or-after `cursor`, wrapping back to the
+/// start when none qualifies. Mutates `*current` to the chosen index.
+/// Returns the picked match position, or `None` only when `matches`
+/// is empty.
+pub fn jump_first_at_or_after(matches: &[usize], current: &mut usize, cursor: usize) -> Option<usize> {
+    let idx = matches.iter().position(|&i| i >= cursor).unwrap_or(0);
+    let &pos = matches.get(idx)?;
+    *current = idx;
+    Some(pos)
+}
+
 /// Cyclically advance `*current` by `delta`. Returns the new match position
 /// or `None` if `matches` is empty.
 pub fn cycle(matches: &[usize], current: &mut usize, delta: isize) -> Option<usize> {
