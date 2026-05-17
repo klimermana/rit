@@ -48,8 +48,22 @@ pub fn load_refs(repo: &gix::Repository) -> HashMap<ObjectId, Vec<RefLabel>> {
 pub fn repo_info_for(repo: &gix::Repository) -> RepoInfo {
     let name = repo
         .workdir()
-        .and_then(|p| p.file_name().map(|n| n.to_string_lossy().into_owned()))
-        .or_else(|| std::env::current_dir().ok().and_then(|p| p.file_name().map(|n| n.to_string_lossy().into_owned())))
+        .and_then(|p| p.canonicalize().ok())
+        .or_else(|| std::env::current_dir().ok().and_then(|p| p.canonicalize().ok()))
+        .map(|p| {
+            let display = p.to_string_lossy().into_owned();
+            if let Ok(home) = std::env::var("HOME") {
+                if display == home {
+                    "~".to_string()
+                } else if let Some(rest) = display.strip_prefix(&(home.clone() + "/")) {
+                    format!("~/{rest}")
+                } else {
+                    display
+                }
+            } else {
+                display
+            }
+        })
         .unwrap_or_else(|| "unknown".to_string());
     let branch = repo.head_name().ok().flatten().map(|n| n.shorten().to_string()).unwrap_or_else(|| "HEAD".to_string());
     RepoInfo { name, branch }

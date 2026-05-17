@@ -8,7 +8,7 @@ use crate::{
 };
 use ratatui::{
     Frame,
-    layout::{Constraint, Direction, Layout, Rect},
+    layout::{Alignment, Constraint, Direction, Layout, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span},
     widgets::{Block, Borders, Paragraph},
@@ -31,7 +31,9 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
     // Title bar
     let title = format!(" rit  {}  [{}] ", app.repo_name, app.branch_name);
     frame.render_widget(
-        Paragraph::new(title).style(Style::default().bg(Color::DarkGray).fg(Color::White).add_modifier(Modifier::BOLD)),
+        Paragraph::new(title)
+            .alignment(Alignment::Center)
+            .style(Style::default().bg(Color::DarkGray).fg(Color::White).add_modifier(Modifier::BOLD)),
         title_area,
     );
 
