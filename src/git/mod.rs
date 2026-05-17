@@ -12,7 +12,6 @@ use gix::{bstr::ByteSlice, ObjectId};
 use similar::ChangeTag;
 use std::collections::{BTreeMap, HashMap};
 
-const AUTHOR_DISPLAY_CHARS: usize = 20;
 
 pub enum GitMsg {
     RepoInfo(RepoInfo),
@@ -220,9 +219,11 @@ fn build_commit_info(
 
     let short_id = id.to_hex_with_len(7).to_string().into();
     let author = decoded.author().ok()?;
-    let author_full = author.name.to_str_lossy().into_owned();
-    let author_display: CompactString = truncate_chars(&author_full, AUTHOR_DISPLAY_CHARS).into();
-    let author_lower: CompactString = author_display.to_lowercase();
+    // Store the full author name so search can find substrings beyond the
+    // 20-char column width. The UI is responsible for truncating at render
+    // time.
+    let author_full: CompactString = author.name.to_str_lossy().into_owned().into();
+    let author_lower: CompactString = author_full.to_lowercase();
     let authored_unix_secs = author.time().map(|t| t.seconds).unwrap_or(0);
     let authored_relative = relative_time(authored_unix_secs);
     let summary = decoded.message().summary().to_str_lossy().into_owned();
@@ -235,19 +236,12 @@ fn build_commit_info(
         short_id,
         authored_unix_secs,
         authored_relative,
-        author: author_display,
+        author: author_full,
         summary,
         refs,
         graph: graph_prefix,
         search: CommitSearchText { author_lower, summary_lower },
     })
-}
-
-fn truncate_chars(s: &str, max_chars: usize) -> String {
-    match s.char_indices().nth(max_chars) {
-        Some((boundary, _)) => s[..boundary].to_string(),
-        None => s.to_string(),
-    }
 }
 
 fn commit_touches_path(repo: &gix::Repository, commit_id: ObjectId, parent_ids: &[ObjectId], filter: &str) -> bool {

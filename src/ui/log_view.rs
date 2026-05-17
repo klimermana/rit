@@ -90,8 +90,12 @@ fn commit_spans(commit: &CommitRecord, app: &App, search_query: &str, highlight_
     ));
     spans.push(Span::raw(" "));
 
+    // Truncate the full author name to the column width here at render
+    // time; the underlying CommitRecord stores the full name so search
+    // can find substrings past the 20-char display cap.
+    let author_truncated = truncate_chars(&commit.author, app.author_col_width());
     let author_span = Span::styled(
-        format!("{:<width$}", commit.author, width = app.author_col_width()),
+        format!("{:<width$}", author_truncated, width = app.author_col_width()),
         Style::default().fg(Color::Green),
     );
     highlight_matches_in_span(&mut spans, author_span, search_query, highlight_style);
@@ -111,6 +115,15 @@ fn commit_spans(commit: &CommitRecord, app: &App, search_query: &str, highlight_
     let summary_span = Span::raw(commit.summary.clone());
     highlight_matches_in_span(&mut spans, summary_span, search_query, highlight_style);
     spans
+}
+
+/// Char-aware truncation so multibyte names don't get sliced mid-codepoint
+/// when they exceed the column width.
+fn truncate_chars(s: &str, max_chars: usize) -> String {
+    match s.char_indices().nth(max_chars) {
+        Some((boundary, _)) => s[..boundary].to_string(),
+        None => s.to_string(),
+    }
 }
 
 fn working_tree_spans(row: &WorkingTreeRow, app: &App) -> Vec<Span<'static>> {
