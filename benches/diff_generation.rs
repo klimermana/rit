@@ -95,5 +95,41 @@ fn bench_diff_generation(c: &mut Criterion) {
     group.finish();
 }
 
-criterion_group!(benches, bench_diff_generation);
+/// Working-tree diff bench. Exercises the gix-native staged + unstaged
+/// diff render code path that replaced the `git diff` / `git diff --cached`
+/// shellouts. Setup: a fixture repo with one baseline commit, then one
+/// staged modification and one unstaged modification — so both renderers
+/// have content to produce.
+fn bench_working_tree_diff(c: &mut Criterion) {
+    let mut group = c.benchmark_group("working_tree_diff");
+    group.sample_size(20);
+
+    let fix = common::FixtureRepo::new();
+    let path = fix.path();
+    // Baseline so the index has prior content.
+    std::fs::write(path.join("staged.txt"), "alpha\nbeta\ngamma\n").expect("write");
+    std::fs::write(path.join("unstaged.txt"), "one\ntwo\nthree\n").expect("write");
+    common::run_git(path, &["add", "-A"]);
+    common::run_git(path, &["commit", "-q", "-m", "baseline"]);
+    // Stage one change, leave another unstaged.
+    std::fs::write(path.join("staged.txt"), "alpha\nBETA\ngamma\nfour\n").expect("write");
+    common::run_git(path, &["add", "staged.txt"]);
+    std::fs::write(path.join("unstaged.txt"), "one\nTWO\nthree\n").expect("write");
+
+    let repo_path = fix.path_buf();
+    let (req_tx, msg_rx, _, handle) = boot_worker(&repo_path);
+
+    group.bench_function("staged_plus_unstaged", |b| {
+        b.iter(|| {
+            req_tx.send(GitReq::Inspect(InspectReq::LoadDiff(DiffTarget::WorkingTree))).expect("send");
+            await_diff(&msg_rx);
+        });
+    });
+
+    drop(req_tx);
+    let _ = handle.join();
+    group.finish();
+}
+
+criterion_group!(benches, bench_diff_generation, bench_working_tree_diff);
 criterion_main!(benches);

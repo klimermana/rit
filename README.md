@@ -84,7 +84,7 @@ The diff/status content is stored as a domain `DiffLine { kind, text }` and only
 
 ## Known limitations
 
-- Working-tree status: the short-status listing (`XY path` lines) and per-file numstat are gix-native, but the staged/unstaged diff *body* sections still shell out to `git diff` / `git diff --cached`. Reproducing git's exact diff text formatting (index lines, rename headers, binary-file callouts) is a follow-up.
+- Diff text doesn't include git's `index <oid>..<oid> <mode>` header line, rename headers (`similarity index N%`), or `\ No newline at end of file` markers — rit renders the hunks themselves but not those metadata flourishes.
 - No mouse support.
 - Linux/macOS only for clipboard yank; everything else is portable.
 

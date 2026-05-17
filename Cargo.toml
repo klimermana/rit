@@ -7,6 +7,10 @@ license = "MIT"
 [[bin]]
 name = "rit"
 path = "src/main.rs"
+bench = false
+
+[lib]
+bench = false
 
 [dependencies]
 ratatui = "0.30"

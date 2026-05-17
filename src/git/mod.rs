@@ -15,7 +15,7 @@ use compact_str::CompactString;
 use crossbeam_channel::{Receiver, Sender};
 use gix::{bstr::ByteSlice, ObjectId};
 use similar::ChangeTag;
-use std::collections::{BTreeMap, HashMap};
+use std::collections::HashMap;
 
 /// Cutoffs that keep `compute_commit_diff` responsive on pathological
 /// commits. Anything past these limits gets a one-line summary instead of
@@ -65,8 +65,6 @@ fn run_git_thread_inner(
         }
     };
 
-    let repo_path = repo.workdir().map(|p| p.to_string_lossy().into_owned()).unwrap_or_else(|| ".".to_string());
-
     let _ = msg_tx.send(GitMsg::History(HistoryMsg::RepoInfo(repo_info_for(&repo))));
     let _ = msg_tx.send(GitMsg::Inspect(InspectMsg::WorkingTreeMeta { author: working_tree_author(&repo) }));
 
@@ -93,7 +91,6 @@ fn run_git_thread_inner(
                     if !process_request(
                         req,
                         &repo,
-                        &repo_path,
                         &path_filter,
                         graph_enabled,
                         &mut walker,
@@ -125,16 +122,7 @@ fn run_git_thread_inner(
         // Indexing finished — block for the next request.
         match req_rx.recv() {
             Ok(req) => {
-                if !process_request(
-                    req,
-                    &repo,
-                    &repo_path,
-                    &path_filter,
-                    graph_enabled,
-                    &mut walker,
-                    &mut refs_loaded,
-                    &msg_tx,
-                )? {
+                if !process_request(req, &repo, &path_filter, graph_enabled, &mut walker, &mut refs_loaded, &msg_tx)? {
                     return Ok(());
                 }
             }
@@ -149,7 +137,6 @@ fn run_git_thread_inner(
 fn process_request<'r>(
     req: GitReq,
     repo: &'r gix::Repository,
-    repo_path: &str,
     path_filter: &Option<PathFilter>,
     graph_enabled: bool,
     walker: &mut Walker<'r>,
@@ -167,12 +154,12 @@ fn process_request<'r>(
         GitReq::Inspect(InspectReq::LoadDiff(target)) => {
             let document = match target {
                 DiffTarget::Commit(id) => compute_commit_diff(repo, id),
-                DiffTarget::WorkingTree => compute_working_tree_diff(repo, repo_path, target),
+                DiffTarget::WorkingTree => compute_working_tree_diff(repo, target),
             };
             let _ = msg_tx.send(GitMsg::Inspect(InspectMsg::DiffLoaded(document)));
         }
         GitReq::Inspect(InspectReq::LoadStatus) => {
-            let document = compute_status(repo, repo_path);
+            let document = compute_status(repo);
             let _ = msg_tx.send(GitMsg::Inspect(InspectMsg::StatusLoaded(document)));
         }
         GitReq::Inspect(InspectReq::RefreshWorkingTreeMeta) => {
@@ -502,11 +489,14 @@ fn compute_commit_diff_inner(repo: &gix::Repository, id: ObjectId, target: DiffT
     let parent_ids: Vec<ObjectId> = decoded.parents().collect();
 
     let mut flags = DiffFlags::default();
-    if parent_ids.is_empty() {
-        diff_trees(repo, &repo.empty_tree(), &cur_tree, &mut body, &mut stats, &mut files, &mut flags)?;
-    } else {
-        let par_tree = repo.find_object(parent_ids[0])?.try_into_commit()?.tree()?;
-        diff_trees(repo, &par_tree, &cur_tree, &mut body, &mut stats, &mut files, &mut flags)?;
+    {
+        let mut sink = DiffSink { lines: &mut body, stats: &mut stats, files: &mut files, flags: &mut flags };
+        if parent_ids.is_empty() {
+            diff_trees(repo, &repo.empty_tree(), &cur_tree, &mut sink)?;
+        } else {
+            let par_tree = repo.find_object(parent_ids[0])?.try_into_commit()?.tree()?;
+            diff_trees(repo, &par_tree, &cur_tree, &mut sink)?;
+        }
     }
 
     Ok(DiffDocument { target, header, body, files, stats, flags })
@@ -516,10 +506,7 @@ fn diff_trees<'r>(
     repo: &'r gix::Repository,
     old_tree: &gix::Tree<'r>,
     new_tree: &gix::Tree<'r>,
-    lines: &mut Vec<DiffLine>,
-    stats: &mut DiffStats,
-    files: &mut Vec<FileStat>,
-    flags: &mut DiffFlags,
+    sink: &mut DiffSink<'_>,
 ) -> Result<()> {
     use gix::{diff::tree::recorder::Change, objs::TreeRefIter};
 
@@ -534,40 +521,10 @@ fn diff_trees<'r>(
     )?;
 
     for change in &recorder.records {
-        // File-count cap: emit a summary row once, then stop materialising
-        // file diffs entirely. The diffstat in `files` keeps accumulating
-        // so the summary header still shows the right counts.
-        if stats.files >= MAX_INLINE_DIFF_FILES {
-            if !flags.truncated {
-                flags.truncated = true;
-                lines.push(DiffLine::new(
-                    DiffLineKind::Faint,
-                    format!(
-                        "… {} files changed; remaining file diffs suppressed (>{} files)",
-                        stats.files, MAX_INLINE_DIFF_FILES,
-                    ),
-                ));
-            }
-            // Still count this file in stats/diffstat without emitting a hunk.
+        // File-count and line-count caps apply before we even fetch blobs.
+        if sink.guardrail_exceeded() {
             if let Some(p) = change_path(change) {
-                stats.files += 1;
-                files.push(FileStat { path: p, additions: 0, deletions: 0 });
-            }
-            continue;
-        }
-
-        // Line-count cap: same idea, but per accumulated body lines.
-        if lines.len() >= MAX_INLINE_DIFF_LINES {
-            if !flags.truncated {
-                flags.truncated = true;
-                lines.push(DiffLine::new(
-                    DiffLineKind::Faint,
-                    format!("… diff truncated at {} lines; remaining files summarised", MAX_INLINE_DIFF_LINES),
-                ));
-            }
-            if let Some(p) = change_path(change) {
-                stats.files += 1;
-                files.push(FileStat { path: p, additions: 0, deletions: 0 });
+                sink.account_skipped_file(p);
             }
             continue;
         }
@@ -575,87 +532,147 @@ fn diff_trees<'r>(
         match change {
             Change::Addition { entry_mode, oid, path, .. } if entry_mode.is_blob() => {
                 let p = path.to_str_lossy().into_owned();
-                let blob_data = repo.find_object(*oid).map(|o| o.data.clone()).unwrap_or_default();
-                let skip = classify_skip(&blob_data, &[]);
-                push_file_headers(lines, &p, Some("new file"));
-                let (file_add, file_del) = match skip {
-                    Some(reason) => {
-                        push_skip_summary(lines, flags, reason, blob_data.len());
-                        (0, 0)
-                    }
-                    None => {
-                        let content = blob_data.to_str_lossy();
-                        let mut file_add = 0usize;
-                        for line in content.lines() {
-                            stats.insertions += 1;
-                            file_add += 1;
-                            lines.push(DiffLine::new(DiffLineKind::Add, format!("+{}", line)));
-                        }
-                        (file_add, 0usize)
-                    }
-                };
-                stats.files += 1;
-                files.push(FileStat { path: p, additions: file_add, deletions: file_del });
+                let new = repo.find_object(*oid).map(|o| o.data.clone()).unwrap_or_default();
+                render_file_addition(sink, &p, &new);
             }
             Change::Deletion { entry_mode, oid, path, .. } if entry_mode.is_blob() => {
                 let p = path.to_str_lossy().into_owned();
-                let blob_data = repo.find_object(*oid).map(|o| o.data.clone()).unwrap_or_default();
-                let skip = classify_skip(&blob_data, &[]);
-                push_file_headers(lines, &p, Some("deleted file"));
-                let (file_add, file_del) = match skip {
-                    Some(reason) => {
-                        push_skip_summary(lines, flags, reason, blob_data.len());
-                        (0, 0)
-                    }
-                    None => {
-                        let content = blob_data.to_str_lossy();
-                        let mut file_del = 0usize;
-                        for line in content.lines() {
-                            stats.deletions += 1;
-                            file_del += 1;
-                            lines.push(DiffLine::new(DiffLineKind::Del, format!("-{}", line)));
-                        }
-                        (0usize, file_del)
-                    }
-                };
-                stats.files += 1;
-                files.push(FileStat { path: p, additions: file_add, deletions: file_del });
+                let old = repo.find_object(*oid).map(|o| o.data.clone()).unwrap_or_default();
+                render_file_deletion(sink, &p, &old);
             }
             Change::Modification { entry_mode, previous_oid, oid, path, .. } if entry_mode.is_blob() => {
                 let p = path.to_str_lossy().into_owned();
                 let old = repo.find_object(*previous_oid).map(|o| o.data.clone()).unwrap_or_default();
                 let new = repo.find_object(*oid).map(|o| o.data.clone()).unwrap_or_default();
-                let skip = classify_skip(&old, &new);
-                push_file_headers(lines, &p, None);
-                let (file_add, file_del) = match skip {
-                    Some(reason) => {
-                        push_skip_summary(lines, flags, reason, old.len().max(new.len()));
-                        (0, 0)
-                    }
-                    None => {
-                        let old_s = old.to_str_lossy();
-                        let new_s = new.to_str_lossy();
-                        let diff = similar::TextDiff::from_lines(old_s.as_ref(), new_s.as_ref());
-                        let mut file_add = 0usize;
-                        let mut file_del = 0usize;
-                        for group in diff.grouped_ops(3) {
-                            lines.push(DiffLine::new(DiffLineKind::HunkHeader, hunk_header(&group)));
-                            for op in &group {
-                                for ch in diff.iter_changes(op) {
-                                    push_change(lines, stats, &mut file_add, &mut file_del, ch.tag(), ch.value());
-                                }
-                            }
-                        }
-                        (file_add, file_del)
-                    }
-                };
-                stats.files += 1;
-                files.push(FileStat { path: p, additions: file_add, deletions: file_del });
+                render_file_modification(sink, &p, &old, &new);
             }
             _ => {}
         }
     }
     Ok(())
+}
+
+/// Mutable accumulator threaded through every file-render call. Keeps the
+/// four output collections (`lines`, `stats`, `files`, `flags`) together
+/// so call sites just pass `sink` instead of four borrows, and so the
+/// guardrail logic stays in one place.
+struct DiffSink<'a> {
+    lines: &'a mut Vec<DiffLine>,
+    stats: &'a mut DiffStats,
+    files: &'a mut Vec<FileStat>,
+    flags: &'a mut DiffFlags,
+}
+
+impl DiffSink<'_> {
+    /// True once a file-count or line-count guardrail has fired. Callers
+    /// should stop materialising hunks but still call `account_skipped_file`
+    /// so the diffstat counts every changed file.
+    fn guardrail_exceeded(&mut self) -> bool {
+        if self.stats.files >= MAX_INLINE_DIFF_FILES {
+            self.note_truncation(format!(
+                "… {} files changed; remaining file diffs suppressed (>{} files)",
+                self.stats.files, MAX_INLINE_DIFF_FILES,
+            ));
+            return true;
+        }
+        if self.lines.len() >= MAX_INLINE_DIFF_LINES {
+            self.note_truncation(format!(
+                "… diff truncated at {} lines; remaining files summarised",
+                MAX_INLINE_DIFF_LINES,
+            ));
+            return true;
+        }
+        false
+    }
+
+    fn note_truncation(&mut self, message: String) {
+        if !self.flags.truncated {
+            self.flags.truncated = true;
+            self.lines.push(DiffLine::new(DiffLineKind::Faint, message));
+        }
+    }
+
+    fn account_skipped_file(&mut self, path: String) {
+        self.stats.files += 1;
+        self.files.push(FileStat { path, additions: 0, deletions: 0 });
+    }
+
+    fn record_file(&mut self, path: String, additions: usize, deletions: usize) {
+        self.stats.files += 1;
+        self.files.push(FileStat { path, additions, deletions });
+    }
+}
+
+/// Render a pure-addition file diff (new file in the new revision).
+fn render_file_addition(sink: &mut DiffSink<'_>, path: &str, new: &[u8]) {
+    push_file_headers(sink.lines, path, Some("new file"));
+    let (additions, deletions) = match classify_skip(&[], new) {
+        Some(reason) => {
+            push_skip_summary(sink.lines, sink.flags, reason, new.len());
+            (0, 0)
+        }
+        None => {
+            let mut count = 0usize;
+            for line in new.to_str_lossy().lines() {
+                sink.stats.insertions += 1;
+                count += 1;
+                sink.lines.push(DiffLine::new(DiffLineKind::Add, format!("+{}", line)));
+            }
+            (count, 0)
+        }
+    };
+    sink.record_file(path.to_string(), additions, deletions);
+}
+
+/// Render a pure-deletion file diff (file present in old, absent in new).
+fn render_file_deletion(sink: &mut DiffSink<'_>, path: &str, old: &[u8]) {
+    push_file_headers(sink.lines, path, Some("deleted file"));
+    let (additions, deletions) = match classify_skip(old, &[]) {
+        Some(reason) => {
+            push_skip_summary(sink.lines, sink.flags, reason, old.len());
+            (0, 0)
+        }
+        None => {
+            let mut count = 0usize;
+            for line in old.to_str_lossy().lines() {
+                sink.stats.deletions += 1;
+                count += 1;
+                sink.lines.push(DiffLine::new(DiffLineKind::Del, format!("-{}", line)));
+            }
+            (0, count)
+        }
+    };
+    sink.record_file(path.to_string(), additions, deletions);
+}
+
+/// Render a per-file modification (both sides present) as one or more
+/// `@@`-headed hunks. Shared between commit diffs (HEAD vs HEAD~1), staged
+/// diffs (HEAD vs index), and unstaged diffs (index vs worktree).
+fn render_file_modification(sink: &mut DiffSink<'_>, path: &str, old: &[u8], new: &[u8]) {
+    push_file_headers(sink.lines, path, None);
+    let (additions, deletions) = match classify_skip(old, new) {
+        Some(reason) => {
+            push_skip_summary(sink.lines, sink.flags, reason, old.len().max(new.len()));
+            (0, 0)
+        }
+        None => {
+            let old_s = old.to_str_lossy();
+            let new_s = new.to_str_lossy();
+            let diff = similar::TextDiff::from_lines(old_s.as_ref(), new_s.as_ref());
+            let mut file_add = 0usize;
+            let mut file_del = 0usize;
+            for group in diff.grouped_ops(3) {
+                sink.lines.push(DiffLine::new(DiffLineKind::HunkHeader, hunk_header(&group)));
+                for op in &group {
+                    for ch in diff.iter_changes(op) {
+                        push_change(sink.lines, sink.stats, &mut file_add, &mut file_del, ch.tag(), ch.value());
+                    }
+                }
+            }
+            (file_add, file_del)
+        }
+    };
+    sink.record_file(path.to_string(), additions, deletions);
 }
 
 /// Reason a file's inline diff was omitted. Each maps to a single
@@ -763,58 +780,129 @@ fn format_timestamp(unix_secs: i64) -> String {
     Utc.timestamp_opt(unix_secs, 0).single().unwrap_or_else(Utc::now).format("%a %b %e %T %Y +0000").to_string()
 }
 
-// `git status --short` and per-file numstat are now produced natively via
-// `gix::status`. The two `git diff [--cached]` shell-outs inside
-// `compute_status_lines` below still remain — replicating git's exact
-// human-readable diff text (including the `index <oid>..<oid> <mode>` line,
-// rename headers, and binary-file callouts) is out of scope for this commit
-// and is left as a follow-up.
-fn compute_status(repo: &gix::Repository, repo_path: &str) -> StatusDocument {
-    StatusDocument { lines: compute_status_lines(repo, repo_path) }
+/// Working-tree status pane. Reuses `compute_working_tree_diff`'s body
+/// production so the status pane and the working-tree diff pane stay in
+/// lockstep — there is exactly one renderer.
+fn compute_status(repo: &gix::Repository) -> StatusDocument {
+    let doc = compute_working_tree_diff(repo, DiffTarget::WorkingTree);
+    StatusDocument { lines: doc.body }
 }
 
-fn compute_status_lines(repo: &gix::Repository, repo_path: &str) -> Vec<DiffLine> {
-    use std::process::Command;
-    let mut lines: Vec<DiffLine> = Vec::new();
+/// Render staged changes (HEAD vs index) into the sink. Iterates
+/// `gix::status` once and matches only `TreeIndex` items.
+fn render_staged_diff(repo: &gix::Repository, sink: &mut DiffSink<'_>) -> usize {
+    use gix::status::{Item, UntrackedFiles};
+    let Ok(platform) = repo.status(gix::progress::Discard) else {
+        return 0;
+    };
+    let Ok(iter) = platform.untracked_files(UntrackedFiles::None).into_iter(Vec::new()) else {
+        return 0;
+    };
 
-    lines.push(DiffLine::new(DiffLineKind::SectionTitle, "Working Tree Status"));
-    lines.push(DiffLine::new(DiffLineKind::Blank, ""));
-
-    let short = compute_short_status_lines_gix(repo);
-    lines.extend(short);
-
-    lines.push(DiffLine::new(DiffLineKind::Blank, ""));
-    lines.push(DiffLine::new(DiffLineKind::SectionStaged, "── Staged ──────────────────────────────────────────────"));
-    lines.push(DiffLine::new(DiffLineKind::Blank, ""));
-
-    if let Ok(out) = Command::new("git").args(["-C", repo_path, "diff", "--cached"]).output() {
-        let s = String::from_utf8_lossy(&out.stdout);
-        if s.trim().is_empty() {
-            lines.push(DiffLine::new(DiffLineKind::Faint, "(no staged changes)"));
-        } else {
-            for line in s.lines() {
-                lines.push(classify_raw_diff_line(line));
+    let mut emitted = 0usize;
+    for item in iter.flatten() {
+        let Item::TreeIndex(change) = item else { continue };
+        if sink.guardrail_exceeded() {
+            if let Some(p) = staged_change_path(&change) {
+                sink.account_skipped_file(p);
             }
+            emitted += 1;
+            continue;
+        }
+        emitted += render_staged_change(repo, sink, change);
+    }
+    emitted
+}
+
+fn render_staged_change(repo: &gix::Repository, sink: &mut DiffSink<'_>, change: gix::diff::index::Change) -> usize {
+    use gix::diff::index::Change;
+    match change {
+        Change::Addition { location, id, .. } => {
+            let path = location.to_string();
+            let new = repo.find_object(id.into_owned()).map(|o| o.data.clone()).unwrap_or_default();
+            render_file_addition(sink, &path, &new);
+            1
+        }
+        Change::Deletion { location, id, .. } => {
+            let path = location.to_string();
+            let old = repo.find_object(id.into_owned()).map(|o| o.data.clone()).unwrap_or_default();
+            render_file_deletion(sink, &path, &old);
+            1
+        }
+        Change::Modification { location, previous_id, id, .. } => {
+            let path = location.to_string();
+            let old = repo.find_object(previous_id.into_owned()).map(|o| o.data.clone()).unwrap_or_default();
+            let new = repo.find_object(id.into_owned()).map(|o| o.data.clone()).unwrap_or_default();
+            render_file_modification(sink, &path, &old, &new);
+            1
+        }
+        Change::Rewrite { location, source_id, id, .. } => {
+            // Treat renames as modifications under the destination path. A
+            // rename header `R old -> new` is a follow-up; today both git
+            // and we show this as a modification at the new path.
+            let path = location.to_string();
+            let old = repo.find_object(source_id.into_owned()).map(|o| o.data.clone()).unwrap_or_default();
+            let new = repo.find_object(id.into_owned()).map(|o| o.data.clone()).unwrap_or_default();
+            render_file_modification(sink, &path, &old, &new);
+            1
         }
     }
+}
 
-    lines.push(DiffLine::new(DiffLineKind::Blank, ""));
-    lines
-        .push(DiffLine::new(DiffLineKind::SectionUnstaged, "── Unstaged ────────────────────────────────────────────"));
-    lines.push(DiffLine::new(DiffLineKind::Blank, ""));
+fn staged_change_path(change: &gix::diff::index::Change) -> Option<String> {
+    use gix::diff::index::Change;
+    let loc = match change {
+        Change::Addition { location, .. }
+        | Change::Deletion { location, .. }
+        | Change::Modification { location, .. }
+        | Change::Rewrite { location, .. } => location,
+    };
+    Some(loc.to_string())
+}
 
-    if let Ok(out) = Command::new("git").args(["-C", repo_path, "diff"]).output() {
-        let s = String::from_utf8_lossy(&out.stdout);
-        if s.trim().is_empty() {
-            lines.push(DiffLine::new(DiffLineKind::Faint, "(no unstaged changes)"));
-        } else {
-            for line in s.lines() {
-                lines.push(classify_raw_diff_line(line));
+/// Render unstaged changes (index vs worktree) into the sink. For each
+/// IndexWorktree::Modification item we fetch the index blob from the ODB
+/// and the worktree file from disk, then defer to the same render_file_*
+/// helpers used everywhere else.
+fn render_unstaged_diff(repo: &gix::Repository, sink: &mut DiffSink<'_>) -> usize {
+    use gix::status::{index_worktree, plumbing::index_as_worktree, Item, UntrackedFiles};
+    let Ok(platform) = repo.status(gix::progress::Discard) else {
+        return 0;
+    };
+    let Ok(iter) = platform.untracked_files(UntrackedFiles::None).into_iter(Vec::new()) else {
+        return 0;
+    };
+    let workdir = repo.workdir().map(|p| p.to_owned());
+
+    let mut emitted = 0usize;
+    for item in iter.flatten() {
+        let Item::IndexWorktree(iw) = item else { continue };
+        let index_worktree::Item::Modification { rela_path, status, entry, .. } = iw else { continue };
+        let path = rela_path.to_string();
+        if sink.guardrail_exceeded() {
+            sink.account_skipped_file(path);
+            emitted += 1;
+            continue;
+        }
+        match status {
+            index_as_worktree::EntryStatus::Change(index_as_worktree::Change::Removed) => {
+                let old = repo.find_object(entry.id).map(|o| o.data.clone()).unwrap_or_default();
+                render_file_deletion(sink, &path, &old);
+                emitted += 1;
             }
+            index_as_worktree::EntryStatus::Change(index_as_worktree::Change::Modification { .. })
+            | index_as_worktree::EntryStatus::Change(index_as_worktree::Change::Type { .. }) => {
+                let old = repo.find_object(entry.id).map(|o| o.data.clone()).unwrap_or_default();
+                let new = workdir.as_ref().and_then(|wd| std::fs::read(wd.join(&path)).ok()).unwrap_or_default();
+                render_file_modification(sink, &path, &old, &new);
+                emitted += 1;
+            }
+            // Conflicts, intent-to-add, submodule modifications, and
+            // stat-refresh hints don't correspond to a unified-diff hunk.
+            _ => {}
         }
     }
-
-    lines
+    emitted
 }
 
 /// Compute the equivalent of `git status --short` natively via `gix::status`.
@@ -905,140 +993,41 @@ fn compute_short_status_lines_gix(repo: &gix::Repository) -> Vec<DiffLine> {
     out
 }
 
-fn classify_raw_diff_line(line: &str) -> DiffLine {
-    let kind = if line.starts_with("+++")
-        || line.starts_with("---")
-        || line.starts_with("diff ")
-        || line.starts_with("index ")
+/// Assemble the working-tree diff document in a single pass: the short
+/// status header, then the staged section, then the unstaged section. All
+/// three contribute to the same `body` / `files` / `stats` / `flags` so
+/// the diffstat numbers in the title bar reflect everything below.
+fn compute_working_tree_diff(repo: &gix::Repository, target: DiffTarget) -> DiffDocument {
+    let mut body: Vec<DiffLine> = Vec::new();
+    let mut files: Vec<FileStat> = Vec::new();
+    let mut stats = DiffStats { files: 0, insertions: 0, deletions: 0 };
+    let mut flags = DiffFlags::default();
+
+    body.push(DiffLine::new(DiffLineKind::SectionTitle, "Working Tree Status"));
+    body.push(DiffLine::new(DiffLineKind::Blank, ""));
+    body.extend(compute_short_status_lines_gix(repo));
+
+    body.push(DiffLine::new(DiffLineKind::Blank, ""));
+    body.push(DiffLine::new(DiffLineKind::SectionStaged, "── Staged ──────────────────────────────────────────────"));
+    body.push(DiffLine::new(DiffLineKind::Blank, ""));
     {
-        DiffLineKind::Faint
-    } else if line.starts_with('+') {
-        DiffLineKind::Add
-    } else if line.starts_with('-') {
-        DiffLineKind::Del
-    } else if line.starts_with("@@") {
-        DiffLineKind::HunkHeader
-    } else {
-        DiffLineKind::Context
-    };
-    DiffLine::new(kind, line)
-}
-
-fn compute_working_tree_diff(repo: &gix::Repository, repo_path: &str, target: DiffTarget) -> DiffDocument {
-    let body = compute_status_lines(repo, repo_path);
-    let mut by_path: BTreeMap<String, (usize, usize)> = BTreeMap::new();
-    for fs in compute_numstat_gix(repo) {
-        let entry = by_path.entry(fs.path).or_insert((0, 0));
-        entry.0 += fs.additions;
-        entry.1 += fs.deletions;
-    }
-    let mut totals = DiffStats { files: 0, insertions: 0, deletions: 0 };
-    let files: Vec<FileStat> = by_path
-        .into_iter()
-        .map(|(path, (a, d))| {
-            totals.files += 1;
-            totals.insertions += a;
-            totals.deletions += d;
-            FileStat { path, additions: a, deletions: d }
-        })
-        .collect();
-    DiffDocument { target, header: Vec::new(), body, files, stats: totals, flags: DiffFlags::default() }
-}
-
-/// Compute per-file numstat (additions / deletions) for the union of
-/// HEAD-vs-index (staged) and index-vs-worktree (unstaged) changes,
-/// replacing `git diff --numstat [--cached]`.
-///
-/// Line-level diffing is delegated to `similar::TextDiff` against blobs
-/// fetched from the object database (for tracked content) or read from the
-/// worktree (for unstaged content). Binary content is treated as a single
-/// addition or deletion line, which mirrors how git's numstat reports `-` —
-/// but here we surface a number so the caller's stats arithmetic still works.
-fn compute_numstat_gix(repo: &gix::Repository) -> Vec<FileStat> {
-    use gix::status::{index_worktree, plumbing::index_as_worktree, UntrackedFiles};
-
-    let mut out: Vec<FileStat> = Vec::new();
-
-    let Ok(platform) = repo.status(gix::progress::Discard) else {
-        return out;
-    };
-    let iter = match platform.untracked_files(UntrackedFiles::None).into_iter(Vec::new()) {
-        Ok(it) => it,
-        Err(_) => return out,
-    };
-
-    let workdir = repo.workdir().map(|p| p.to_owned());
-
-    for item in iter.flatten() {
-        match item {
-            gix::status::Item::TreeIndex(change) => {
-                use gix::diff::index::Change;
-                let (path, old_id, new_id) = match change {
-                    Change::Addition { location, id, .. } => (location.to_string(), None, Some(id.into_owned())),
-                    Change::Deletion { location, id, .. } => (location.to_string(), Some(id.into_owned()), None),
-                    Change::Modification { location, previous_id, id, .. } => {
-                        (location.to_string(), Some(previous_id.into_owned()), Some(id.into_owned()))
-                    }
-                    Change::Rewrite { location, source_id, id, .. } => {
-                        (location.to_string(), Some(source_id.into_owned()), Some(id.into_owned()))
-                    }
-                };
-                let old = old_id.and_then(|id| repo.find_object(id).ok().map(|o| o.data.clone())).unwrap_or_default();
-                let new = new_id.and_then(|id| repo.find_object(id).ok().map(|o| o.data.clone())).unwrap_or_default();
-                let (additions, deletions) = numstat_for_blobs(&old, &new);
-                out.push(FileStat { path, additions, deletions });
-            }
-            gix::status::Item::IndexWorktree(iw) => {
-                if let index_worktree::Item::Modification { rela_path, status, entry, .. } = iw {
-                    let path = rela_path.to_string();
-                    match status {
-                        index_as_worktree::EntryStatus::Change(index_as_worktree::Change::Removed) => {
-                            let old = repo.find_object(entry.id).ok().map(|o| o.data.clone()).unwrap_or_default();
-                            let (additions, deletions) = numstat_for_blobs(&old, &[]);
-                            out.push(FileStat { path, additions, deletions });
-                        }
-                        index_as_worktree::EntryStatus::Change(index_as_worktree::Change::Modification { .. })
-                        | index_as_worktree::EntryStatus::Change(index_as_worktree::Change::Type { .. }) => {
-                            let old = repo.find_object(entry.id).ok().map(|o| o.data.clone()).unwrap_or_default();
-                            let new_bytes =
-                                workdir.as_ref().and_then(|wd| std::fs::read(wd.join(&path)).ok()).unwrap_or_default();
-                            let (additions, deletions) = numstat_for_blobs(&old, &new_bytes);
-                            out.push(FileStat { path, additions, deletions });
-                        }
-                        // Conflicts, intent-to-add, submodule modifications, and stat-only
-                        // refreshes don't contribute numstat numbers comparable to git's.
-                        _ => {}
-                    }
-                }
-            }
+        let mut sink = DiffSink { lines: &mut body, stats: &mut stats, files: &mut files, flags: &mut flags };
+        if render_staged_diff(repo, &mut sink) == 0 {
+            sink.lines.push(DiffLine::new(DiffLineKind::Faint, "(no staged changes)"));
         }
     }
 
-    out
-}
-
-fn numstat_for_blobs(old: &[u8], new: &[u8]) -> (usize, usize) {
-    // Crude binary detection: a NUL byte in either side means we can't do a
-    // line-diff. Report it as a wholesale rewrite (1 add + 1 del) so the
-    // caller still surfaces a non-zero entry.
-    if old.contains(&0) || new.contains(&0) {
-        let a = if new.is_empty() { 0 } else { 1 };
-        let d = if old.is_empty() { 0 } else { 1 };
-        return (a, d);
-    }
-    let old_s = String::from_utf8_lossy(old);
-    let new_s = String::from_utf8_lossy(new);
-    let diff = similar::TextDiff::from_lines(old_s.as_ref(), new_s.as_ref());
-    let mut additions = 0usize;
-    let mut deletions = 0usize;
-    for change in diff.iter_all_changes() {
-        match change.tag() {
-            ChangeTag::Insert => additions += 1,
-            ChangeTag::Delete => deletions += 1,
-            ChangeTag::Equal => {}
+    body.push(DiffLine::new(DiffLineKind::Blank, ""));
+    body.push(DiffLine::new(DiffLineKind::SectionUnstaged, "── Unstaged ────────────────────────────────────────────"));
+    body.push(DiffLine::new(DiffLineKind::Blank, ""));
+    {
+        let mut sink = DiffSink { lines: &mut body, stats: &mut stats, files: &mut files, flags: &mut flags };
+        if render_unstaged_diff(repo, &mut sink) == 0 {
+            sink.lines.push(DiffLine::new(DiffLineKind::Faint, "(no unstaged changes)"));
         }
     }
-    (additions, deletions)
+
+    DiffDocument { target, header: Vec::new(), body, files, stats, flags }
 }
 
 #[cfg(test)]
@@ -1302,5 +1291,67 @@ mod tests {
         assert_eq!(info.author.as_str(), long_name, "author field should hold the full name, not the truncated form");
         assert!(info.search.author_lower.contains("rooijen"));
         assert!(info.search.author_lower.contains("smith"));
+    }
+
+    #[test]
+    fn working_tree_diff_renders_staged_and_unstaged_sections() {
+        // End-to-end check for the gix-native diff body migration: stage
+        // one change, leave another unstaged, and confirm both surface in
+        // the right section with non-zero numstat contributions.
+        use crate::model::DiffTarget;
+        let (td, repo) = make_fixture_repo();
+        let path = td.path();
+
+        // Commit a baseline so the index has something to diff against.
+        write_file(path, "staged.txt", "one\ntwo\nthree\n");
+        write_file(path, "unstaged.txt", "alpha\nbeta\n");
+        commit_all(path, "baseline");
+
+        // Stage one modification.
+        write_file(path, "staged.txt", "one\nTWO\nthree\nfour\n");
+        run_git(path, &["add", "staged.txt"]);
+
+        // Leave another modification unstaged.
+        write_file(path, "unstaged.txt", "alpha\nBETA\n");
+
+        let doc = super::compute_working_tree_diff(&repo, DiffTarget::WorkingTree);
+
+        let body_text: String = doc.body.iter().map(|l| l.text.as_str()).collect::<Vec<_>>().join("\n");
+        // Staged section contains the staged file's diff headers + a + line for "four".
+        assert!(body_text.contains("── Staged"), "staged section title present");
+        assert!(body_text.contains("diff --git a/staged.txt b/staged.txt"));
+        assert!(body_text.contains("+four"));
+        // Unstaged section contains the unstaged file's diff headers + the BETA change.
+        assert!(body_text.contains("── Unstaged"), "unstaged section title present");
+        assert!(body_text.contains("diff --git a/unstaged.txt b/unstaged.txt"));
+        assert!(body_text.contains("+BETA"));
+
+        // Both files contribute to the diffstat / aggregated stats.
+        let paths: Vec<&str> = doc.files.iter().map(|f| f.path.as_str()).collect();
+        assert!(paths.contains(&"staged.txt"));
+        assert!(paths.contains(&"unstaged.txt"));
+        assert!(doc.stats.files >= 2);
+        assert!(doc.stats.insertions > 0);
+    }
+
+    #[test]
+    fn working_tree_diff_empty_sections_show_placeholder_text() {
+        // Pristine repo: status should report clean, both diff sections
+        // should fall back to their "(no … changes)" placeholders.
+        use crate::model::DiffTarget;
+        let (td, repo) = make_fixture_repo();
+        let path = td.path();
+        write_file(path, "a.txt", "hi\n");
+        commit_all(path, "baseline");
+
+        let doc = super::compute_working_tree_diff(&repo, DiffTarget::WorkingTree);
+        let body_text: String = doc.body.iter().map(|l| l.text.as_str()).collect::<Vec<_>>().join("\n");
+
+        assert!(body_text.contains("Nothing to commit, working tree clean"));
+        assert!(body_text.contains("(no staged changes)"));
+        assert!(body_text.contains("(no unstaged changes)"));
+        assert_eq!(doc.stats.files, 0);
+        assert_eq!(doc.stats.insertions, 0);
+        assert_eq!(doc.stats.deletions, 0);
     }
 }
