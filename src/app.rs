@@ -138,6 +138,12 @@ pub struct DiffState {
     /// In-diff search state (`/` while the diff pane is focused). Matches are
     /// virtual line indices into header + diffstat + body.
     pub search: SearchState,
+    /// Lazily-built lowercased mirrors of `header_lines` / `body_lines`,
+    /// keyed by the same indices. Populated on first search so a 50k-line
+    /// body isn't re-lowercased on every keystroke. Cleared whenever the
+    /// underlying diff content changes.
+    pub header_lower: Option<Vec<String>>,
+    pub body_lower: Option<Vec<String>>,
 }
 
 pub struct StatusState {
@@ -194,6 +200,8 @@ impl App {
                 show_hunks: true,
                 view_height: 1,
                 search: SearchState::new(),
+                header_lower: None,
+                body_lower: None,
             },
             status: StatusState { open: false, lines: Vec::new(), scroll: 0, loading: false },
             focus: Focus::Log,
@@ -315,6 +323,9 @@ impl App {
                     self.diff.files = Some(files);
                     self.diff.stats = Some(stats);
                     self.diff.scroll = 0;
+                    // New content invalidates the lowercased mirrors.
+                    self.diff.header_lower = None;
+                    self.diff.body_lower = None;
                     // Re-run diff search against new content.
                     self.update_matches(SearchKind::Diff);
                 }
@@ -496,6 +507,8 @@ impl App {
         self.log.scroll = 0;
         self.diff.header_lines = None;
         self.diff.body_lines = None;
+        self.diff.header_lower = None;
+        self.diff.body_lower = None;
         self.diff.files = None;
         self.diff.target = None;
         self.diff.stats = None;
@@ -589,6 +602,8 @@ impl App {
             self.diff.target = Some(target);
             self.diff.header_lines = None;
             self.diff.body_lines = None;
+            self.diff.header_lower = None;
+            self.diff.body_lower = None;
             self.diff.files = None;
             self.diff.stats = None;
             self.diff.loading = true;
@@ -634,20 +649,24 @@ impl App {
             self.diff.search.current = 0;
             return;
         }
+        // Build the lowercase mirrors on first search so we don't re-lowercase
+        // the entire diff body on every keystroke.
+        self.diff.ensure_lower_cache();
+
         let header_len = self.diff.header_lines.as_ref().map(|v| v.len()).unwrap_or(0);
         let body_offset = header_len + self.diff.diffstat_line_count();
         let mut matches = Vec::new();
 
-        if let Some(header) = &self.diff.header_lines {
-            for (i, line) in header.iter().enumerate() {
-                if line.text.to_lowercase().contains(&q) {
+        if let Some(header) = &self.diff.header_lower {
+            for (i, text) in header.iter().enumerate() {
+                if text.contains(&q) {
                     matches.push(i);
                 }
             }
         }
-        if let Some(body) = &self.diff.body_lines {
-            for (i, line) in body.iter().enumerate() {
-                if line.text.to_lowercase().contains(&q) {
+        if let Some(body) = &self.diff.body_lower {
+            for (i, text) in body.iter().enumerate() {
+                if text.contains(&q) {
                     matches.push(body_offset + i);
                 }
             }
@@ -746,6 +765,22 @@ impl DiffState {
                 files.len() + 3
             }
             _ => 0,
+        }
+    }
+
+    /// Populate `header_lower` / `body_lower` from the current diff content.
+    /// No-op once populated; cleared by `apply_msg` whenever new diff content
+    /// arrives.
+    pub fn ensure_lower_cache(&mut self) {
+        if self.header_lower.is_none() {
+            if let Some(h) = &self.header_lines {
+                self.header_lower = Some(h.iter().map(|l| l.text.to_lowercase()).collect());
+            }
+        }
+        if self.body_lower.is_none() {
+            if let Some(b) = &self.body_lines {
+                self.body_lower = Some(b.iter().map(|l| l.text.to_lowercase()).collect());
+            }
         }
     }
 }

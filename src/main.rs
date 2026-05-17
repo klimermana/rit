@@ -12,7 +12,11 @@ use crossterm::{
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
 };
 use ratatui::{backend::CrosstermBackend, Terminal};
-use std::{io, panic, time::Duration};
+use std::{
+    io::{self, BufWriter},
+    panic,
+    time::Duration,
+};
 
 /// Interactive terminal git log/diff viewer.
 #[derive(Parser, Debug)]
@@ -37,7 +41,10 @@ fn main() -> Result<()> {
     enable_raw_mode()?;
     let mut stdout = io::stdout();
     execute!(stdout, EnterAlternateScreen)?;
-    let backend = CrosstermBackend::new(stdout);
+    // Wrap stdout in BufWriter so ratatui's many small per-cell writes
+    // coalesce into far fewer syscalls. CrosstermBackend calls flush() at
+    // the end of each frame, so latency is not affected.
+    let backend = CrosstermBackend::new(BufWriter::new(stdout));
     let mut terminal = Terminal::new(backend)?;
 
     let (req_tx, req_rx) = bounded::<git::GitReq>(64);

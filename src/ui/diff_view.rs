@@ -34,33 +34,28 @@ pub fn draw_diff(frame: &mut Frame, app: &App, area: Rect, focused: bool) {
         return;
     }
 
-    // Assemble the full virtual line list: header → diffstat → (hunks if shown).
-    let mut all_lines: Vec<Line> = Vec::new();
+    // Compute section lengths without building any Line objects yet.
+    let header_slice: &[DiffLine] = app.diff.header_lines.as_deref().unwrap_or(&[]);
+    let body_slice: &[DiffLine] = if app.diff.show_hunks { app.diff.body_lines.as_deref().unwrap_or(&[]) } else { &[] };
+    let header_len = header_slice.len();
 
-    if let Some(header) = &app.diff.header_lines {
-        for l in header {
-            all_lines.push(diff_line_to_ratatui(l));
+    // Diffstat is small (one row per file, plus 3 framing lines) so build it
+    // eagerly; the wins come from not materialising the body.
+    let diffstat: Vec<Line<'static>> = match (&app.diff.files, &app.diff.stats) {
+        (Some(files), Some(stats)) if !files.is_empty() => {
+            let mut out = Vec::with_capacity(files.len() + 3);
+            append_diffstat(&mut out, files, stats);
+            out
         }
-    }
-
-    if let (Some(files), Some(stats)) = (&app.diff.files, &app.diff.stats) {
-        if !files.is_empty() {
-            append_diffstat(&mut all_lines, files, stats);
-        }
-    }
-
-    if app.diff.show_hunks {
-        if let Some(body) = &app.diff.body_lines {
-            for l in body {
-                all_lines.push(diff_line_to_ratatui(l));
-            }
-        }
-    }
-
-    let total = all_lines.len();
+        _ => Vec::new(),
+    };
+    let diffstat_len = diffstat.len();
+    let body_offset = header_len + diffstat_len;
+    let total = body_offset + body_slice.len();
     if total == 0 {
         return;
     }
+
     let height = inner.height as usize;
     let scroll = app.diff.scroll.min(total.saturating_sub(1));
     let end = (scroll + height).min(total);
@@ -70,21 +65,25 @@ pub fn draw_diff(frame: &mut Frame, app: &App, area: Rect, focused: bool) {
     let has_diff_search = !search_query.is_empty();
     let current_match_line = app.diff.search.current_pos();
 
-    let visible: Vec<Line> = all_lines
-        .into_iter()
-        .skip(scroll)
-        .take(end - scroll)
-        .enumerate()
-        .map(|(i, line)| {
-            let global_idx = scroll + i;
+    // Build Lines only for the visible window.
+    let visible: Vec<Line> = (scroll..end)
+        .map(|global_idx| {
+            let line: Line<'static> = if global_idx < header_len {
+                diff_line_to_ratatui(&header_slice[global_idx])
+            } else if global_idx < body_offset {
+                diffstat[global_idx - header_len].clone()
+            } else {
+                diff_line_to_ratatui(&body_slice[global_idx - body_offset])
+            };
+
             let is_current = has_diff_search && current_match_line == Some(global_idx);
             let is_match = has_diff_search && app.diff.search.matches.binary_search(&global_idx).is_ok();
-            // Style for the current (focused) match vs other matches.
             let highlight = if is_current {
                 Style::default().bg(Color::Yellow).fg(Color::Black)
             } else {
                 Style::default().bg(Color::Rgb(100, 80, 0)).fg(Color::White)
             };
+
             let mut spans = Vec::new();
             if show_nums {
                 spans.push(Span::styled(format!("{:>4} ", global_idx + 1), Style::default().fg(Color::DarkGray)));
