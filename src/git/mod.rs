@@ -1,4 +1,9 @@
 pub mod graph;
+pub mod history;
+pub mod inspect;
+
+pub use history::{HistoryMsg, HistoryReq};
+pub use inspect::{InspectMsg, InspectReq};
 
 use crate::model::{
     CommitRecord, CommitSearchText, DiffDocument, DiffFlags, DiffLine, DiffLineKind, DiffStats, DiffTarget, FileStat,
@@ -12,37 +17,19 @@ use gix::{bstr::ByteSlice, ObjectId};
 use similar::ChangeTag;
 use std::collections::{BTreeMap, HashMap};
 
-pub enum GitMsg {
-    RepoInfo(RepoInfo),
-    /// `gen` matches the worker's current walk generation. The app drops
-    /// commits whose generation predates the most recent reload.
-    Commits {
-        gen: u64,
-        commits: Vec<CommitRecord>,
-    },
-    Diff(DiffDocument),
-    Status(StatusDocument),
-    WorkingTreeMeta {
-        author: String,
-    },
-    WalkDone {
-        gen: u64,
-    },
-    /// Deferred ref labels — sent after the first commit batch so the UI
-    /// can backfill branch/tag decorations without blocking startup.
-    RefsLoaded {
-        gen: u64,
-        refs_map: HashMap<ObjectId, Vec<RefLabel>>,
-    },
-    Error(String),
+/// Combined request envelope so the app can keep one channel pair to the
+/// (currently single) worker thread, while the type system still shows
+/// which side -- history or inspect -- owns each operation.
+pub enum GitReq {
+    History(HistoryReq),
+    Inspect(InspectReq),
 }
 
-pub enum GitReq {
-    LoadMore(usize),
-    FetchDiff(DiffTarget),
-    FetchStatus,
-    CheckWorkingTree,
-    Reload,
+/// Combined reply envelope from the worker. The app's `apply_msg`
+/// dispatches on the outer variant then the inner variant.
+pub enum GitMsg {
+    History(HistoryMsg),
+    Inspect(InspectMsg),
 }
 
 pub fn run_git_thread(
@@ -52,7 +39,7 @@ pub fn run_git_thread(
     graph_enabled: bool,
 ) {
     if let Err(e) = run_git_thread_inner(req_rx, msg_tx.clone(), path_filter, graph_enabled) {
-        let _ = msg_tx.send(GitMsg::Error(format!("git worker died: {}", e)));
+        let _ = msg_tx.send(GitMsg::History(HistoryMsg::Error(format!("git worker died: {}", e))));
     }
 }
 
@@ -65,50 +52,53 @@ fn run_git_thread_inner(
     let repo = match gix::discover(".") {
         Ok(r) => r,
         Err(e) => {
-            let _ = msg_tx.send(GitMsg::Error(format!("Failed to open repo: {}", e)));
+            let _ = msg_tx.send(GitMsg::History(HistoryMsg::Error(format!("Failed to open repo: {}", e))));
             return Ok(());
         }
     };
 
     let repo_path = repo.workdir().map(|p| p.to_string_lossy().into_owned()).unwrap_or_else(|| ".".to_string());
 
-    let _ = msg_tx.send(GitMsg::RepoInfo(repo_info_for(&repo)));
-    let _ = msg_tx.send(GitMsg::WorkingTreeMeta { author: working_tree_author(&repo) });
+    let _ = msg_tx.send(GitMsg::History(HistoryMsg::RepoInfo(repo_info_for(&repo))));
+    let _ = msg_tx.send(GitMsg::Inspect(InspectMsg::WorkingTreeMeta { author: working_tree_author(&repo) }));
 
     let mut walker = Walker::new(&repo, path_filter.clone(), 0, graph_enabled, HashMap::new())?;
     let mut refs_loaded = false;
 
     while let Ok(req) = req_rx.recv() {
         match req {
-            GitReq::LoadMore(n) => {
+            GitReq::History(HistoryReq::LoadMore(n)) => {
                 walker.load_more(n, &msg_tx)?;
                 // After the first batch, load refs and backfill.
                 if !refs_loaded {
                     refs_loaded = true;
                     let refs_map = load_refs(&repo);
                     walker.refs_map = refs_map.clone();
-                    let _ = msg_tx.send(GitMsg::RefsLoaded { gen: walker.gen, refs_map });
+                    let _ = msg_tx
+                        .send(GitMsg::History(HistoryMsg::RefsLoaded { gen: walker.gen, refs_map }));
                 }
             }
-            GitReq::FetchDiff(target) => {
-                let document = match target {
-                    DiffTarget::Commit(id) => compute_commit_diff(&repo, id),
-                    DiffTarget::WorkingTree => compute_working_tree_diff(&repo_path, target),
-                };
-                let _ = msg_tx.send(GitMsg::Diff(document));
-            }
-            GitReq::FetchStatus => {
-                let document = compute_status(&repo_path);
-                let _ = msg_tx.send(GitMsg::Status(document));
-            }
-            GitReq::CheckWorkingTree => {
-                let _ = msg_tx.send(GitMsg::WorkingTreeMeta { author: working_tree_author(&repo) });
-            }
-            GitReq::Reload => {
+            GitReq::History(HistoryReq::Reload) => {
                 let next_gen = walker.gen.wrapping_add(1);
                 let refs_map = load_refs(&repo);
                 walker = Walker::new(&repo, path_filter.clone(), next_gen, graph_enabled, refs_map)?;
                 refs_loaded = true;
+            }
+            GitReq::Inspect(InspectReq::LoadDiff(target)) => {
+                let document = match target {
+                    DiffTarget::Commit(id) => compute_commit_diff(&repo, id),
+                    DiffTarget::WorkingTree => compute_working_tree_diff(&repo_path, target),
+                };
+                let _ = msg_tx.send(GitMsg::Inspect(InspectMsg::DiffLoaded(document)));
+            }
+            GitReq::Inspect(InspectReq::LoadStatus) => {
+                let document = compute_status(&repo_path);
+                let _ = msg_tx.send(GitMsg::Inspect(InspectMsg::StatusLoaded(document)));
+            }
+            GitReq::Inspect(InspectReq::RefreshWorkingTreeMeta) => {
+                let _ = msg_tx.send(GitMsg::Inspect(InspectMsg::WorkingTreeMeta {
+                    author: working_tree_author(&repo),
+                }));
             }
         }
     }
@@ -160,12 +150,12 @@ impl<'r> Walker<'r> {
 
     fn load_more(&mut self, requested: usize, msg_tx: &Sender<GitMsg>) -> Result<()> {
         if self.done {
-            let _ = msg_tx.send(GitMsg::WalkDone { gen: self.gen });
+            let _ = msg_tx.send(GitMsg::History(HistoryMsg::WalkDone { gen: self.gen }));
             return Ok(());
         }
         let Some(iter) = self.iter.as_mut() else {
             self.done = true;
-            let _ = msg_tx.send(GitMsg::WalkDone { gen: self.gen });
+            let _ = msg_tx.send(GitMsg::History(HistoryMsg::WalkDone { gen: self.gen }));
             return Ok(());
         };
 
@@ -203,10 +193,10 @@ impl<'r> Walker<'r> {
         }
 
         if !batch.is_empty() {
-            let _ = msg_tx.send(GitMsg::Commits { gen: self.gen, commits: batch });
+            let _ = msg_tx.send(GitMsg::History(HistoryMsg::Commits { gen: self.gen, commits: batch }));
         }
         if self.done {
-            let _ = msg_tx.send(GitMsg::WalkDone { gen: self.gen });
+            let _ = msg_tx.send(GitMsg::History(HistoryMsg::WalkDone { gen: self.gen }));
         }
         Ok(())
     }

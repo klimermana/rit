@@ -1,5 +1,5 @@
 use crate::{
-    git::{GitMsg, GitReq},
+    git::{GitMsg, GitReq, HistoryMsg, HistoryReq, InspectMsg, InspectReq},
     model::{CommitRecord, DiffDocument, DiffTarget, RepoInfo, StatusDocument},
     ui,
 };
@@ -262,12 +262,20 @@ impl App {
         }
     }
 
+    fn send_history(&self, req: HistoryReq) {
+        let _ = self.tx.send(GitReq::History(req));
+    }
+
+    fn send_inspect(&self, req: InspectReq) {
+        let _ = self.tx.send(GitReq::Inspect(req));
+    }
+
     pub fn run<B: Backend>(&mut self, terminal: &mut Terminal<B>) -> Result<()>
     where
         B::Error: Send + Sync + 'static,
     {
         // Kick off the initial walk.
-        let _ = self.tx.send(GitReq::LoadMore(INITIAL_LOAD));
+        self.send_history(HistoryReq::LoadMore(INITIAL_LOAD));
 
         loop {
             self.poll_git_msgs();
@@ -345,11 +353,18 @@ impl App {
 
     fn apply_msg(&mut self, msg: GitMsg) {
         match msg {
-            GitMsg::RepoInfo(RepoInfo { name, branch }) => {
+            GitMsg::History(m) => self.apply_history_msg(m),
+            GitMsg::Inspect(m) => self.apply_inspect_msg(m),
+        }
+    }
+
+    fn apply_history_msg(&mut self, msg: HistoryMsg) {
+        match msg {
+            HistoryMsg::RepoInfo(RepoInfo { name, branch }) => {
                 self.repo_name = name;
                 self.branch_name = branch;
             }
-            GitMsg::Commits { gen, commits } => {
+            HistoryMsg::Commits { gen, commits } => {
                 if gen != self.walk_gen {
                     return;
                 }
@@ -358,33 +373,12 @@ impl App {
                     self.update_commit_matches();
                 }
             }
-            GitMsg::Diff(document) => {
-                if self.diff.target == Some(document.target) {
-                    self.diff.loading = false;
-                    self.diff.document = Some(document);
-                    self.diff.scroll = 0;
-                    // New content invalidates the lowercased mirrors.
-                    self.diff.header_lower = None;
-                    self.diff.body_lower = None;
-                    // Re-run diff search against new content.
-                    self.update_diff_matches();
-                }
-            }
-            GitMsg::Status(document) => {
-                self.status.loading = false;
-                self.status.document = Some(document);
-            }
-            GitMsg::WorkingTreeMeta { author } => {
-                if let Some(LogRow::WorkingTree(w)) = self.log.rows.first_mut() {
-                    w.author = author.into();
-                }
-            }
-            GitMsg::WalkDone { gen } => {
+            HistoryMsg::WalkDone { gen } => {
                 if gen == self.walk_gen {
                     self.walk_done = true;
                 }
             }
-            GitMsg::RefsLoaded { gen, refs_map } => {
+            HistoryMsg::RefsLoaded { gen, refs_map } => {
                 if gen == self.walk_gen {
                     // Backfill ref labels on commits already in the log.
                     for row in &mut self.log.rows {
@@ -396,9 +390,35 @@ impl App {
                     }
                 }
             }
-            GitMsg::Error(e) => {
+            HistoryMsg::Error(e) => {
                 self.error = Some(e);
                 self.walk_done = true;
+            }
+        }
+    }
+
+    fn apply_inspect_msg(&mut self, msg: InspectMsg) {
+        match msg {
+            InspectMsg::DiffLoaded(document) => {
+                if self.diff.target == Some(document.target) {
+                    self.diff.loading = false;
+                    self.diff.document = Some(document);
+                    self.diff.scroll = 0;
+                    // New content invalidates the lowercased mirrors.
+                    self.diff.header_lower = None;
+                    self.diff.body_lower = None;
+                    // Re-run diff search against new content.
+                    self.update_diff_matches();
+                }
+            }
+            InspectMsg::StatusLoaded(document) => {
+                self.status.loading = false;
+                self.status.document = Some(document);
+            }
+            InspectMsg::WorkingTreeMeta { author } => {
+                if let Some(LogRow::WorkingTree(w)) = self.log.rows.first_mut() {
+                    w.author = author.into();
+                }
             }
         }
     }
@@ -521,7 +541,7 @@ impl App {
                 self.status.scroll = 0;
                 if self.status.document.is_none() && !self.status.loading {
                     self.status.loading = true;
-                    let _ = self.tx.send(GitReq::FetchStatus);
+                    self.send_inspect(InspectReq::LoadStatus);
                 }
             }
             (_, Char('R'), Mod::NONE) => self.reload(),
@@ -593,9 +613,9 @@ impl App {
         self.walk_done = false;
         self.walk_gen = self.walk_gen.wrapping_add(1);
         self.error = None;
-        let _ = self.tx.send(GitReq::Reload);
-        let _ = self.tx.send(GitReq::CheckWorkingTree);
-        let _ = self.tx.send(GitReq::LoadMore(INITIAL_LOAD));
+        self.send_history(HistoryReq::Reload);
+        self.send_inspect(InspectReq::RefreshWorkingTreeMeta);
+        self.send_history(HistoryReq::LoadMore(INITIAL_LOAD));
     }
 
     fn move_log_down(&mut self, n: usize) {
@@ -640,7 +660,7 @@ impl App {
         }
         self.log.selected = self.log.rows.len() - 1;
         if !self.walk_done {
-            let _ = self.tx.send(GitReq::LoadMore(LOAD_PAGE));
+            self.send_history(HistoryReq::LoadMore(LOAD_PAGE));
         }
         self.ensure_selected_visible();
         if self.diff.open {
@@ -650,7 +670,7 @@ impl App {
 
     fn maybe_prefetch(&self) {
         if !self.walk_done && self.log.selected + PREFETCH_THRESHOLD >= self.log.rows.len() {
-            let _ = self.tx.send(GitReq::LoadMore(LOAD_PAGE));
+            self.send_history(HistoryReq::LoadMore(LOAD_PAGE));
         }
     }
 
@@ -677,7 +697,7 @@ impl App {
             self.diff.header_lower = None;
             self.diff.body_lower = None;
             self.diff.loading = true;
-            let _ = self.tx.send(GitReq::FetchDiff(target));
+            self.send_inspect(InspectReq::LoadDiff(target));
         }
     }
 
@@ -690,7 +710,7 @@ impl App {
         }
         // Trigger continued loading so the search eventually covers all commits.
         if !self.walk_done {
-            let _ = self.tx.send(GitReq::LoadMore(LOAD_PAGE));
+            self.send_history(HistoryReq::LoadMore(LOAD_PAGE));
         }
         self.search.matches = self
             .log
