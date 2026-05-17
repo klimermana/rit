@@ -232,11 +232,14 @@ app's backfill loop is bounded by that.
 100k-commit repo this turns the post-refs loop from O(rows) into
 O(64).
 
-### 5f — `extend_commit_matches` reuses lowercased `last_query`
+### 5f — `extend_commit_matches` reuses lowercased `last_query` ✅
 
 Avoid re-`to_lowercase()` on every batch.
 
-**Bench**: `search/hot_full_scan` (small win).
+**Bench**: this code path isn't on the search bench (the bench drives
+`commit_matches` directly against pre-lowercased data). The saving
+is "one fewer Unicode lowercase pass per batch arrival" — small but
+mechanical.
 
 ### 5g — DiffLine prefix encoding refactor
 

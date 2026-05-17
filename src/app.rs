@@ -770,11 +770,18 @@ impl App {
         if self.search.query.is_empty() {
             return;
         }
-        let q = self.search.query.to_lowercase();
+        // `last_query` is the already-lowercased mirror of `query`,
+        // updated by every `update_commit_matches` call (the only place
+        // the user-visible query changes). Re-lowercasing on every batch
+        // would be redundant — slot in the cached form instead.
+        let q = &self.search.last_query;
+        if q.is_empty() {
+            return;
+        }
         let rows = &self.log.rows;
         for i in new_range {
             if let Some(LogRow::Commit(c)) = rows.get(i)
-                && commit_matches(c, &q)
+                && commit_matches(c, q)
             {
                 self.search.matches.push(i);
             }
