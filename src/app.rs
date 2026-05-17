@@ -499,6 +499,9 @@ impl App {
             (Focus::Log, Char('G'), Mod::NONE) => self.jump_log_bottom(),
             (Focus::Log, Char('d'), Mod::CONTROL) => self.move_log_down(HALF_PAGE),
             (Focus::Log, Char('u'), Mod::CONTROL) => self.move_log_up(HALF_PAGE),
+            // Full-page nav. Modifiers ignored — PageUp/PageDown is dedicated.
+            (Focus::Log, PageDown, _) => self.move_log_down(self.log.view_height.max(1)),
+            (Focus::Log, PageUp, _) => self.move_log_up(self.log.view_height.max(1)),
             (Focus::Diff, Char('j') | Down | Enter, Mod::NONE) => self.diff_scroll_down(1),
             (Focus::Diff, Char('k') | Up | Backspace, Mod::NONE) => {
                 self.diff.scroll = self.diff.scroll.saturating_sub(1);
@@ -507,6 +510,10 @@ impl App {
             (Focus::Diff, Char('G'), Mod::NONE) => self.diff_scroll_to_bottom(),
             (Focus::Diff, Char('d'), Mod::CONTROL) => self.diff_scroll_down(HALF_PAGE),
             (Focus::Diff, Char('u'), Mod::CONTROL) => self.diff.scroll = self.diff.scroll.saturating_sub(HALF_PAGE),
+            (Focus::Diff, PageDown, _) => self.diff_scroll_down(self.diff.view_height.max(1)),
+            (Focus::Diff, PageUp, _) => {
+                self.diff.scroll = self.diff.scroll.saturating_sub(self.diff.view_height.max(1));
+            }
             _ => {}
         }
     }
