@@ -953,69 +953,69 @@ fn render_unstaged_diff(repo: &gix::Repository, sink: &mut DiffSink<'_>) -> usiz
 /// Each tracked path's two-column status (staged column / unstaged column) is
 /// folded together so files modified in both stages emit a single `MM <path>`
 /// row, matching git. Untracked entries surface as `?? <path>` rows.
-fn compute_short_status_lines_gix(repo: &gix::Repository) -> Vec<DiffLine> {
+///
+/// Returns `Err` when the underlying `gix::status` platform / iterator
+/// cannot be initialised (detached worktree without an index, ODB error,
+/// etc.) — the caller decides how to render the failure. An empty `Ok`
+/// vec means "actually clean."
+fn compute_short_status_lines_gix(repo: &gix::Repository) -> Result<Vec<DiffLine>> {
     use gix::status::{UntrackedFiles, index_worktree, plumbing::index_as_worktree};
     use std::collections::BTreeMap;
+
+    let platform = repo.status(gix::progress::Discard)?;
+    let iter = platform.untracked_files(UntrackedFiles::Collapsed).into_iter(Vec::new())?;
 
     // Per-path: (staged_char, unstaged_char). Space means "no change in that
     // column". Untracked is special-cased as ('?', '?').
     let mut by_path: BTreeMap<String, (char, char)> = BTreeMap::new();
-    // Errors (e.g. detached worktree without an index) just yield an empty
-    // status; the caller still prints the surrounding section frame.
-    if let Ok(platform) = repo.status(gix::progress::Discard) {
-        let iter = match platform.untracked_files(UntrackedFiles::Collapsed).into_iter(Vec::new()) {
-            Ok(it) => it,
-            Err(_) => return vec![DiffLine::new(DiffLineKind::Good, "Nothing to commit, working tree clean")],
-        };
-        for item in iter.flatten() {
-            match item {
-                gix::status::Item::TreeIndex(change) => {
-                    // Staged (HEAD vs index) — affects the first column.
-                    use gix::diff::index::Change;
-                    let (path, c) = match change {
-                        Change::Addition { location, .. } => (location.to_string(), 'A'),
-                        Change::Deletion { location, .. } => (location.to_string(), 'D'),
-                        Change::Modification { location, .. } => (location.to_string(), 'M'),
-                        Change::Rewrite { location, copy, .. } => (location.to_string(), if copy { 'C' } else { 'R' }),
-                    };
-                    let entry = by_path.entry(path).or_insert((' ', ' '));
-                    entry.0 = c;
-                }
-                gix::status::Item::IndexWorktree(iw) => match iw {
-                    index_worktree::Item::Modification { rela_path, status, .. } => {
-                        let c = match status {
-                            index_as_worktree::EntryStatus::Change(index_as_worktree::Change::Removed) => 'D',
-                            index_as_worktree::EntryStatus::Change(
-                                index_as_worktree::Change::Modification { .. }
-                                | index_as_worktree::Change::Type { .. }
-                                | index_as_worktree::Change::SubmoduleModification(_),
-                            ) => 'M',
-                            index_as_worktree::EntryStatus::Conflict { .. } => 'U',
-                            index_as_worktree::EntryStatus::IntentToAdd => 'A',
-                            // NeedsUpdate is a stat-refresh hint, not a user-visible change.
-                            index_as_worktree::EntryStatus::NeedsUpdate(_) => continue,
-                        };
-                        let entry = by_path.entry(rela_path.to_string()).or_insert((' ', ' '));
-                        entry.1 = c;
-                    }
-                    index_worktree::Item::DirectoryContents { entry, .. } => {
-                        // Only true untracked entries show up as `?? <path>`.
-                        if matches!(entry.status, gix::dir::entry::Status::Untracked) {
-                            by_path.entry(entry.rela_path.to_string()).or_insert(('?', '?'));
-                        }
-                    }
-                    // Rewrites/copies between index and worktree would require
-                    // a separately-configured iterator; treat the two halves
-                    // as plain add+delete events, which is how the rest of
-                    // this iteration already sees them.
-                    index_worktree::Item::Rewrite { .. } => {}
-                },
+    for item in iter.flatten() {
+        match item {
+            gix::status::Item::TreeIndex(change) => {
+                // Staged (HEAD vs index) — affects the first column.
+                use gix::diff::index::Change;
+                let (path, c) = match change {
+                    Change::Addition { location, .. } => (location.to_string(), 'A'),
+                    Change::Deletion { location, .. } => (location.to_string(), 'D'),
+                    Change::Modification { location, .. } => (location.to_string(), 'M'),
+                    Change::Rewrite { location, copy, .. } => (location.to_string(), if copy { 'C' } else { 'R' }),
+                };
+                let entry = by_path.entry(path).or_insert((' ', ' '));
+                entry.0 = c;
             }
+            gix::status::Item::IndexWorktree(iw) => match iw {
+                index_worktree::Item::Modification { rela_path, status, .. } => {
+                    let c = match status {
+                        index_as_worktree::EntryStatus::Change(index_as_worktree::Change::Removed) => 'D',
+                        index_as_worktree::EntryStatus::Change(
+                            index_as_worktree::Change::Modification { .. }
+                            | index_as_worktree::Change::Type { .. }
+                            | index_as_worktree::Change::SubmoduleModification(_),
+                        ) => 'M',
+                        index_as_worktree::EntryStatus::Conflict { .. } => 'U',
+                        index_as_worktree::EntryStatus::IntentToAdd => 'A',
+                        // NeedsUpdate is a stat-refresh hint, not a user-visible change.
+                        index_as_worktree::EntryStatus::NeedsUpdate(_) => continue,
+                    };
+                    let entry = by_path.entry(rela_path.to_string()).or_insert((' ', ' '));
+                    entry.1 = c;
+                }
+                index_worktree::Item::DirectoryContents { entry, .. } => {
+                    // Only true untracked entries show up as `?? <path>`.
+                    if matches!(entry.status, gix::dir::entry::Status::Untracked) {
+                        by_path.entry(entry.rela_path.to_string()).or_insert(('?', '?'));
+                    }
+                }
+                // Rewrites/copies between index and worktree would require
+                // a separately-configured iterator; treat the two halves
+                // as plain add+delete events, which is how the rest of
+                // this iteration already sees them.
+                index_worktree::Item::Rewrite { .. } => {}
+            },
         }
     }
 
     if by_path.is_empty() {
-        return vec![DiffLine::new(DiffLineKind::Good, "Nothing to commit, working tree clean")];
+        return Ok(vec![DiffLine::new(DiffLineKind::Good, "Nothing to commit, working tree clean")]);
     }
 
     let mut out = Vec::with_capacity(by_path.len());
@@ -1033,7 +1033,7 @@ fn compute_short_status_lines_gix(repo: &gix::Repository) -> Vec<DiffLine> {
         };
         out.push(DiffLine::new(kind, text));
     }
-    out
+    Ok(out)
 }
 
 /// Assemble the working-tree diff document in a single pass: the short
@@ -1048,7 +1048,10 @@ fn compute_working_tree_diff(repo: &gix::Repository, target: DiffTarget) -> Diff
 
     body.push(DiffLine::new(DiffLineKind::SectionTitle, "Working Tree Status"));
     body.push(DiffLine::new(DiffLineKind::Blank, ""));
-    body.extend(compute_short_status_lines_gix(repo));
+    match compute_short_status_lines_gix(repo) {
+        Ok(lines) => body.extend(lines),
+        Err(e) => body.push(DiffLine::new(DiffLineKind::Faint, format!("Status query failed: {e}"))),
+    }
 
     body.push(DiffLine::new(DiffLineKind::Blank, ""));
     body.push(DiffLine::new(DiffLineKind::SectionStaged, "── Staged ──────────────────────────────────────────────"));

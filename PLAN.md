@@ -147,7 +147,7 @@ Run `./fix` at the end.
 
 **Gate**: new tests pass, existing hunk-header tests unchanged.
 
-### 4b — Status query error reported, not silently "clean"
+### 4b — Status query error reported, not silently "clean" ✅
 
 `git/mod.rs:949`. `compute_short_status_lines_gix` returns a `Result`
 (or an enum with an `Errored` variant) and the caller renders an
