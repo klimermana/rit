@@ -25,6 +25,48 @@ const MAX_INLINE_DIFF_BYTES: usize = 256 * 1024;
 const MAX_INLINE_DIFF_LINES: usize = 20_000;
 const MAX_INLINE_DIFF_FILES: usize = 200;
 
+/// Upper bound on the pathspec → commit-diff cache. 64 entries are
+/// enough to absorb a few seconds of scrollback while the user
+/// navigates a pathspec-filtered log; the eviction policy is LRU.
+const TREE_DIFF_CACHE_CAP: usize = 64;
+
+/// Key for `TreeDiffCache` entries: `(parent_oid, commit_oid)`, where
+/// `parent_oid` is `None` for root commits diffed against an empty tree.
+type TreeDiffKey = (Option<ObjectId>, ObjectId);
+type TreeDiffRecords = Vec<gix::diff::tree::recorder::Change>;
+
+/// Per-pair LRU cache of `gix::diff::tree` records, shared between the
+/// pathspec filter (which runs a tree diff to decide whether to keep
+/// each walked commit) and `compute_commit_diff_inner` (which runs the
+/// same diff when the user opens that commit). Since commit / parent
+/// oids are content-addressed, cache entries never become stale — only
+/// evicted when the cache fills.
+struct TreeDiffCache {
+    entries: Vec<(TreeDiffKey, TreeDiffRecords)>,
+}
+
+impl TreeDiffCache {
+    fn new() -> Self {
+        Self { entries: Vec::with_capacity(TREE_DIFF_CACHE_CAP) }
+    }
+
+    /// Look up a cached records vec. Bumps the entry to MRU on hit so
+    /// the next eviction takes the genuinely least-recently-used item.
+    fn get(&mut self, key: &(Option<ObjectId>, ObjectId)) -> Option<&[gix::diff::tree::recorder::Change]> {
+        let pos = self.entries.iter().position(|(k, _)| k == key)?;
+        let entry = self.entries.remove(pos);
+        self.entries.push(entry);
+        self.entries.last().map(|(_, v)| v.as_slice())
+    }
+
+    fn insert(&mut self, key: (Option<ObjectId>, ObjectId), value: Vec<gix::diff::tree::recorder::Change>) {
+        if self.entries.len() >= TREE_DIFF_CACHE_CAP {
+            self.entries.remove(0);
+        }
+        self.entries.push((key, value));
+    }
+}
+
 /// Combined request envelope so the app can keep one channel pair to the
 /// (currently single) worker thread, while the type system still shows
 /// which side -- history or inspect -- owns each operation.
@@ -73,6 +115,9 @@ fn run_git_thread_inner(
 
     let mut walker = Walker::new(&repo, path_filter.clone(), 0, graph_enabled, Arc::new(HashMap::new()))?;
     let mut refs_loaded = false;
+    // Per-worker shared cache: the pathspec filter populates it during
+    // walking; LoadDiff requests for the same commit reuse the records.
+    let mut tree_diff_cache = TreeDiffCache::new();
 
     // Self-paced indexing loop:
     //   1. Drain any pending requests (non-blocking) so Reload and inspect
@@ -98,6 +143,7 @@ fn run_git_thread_inner(
                         graph_enabled,
                         &mut walker,
                         &mut refs_loaded,
+                        &mut tree_diff_cache,
                         &msg_tx,
                     )? {
                         return Ok(());
@@ -110,7 +156,7 @@ fn run_git_thread_inner(
 
         if !walker.done {
             let n = if refs_loaded { PAGE_BATCH } else { INITIAL_BATCH };
-            let emitted = walker.load_more(n, &msg_tx)?;
+            let emitted = walker.load_more(n, &mut tree_diff_cache, &msg_tx)?;
             // After the first batch, load refs and backfill so branch/tag
             // decorations appear without blocking startup.
             if !refs_loaded {
@@ -129,7 +175,16 @@ fn run_git_thread_inner(
         // Indexing finished — block for the next request.
         match req_rx.recv() {
             Ok(req) => {
-                if !process_request(req, &repo, &path_filter, graph_enabled, &mut walker, &mut refs_loaded, &msg_tx)? {
+                if !process_request(
+                    req,
+                    &repo,
+                    &path_filter,
+                    graph_enabled,
+                    &mut walker,
+                    &mut refs_loaded,
+                    &mut tree_diff_cache,
+                    &msg_tx,
+                )? {
                     return Ok(());
                 }
             }
@@ -141,6 +196,10 @@ fn run_git_thread_inner(
 /// Process one request. Returns `Ok(false)` if the loop should exit,
 /// `Ok(true)` to continue. Kept as a free function so both the
 /// try_recv-drain and the blocking-recv branches share it.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "single worker-loop callsite; all params are intrinsic state of the worker, no struct would clarify"
+)]
 fn process_request<'r>(
     req: GitReq,
     repo: &'r gix::Repository,
@@ -148,6 +207,7 @@ fn process_request<'r>(
     graph_enabled: bool,
     walker: &mut Walker<'r>,
     refs_loaded: &mut bool,
+    tree_diff_cache: &mut TreeDiffCache,
     msg_tx: &Sender<GitMsg>,
 ) -> Result<bool> {
     match req {
@@ -156,12 +216,15 @@ fn process_request<'r>(
             let refs_map = Arc::new(load_refs(repo));
             // The new Walker's `'r` lifetime ties to `repo`, same as
             // the caller's walker — overwriting in place is fine.
+            // The tree-diff cache survives reload: oids are
+            // content-addressed so entries from the prior generation
+            // are still valid.
             *walker = Walker::new(repo, path_filter.clone(), next_gen, graph_enabled, refs_map)?;
             *refs_loaded = true;
         }
         GitReq::Inspect(InspectReq::LoadDiff(target)) => {
             let document = match target {
-                DiffTarget::Commit(id) => compute_commit_diff(repo, id),
+                DiffTarget::Commit(id) => compute_commit_diff(repo, id, tree_diff_cache),
                 DiffTarget::WorkingTree => compute_working_tree_diff(repo, target),
             };
             _ = msg_tx.send(GitMsg::Inspect(InspectMsg::DiffLoaded(document)));
@@ -225,7 +288,7 @@ impl<'r> Walker<'r> {
     /// Pull and emit one batch. Returns the count of commits emitted —
     /// the worker uses this to tell `RefsLoaded` how far the
     /// refs-less prefix extends so the app can bound its backfill loop.
-    fn load_more(&mut self, requested: usize, msg_tx: &Sender<GitMsg>) -> Result<usize> {
+    fn load_more(&mut self, requested: usize, cache: &mut TreeDiffCache, msg_tx: &Sender<GitMsg>) -> Result<usize> {
         if self.done {
             _ = msg_tx.send(GitMsg::History(HistoryMsg::WalkDone { generation: self.generation }));
             return Ok(0);
@@ -257,7 +320,7 @@ impl<'r> Walker<'r> {
             let parent_ids: Vec<ObjectId> = info.parent_ids.iter().copied().collect();
 
             if let Some(search) = self.pathspec.as_mut()
-                && !commit_touches_pathspec(self.repo, info.id, &parent_ids, search)
+                && !commit_touches_pathspec(self.repo, info.id, &parent_ids, search, cache)
             {
                 continue;
             }
@@ -334,8 +397,9 @@ fn commit_touches_pathspec(
     commit_id: ObjectId,
     parent_ids: &[ObjectId],
     search: &mut gix::pathspec::Search,
+    cache: &mut TreeDiffCache,
 ) -> bool {
-    commit_touches_pathspec_inner(repo, commit_id, parent_ids, search).unwrap_or(false)
+    commit_touches_pathspec_inner(repo, commit_id, parent_ids, search, cache).unwrap_or(false)
 }
 
 fn commit_touches_pathspec_inner(
@@ -343,15 +407,51 @@ fn commit_touches_pathspec_inner(
     commit_id: ObjectId,
     parent_ids: &[ObjectId],
     search: &mut gix::pathspec::Search,
+    cache: &mut TreeDiffCache,
 ) -> Result<bool> {
-    use gix::{diff::tree::recorder::Change, objs::TreeRefIter};
+    use gix::diff::tree::recorder::Change;
+
+    // No attribute-driven pathspec magic is supported in this build; the
+    // stub closure satisfies the signature without doing any work.
+    let mut attrs = |_: &_, _: _, _: _, _: &mut _| true;
+
+    let records = compute_tree_diff_records(repo, parent_ids.first().copied(), commit_id, cache)?;
+    for change in records {
+        let path = match change {
+            Change::Addition { path, .. } | Change::Deletion { path, .. } | Change::Modification { path, .. } => path,
+        };
+        if search.pattern_matching_relative_path(path.as_ref(), Some(false), &mut attrs).is_some() {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+/// Look up (or compute and cache) the `gix::diff::tree` records for a
+/// commit against its first parent (or the empty tree for root
+/// commits). The cached vec is returned by slice — callers iterate
+/// it in place without taking ownership.
+fn compute_tree_diff_records<'c>(
+    repo: &gix::Repository,
+    parent_id: Option<ObjectId>,
+    commit_id: ObjectId,
+    cache: &'c mut TreeDiffCache,
+) -> Result<&'c [gix::diff::tree::recorder::Change]> {
+    use gix::objs::TreeRefIter;
+
+    let key = (parent_id, commit_id);
+    // Borrow checker doesn't like `if let Some(...) = cache.get(...)`
+    // followed by an else-branch that also touches `cache`, so
+    // check-then-act through a sentinel.
+    if cache.get(&key).is_some() {
+        return Ok(cache.get(&key).unwrap_or(&[]));
+    }
 
     let cur_commit = repo.find_object(commit_id)?.try_into_commit()?;
     let cur_tree = cur_commit.tree()?;
-
-    let par_tree = match parent_ids.first() {
+    let par_tree = match parent_id {
         None => repo.empty_tree(),
-        Some(first_parent) => repo.find_object(*first_parent)?.try_into_commit()?.tree()?,
+        Some(parent) => repo.find_object(parent)?.try_into_commit()?.tree()?,
     };
 
     let hash_kind = repo.object_hash();
@@ -364,19 +464,8 @@ fn commit_touches_pathspec_inner(
         &mut recorder,
     )?;
 
-    // No attribute-driven pathspec magic is supported in this build; the
-    // stub closure satisfies the signature without doing any work.
-    let mut attrs = |_: &_, _: _, _: _, _: &mut _| true;
-
-    for change in &recorder.records {
-        let path = match change {
-            Change::Addition { path, .. } | Change::Deletion { path, .. } | Change::Modification { path, .. } => path,
-        };
-        if search.pattern_matching_relative_path(path.as_ref(), Some(false), &mut attrs).is_some() {
-            return Ok(true);
-        }
-    }
-    Ok(false)
+    cache.insert(key, recorder.records);
+    Ok(cache.get(&key).unwrap_or(&[]))
 }
 
 fn load_refs(repo: &gix::Repository) -> HashMap<ObjectId, Vec<RefLabel>> {
@@ -500,12 +589,17 @@ fn empty_error_document(target: DiffTarget, e: anyhow::Error) -> DiffDocument {
     }
 }
 
-fn compute_commit_diff(repo: &gix::Repository, id: ObjectId) -> DiffDocument {
+fn compute_commit_diff(repo: &gix::Repository, id: ObjectId, cache: &mut TreeDiffCache) -> DiffDocument {
     let target = DiffTarget::Commit(id);
-    compute_commit_diff_inner(repo, id, target).unwrap_or_else(|e| empty_error_document(target, e))
+    compute_commit_diff_inner(repo, id, target, cache).unwrap_or_else(|e| empty_error_document(target, e))
 }
 
-fn compute_commit_diff_inner(repo: &gix::Repository, id: ObjectId, target: DiffTarget) -> Result<DiffDocument> {
+fn compute_commit_diff_inner(
+    repo: &gix::Repository,
+    id: ObjectId,
+    target: DiffTarget,
+    cache: &mut TreeDiffCache,
+) -> Result<DiffDocument> {
     let commit_obj = repo.find_object(id)?.try_into_commit()?;
     let decoded = commit_obj.decode()?;
     let mut header: Vec<DiffLine> = Vec::new();
@@ -533,43 +627,28 @@ fn compute_commit_diff_inner(repo: &gix::Repository, id: ObjectId, target: DiffT
     header.push(DiffLine::new(DiffLineKind::Message, format!("    {}", decoded.message_summary().to_str_lossy())));
     header.push(DiffLine::new(DiffLineKind::Blank, ""));
 
-    let cur_tree = commit_obj.tree()?;
     let parent_ids: Vec<ObjectId> = decoded.parents().collect();
+
+    // Cached tree-diff records. The pathspec filter populated this
+    // during walking for every commit it considered; on a pathspec
+    // walk this is a cache hit.
+    let records = compute_tree_diff_records(repo, parent_ids.first().copied(), id, cache)?.to_vec();
 
     let mut flags = DiffFlags::default();
     {
         let mut sink = DiffSink { lines: &mut body, stats: &mut stats, files: &mut files, flags: &mut flags };
-        match parent_ids.first() {
-            None => diff_trees(repo, &repo.empty_tree(), &cur_tree, &mut sink)?,
-            Some(first_parent) => {
-                let par_tree = repo.find_object(*first_parent)?.try_into_commit()?.tree()?;
-                diff_trees(repo, &par_tree, &cur_tree, &mut sink)?;
-            }
-        }
+        render_diff_records(repo, &records, &mut sink);
     }
 
     Ok(DiffDocument { target, header, body, files, stats, flags })
 }
 
-fn diff_trees<'r>(
-    repo: &'r gix::Repository,
-    old_tree: &gix::Tree<'r>,
-    new_tree: &gix::Tree<'r>,
-    sink: &mut DiffSink<'_>,
-) -> Result<()> {
-    use gix::{diff::tree::recorder::Change, objs::TreeRefIter};
-
-    let hash_kind = repo.object_hash();
-    let mut recorder = gix::diff::tree::Recorder::default();
-    gix::diff::tree(
-        TreeRefIter::from_bytes(&old_tree.data, hash_kind),
-        TreeRefIter::from_bytes(&new_tree.data, hash_kind),
-        gix::diff::tree::State::default(),
-        &repo.objects,
-        &mut recorder,
-    )?;
-
-    for change in &recorder.records {
+/// Render previously-computed tree-diff records into the sink. Split
+/// out of the old `diff_trees` so the cache lookup can sit outside the
+/// renderer.
+fn render_diff_records(repo: &gix::Repository, records: &[gix::diff::tree::recorder::Change], sink: &mut DiffSink<'_>) {
+    use gix::diff::tree::recorder::Change;
+    for change in records {
         // File-count and line-count caps apply before we even fetch blobs.
         if sink.guardrail_exceeded() {
             sink.account_skipped_file(change_path(change));
@@ -598,7 +677,6 @@ fn diff_trees<'r>(
             _ => {}
         }
     }
-    Ok(())
 }
 
 /// Mutable accumulator threaded through every file-render call. Keeps the
@@ -1141,8 +1219,8 @@ fn compute_working_tree_diff(repo: &gix::Repository, target: DiffTarget) -> Diff
 #[cfg(test)]
 mod tests {
     use super::{
-        GitMsg, HistoryMsg, MAX_INLINE_DIFF_BYTES, SkipReason, Walker, build_commit_info, build_pathspec_search,
-        classify_skip, hunk_header, quick_is_dirty, relative_time,
+        GitMsg, HistoryMsg, MAX_INLINE_DIFF_BYTES, SkipReason, TreeDiffCache, Walker, build_commit_info,
+        build_pathspec_search, classify_skip, hunk_header, quick_is_dirty, relative_time,
     };
     use crate::model::{CommitRecord, PathFilter};
     use gix::bstr::BStr;
@@ -1377,7 +1455,7 @@ mod tests {
         let pf = PathFilter::new("src");
         let mut walker = Walker::new(&repo, Some(pf), 0, false, Arc::new(HashMap::new())).expect("walker");
         let (tx, rx) = crossbeam_channel::bounded::<GitMsg>(256);
-        walker.load_more(100, &tx).expect("load_more");
+        walker.load_more(100, &mut TreeDiffCache::new(), &tx).expect("load_more");
 
         let summaries: Vec<String> = drain_commits(&rx).into_iter().map(|c| c.summary).collect();
         // HEAD ancestors yields newest-first.
@@ -1404,7 +1482,7 @@ mod tests {
         let pf = PathFilter::new("src/api");
         let mut walker = Walker::new(&repo, Some(pf), 0, false, Arc::new(HashMap::new())).expect("walker");
         let (tx, rx) = crossbeam_channel::bounded::<GitMsg>(256);
-        walker.load_more(100, &tx).expect("load_more");
+        walker.load_more(100, &mut TreeDiffCache::new(), &tx).expect("load_more");
 
         let summaries: Vec<String> = drain_commits(&rx).into_iter().map(|c| c.summary).collect();
         assert!(summaries.iter().any(|s| s == "modify api/foo"));

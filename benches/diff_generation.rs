@@ -131,5 +131,58 @@ fn bench_working_tree_diff(c: &mut Criterion) {
     group.finish();
 }
 
-criterion_group!(benches, bench_diff_generation, bench_working_tree_diff);
+/// Exercise the Stage 5h tree-diff cache: walk with a pathspec, then
+/// open the diff for the HEAD commit. The pathspec filter pre-populates
+/// the cache during walking, so the LoadDiff request is a cache hit.
+fn bench_pathspec_walk_then_diff(c: &mut Criterion) {
+    use rit::model::PathFilter;
+
+    let mut group = c.benchmark_group("pathspec_walk_then_diff");
+    group.sample_size(20);
+
+    let fix = common::FixtureRepo::new();
+    fix.seed_commits(50);
+    let repo_path = fix.path_buf();
+
+    group.bench_function("walk_50_then_diff_head", |b| {
+        b.iter(|| {
+            std::env::set_current_dir(&repo_path).expect("cd into fixture");
+            let (req_tx, req_rx) = bounded::<GitReq>(64);
+            let (msg_tx, msg_rx) = bounded::<GitMsg>(2048);
+            let handle = std::thread::spawn(move || {
+                rit::git::run_git_thread(req_rx, msg_tx, Some(PathFilter::new("file_*.txt")), false);
+            });
+
+            // Walk until done, capturing HEAD.
+            let mut head: Option<gix::ObjectId> = None;
+            let timeout = Duration::from_secs(15);
+            loop {
+                match msg_rx.recv_timeout(timeout) {
+                    Ok(GitMsg::History(HistoryMsg::Commits { commits, .. })) => {
+                        if head.is_none() {
+                            head = commits.first().map(|c| c.id);
+                        }
+                    }
+                    Ok(GitMsg::History(HistoryMsg::WalkDone { .. })) => break,
+                    Ok(_) => {}
+                    Err(_) => panic!("walk timed out"),
+                }
+            }
+            let head = head.expect("at least one commit");
+
+            // Now request the diff for HEAD. Without the cache, this
+            // re-runs gix::diff::tree from scratch; with the cache, it
+            // reuses what the walker already computed.
+            req_tx.send(GitReq::Inspect(InspectReq::LoadDiff(DiffTarget::Commit(head)))).expect("send");
+            await_diff(&msg_rx);
+
+            drop(req_tx);
+            _ = handle.join();
+        });
+    });
+
+    group.finish();
+}
+
+criterion_group!(benches, bench_diff_generation, bench_working_tree_diff, bench_pathspec_walk_then_diff);
 criterion_main!(benches);

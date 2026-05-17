@@ -174,7 +174,7 @@ if practical, otherwise a manual note in the commit body.
 
 ---
 
-## Stage 5 — Performance fixes (one commit each)
+## Stage 5 — Performance fixes (one commit each) ✅
 
 Workflow per commit: edit → `./fix` →
 `cargo bench --bench <relevant> -- --baseline pre-cleanup` → quote the
@@ -256,14 +256,28 @@ based on `kind`.
   `diff_generation/small_10_lines` within noise
   `working_tree_diff/staged_plus_unstaged` -57% (already at 5c)
 
-### 5h — Pathspec tree-diff cache
+### 5h — Pathspec tree-diff cache ✅
 
 Add a small LRU keyed by `(parent_oid, commit_oid)` so
 `commit_touches_pathspec_inner`'s records can be reused when
 `compute_commit_diff_inner` runs on the same commit. Size cap kept
-small (say 64 entries) so memory growth on long walks is bounded.
+small (64 entries) so memory growth on long walks is bounded.
 
-**Bench**: the new `indexing/with_pathspec` baseline saved at Stage 0.
+**Bench result**: walk-only path
+(`indexing/with_pathspec/{50,200}`) within noise — the cache adds
+~no overhead when only the walker uses it. The new bench
+`pathspec_walk_then_diff/walk_50_then_diff_head` (5.8 ms) exercises
+the workflow the cache helps (walk + open every visited commit) and
+becomes the baseline for future work.
+
+**Cumulative Stage 5 wins vs `pre-cleanup`**:
+| Bench | pre-cleanup | post-Stage 5 | Δ |
+|---|---|---|---|
+| `diff_generation/small_10_lines` | 58.6 µs | 44.8 µs | **−23.8%** |
+| `diff_generation/large_5000_lines` | 296.3 µs | 193.0 µs | **−34.3%** |
+| `working_tree_diff/staged_plus_unstaged` | 869.7 µs | 367.5 µs | **−57.7%** |
+| `indexing/200` | 7.60 ms | 7.60 ms | within noise |
+| `indexing/with_pathspec/200` | 23.96 ms | 23.89 ms | within noise |
 
 ---
 
