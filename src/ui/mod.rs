@@ -3,7 +3,7 @@ pub mod help;
 pub mod log_view;
 
 use crate::{
-    app::App,
+    app::{App, SearchState},
     git::{DiffLine, DiffLineKind},
 };
 use ratatui::{
@@ -105,36 +105,15 @@ fn draw_status_view(frame: &mut Frame, app: &App, area: Rect) {
 }
 
 fn draw_status_bar(frame: &mut Frame, app: &App, area: Rect) {
-    let text = if app.diff.search_active {
-        let pos = app.diff.search_matches.binary_search(&app.diff.scroll).map(|i| i + 1).unwrap_or(0);
-        Line::from(vec![
-            Span::raw(format!(" [{}/{}] /", pos, app.diff.search_matches.len())),
-            Span::styled(app.diff.search_query.clone(), Style::default().fg(Color::Yellow)),
-            Span::raw("█"),
-        ])
-    } else if !app.diff.search_query.is_empty() {
-        let pos = app.diff.search_matches.binary_search(&app.diff.scroll).map(|i| i + 1).unwrap_or(0);
-        Line::from(Span::styled(
-            format!(" [{}/{}] n:next  N:prev  Esc:clear diff search", pos, app.diff.search_matches.len()),
-            Style::default().fg(Color::Yellow),
-        ))
-    } else if app.search.active {
-        Line::from(vec![
-            Span::raw(" /"),
-            Span::styled(app.search.query.clone(), Style::default().fg(Color::Yellow)),
-            Span::raw("█"),
-        ])
-    } else if !app.search.query.is_empty() {
-        let pos = app.search.matches.binary_search(&app.log.selected).map(|i| i + 1).unwrap_or(0);
-        Line::from(Span::styled(
-            format!(
-                " [{}/{}] n:next  N:prev  Esc:clear  {}",
-                pos,
-                app.search.matches.len(),
-                if app.diff.open { "Tab:switch  q/Esc:close-diff" } else { "Enter:open-diff" }
-            ),
-            Style::default().fg(Color::Yellow),
-        ))
+    // Diff search takes precedence over log search when both have a query —
+    // the diff pane is the foreground context whenever it's open.
+    let text = if let Some(line) = search_status_line(&app.diff.search, "diff search") {
+        line
+    } else if let Some(line) = search_status_line(
+        &app.search,
+        if app.diff.open { "search  Tab:switch  q/Esc:close-diff" } else { "search  Enter:open-diff" },
+    ) {
+        line
     } else if let Some(y) = &app.yank_message {
         Line::from(Span::styled(format!(" ✓ {}", y.text), Style::default().fg(Color::Green)))
     } else if app.status.open {
@@ -151,6 +130,59 @@ fn draw_status_bar(frame: &mut Frame, app: &App, area: Rect) {
     };
 
     frame.render_widget(Paragraph::new(text).style(Style::default().bg(Color::DarkGray).fg(Color::Gray)), area);
+}
+
+/// Renders the status-bar line for an active or pending search.
+/// Returns `None` when the search has neither input mode active nor a stored
+/// query — i.e. nothing to show.
+fn search_status_line(state: &SearchState, idle_hint: &str) -> Option<Line<'static>> {
+    if state.active {
+        Some(Line::from(vec![
+            Span::raw(format!(" [{}/{}] /", state.display_index(), state.matches.len())),
+            Span::styled(state.query.clone(), Style::default().fg(Color::Yellow)),
+            Span::raw("█"),
+        ]))
+    } else if !state.query.is_empty() {
+        Some(Line::from(Span::styled(
+            format!(" [{}/{}] n:next  N:prev  Esc:clear {}", state.display_index(), state.matches.len(), idle_hint,),
+            Style::default().fg(Color::Yellow),
+        )))
+    } else {
+        None
+    }
+}
+
+/// Splits `span` into sub-spans, wrapping each occurrence of `query`
+/// (already lowercased) with `highlight_style`. Non-matching portions keep
+/// the original span's style. Shared between the log and diff views so a
+/// single highlighter fixes both at once.
+pub fn highlight_matches_in_span(
+    out: &mut Vec<Span<'static>>,
+    span: Span<'static>,
+    query: &str,
+    highlight_style: Style,
+) {
+    if query.is_empty() {
+        out.push(span);
+        return;
+    }
+    let text: &str = &span.content;
+    let text_lower = text.to_lowercase();
+    let base_style = span.style;
+    let mut last = 0;
+
+    while let Some(pos) = text_lower[last..].find(query) {
+        let abs = last + pos;
+        let end = abs + query.len();
+        if abs > last {
+            out.push(Span::styled(text[last..abs].to_string(), base_style));
+        }
+        out.push(Span::styled(text[abs..end].to_string(), highlight_style));
+        last = end;
+    }
+    if last < text.len() {
+        out.push(Span::styled(text[last..].to_string(), base_style));
+    }
 }
 
 pub fn diff_line_to_ratatui(line: &DiffLine) -> Line<'static> {

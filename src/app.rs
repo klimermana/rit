@@ -65,10 +65,61 @@ pub struct LogState {
     pub view_height: usize,
 }
 
+/// Shared search state used by both the log view and the in-diff search.
+/// `matches` holds positions in whatever index space the view uses (log row
+/// indices, or diff virtual line indices). `current` is an index into
+/// `matches` and is 0 when there are no matches.
 pub struct SearchState {
     pub active: bool,
     pub query: String,
     pub matches: Vec<usize>,
+    pub current: usize,
+}
+
+#[derive(Clone, Copy)]
+pub enum SearchKind {
+    Log,
+    Diff,
+}
+
+impl SearchState {
+    pub fn new() -> Self {
+        Self { active: false, query: String::new(), matches: Vec::new(), current: 0 }
+    }
+
+    pub fn clear(&mut self) {
+        self.active = false;
+        self.query.clear();
+        self.matches.clear();
+        self.current = 0;
+    }
+
+    /// Cyclically advance `current` by `delta`. Returns the new match
+    /// position, or `None` if there are no matches.
+    pub fn advance(&mut self, delta: isize) -> Option<usize> {
+        let len = self.matches.len();
+        if len == 0 {
+            return None;
+        }
+        let len_i = len as isize;
+        let cur = self.current as isize;
+        let next = ((cur + delta) % len_i + len_i) % len_i;
+        self.current = next as usize;
+        self.matches.get(self.current).copied()
+    }
+
+    pub fn current_pos(&self) -> Option<usize> {
+        self.matches.get(self.current).copied()
+    }
+
+    /// 1-based index for the status bar; 0 when there are no matches.
+    pub fn display_index(&self) -> usize {
+        if self.matches.is_empty() {
+            0
+        } else {
+            self.current + 1
+        }
+    }
 }
 
 pub struct DiffState {
@@ -84,14 +135,9 @@ pub struct DiffState {
     pub show_hunks: bool,
     /// Inner height of the diff pane, updated by the renderer each frame.
     pub view_height: usize,
-    // In-diff search (/ while diff pane is focused)
-    pub search_active: bool,
-    pub search_query: String,
-    /// Sorted list of virtual line indices (header + diffstat + body) that
-    /// match the current diff search query.
-    pub search_matches: Vec<usize>,
-    /// Index into search_matches for the current highlighted match.
-    pub search_current: usize,
+    /// In-diff search state (`/` while the diff pane is focused). Matches are
+    /// virtual line indices into header + diffstat + body.
+    pub search: SearchState,
 }
 
 pub struct StatusState {
@@ -134,7 +180,7 @@ impl App {
         let rows = vec![LogRow::WorkingTree(WorkingTreeRow { author: "you".into() })];
         Self {
             log: LogState { rows, selected: 0, scroll: 0, view_height: 1 },
-            search: SearchState { active: false, query: String::new(), matches: Vec::new() },
+            search: SearchState::new(),
             diff: DiffState {
                 open: false,
                 target: None,
@@ -147,10 +193,7 @@ impl App {
                 show_line_numbers: true,
                 show_hunks: true,
                 view_height: 1,
-                search_active: false,
-                search_query: String::new(),
-                search_matches: Vec::new(),
-                search_current: 0,
+                search: SearchState::new(),
             },
             status: StatusState { open: false, lines: Vec::new(), scroll: 0, loading: false },
             focus: Focus::Log,
@@ -261,7 +304,7 @@ impl App {
                 }
                 self.log.rows.extend(commits.into_iter().map(LogRow::Commit));
                 if !self.search.query.is_empty() {
-                    self.update_search_matches();
+                    self.update_matches(SearchKind::Log);
                 }
             }
             GitMsg::Diff { target, header_lines, body_lines, stats, files } => {
@@ -273,7 +316,7 @@ impl App {
                     self.diff.stats = Some(stats);
                     self.diff.scroll = 0;
                     // Re-run diff search against new content.
-                    self.update_diff_search_matches();
+                    self.update_matches(SearchKind::Diff);
                 }
             }
             GitMsg::Status(lines) => {
@@ -302,12 +345,12 @@ impl App {
             self.handle_help_key(key);
             return;
         }
-        if self.diff.search_active {
-            self.handle_diff_search_key(key);
+        if self.diff.search.active {
+            self.handle_search_key(key, SearchKind::Diff);
             return;
         }
         if self.search.active {
-            self.handle_search_key(key);
+            self.handle_search_key(key, SearchKind::Log);
             return;
         }
         if self.status.open {
@@ -317,62 +360,36 @@ impl App {
         self.handle_main_key(key);
     }
 
+    fn search_state_mut(&mut self, kind: SearchKind) -> &mut SearchState {
+        match kind {
+            SearchKind::Log => &mut self.search,
+            SearchKind::Diff => &mut self.diff.search,
+        }
+    }
+
     fn handle_help_key(&mut self, key: KeyEvent) {
         if matches!(key.code, KeyCode::Char('q') | KeyCode::Char('?') | KeyCode::Esc) {
             self.show_help = false;
         }
     }
 
-    fn handle_search_key(&mut self, key: KeyEvent) {
+    fn handle_search_key(&mut self, key: KeyEvent, kind: SearchKind) {
         use KeyCode::*;
         use KeyModifiers as Mod;
         match (key.code, key.modifiers) {
-            (Esc, _) => {
-                self.search.active = false;
-                self.search.query.clear();
-                self.search.matches.clear();
-            }
+            (Esc, _) => self.search_state_mut(kind).clear(),
             (Enter, _) => {
-                self.search.active = false;
-                self.jump_to_next_match();
+                self.search_state_mut(kind).active = false;
+                self.jump_match(kind, 1);
             }
             (Backspace, _) => {
-                self.search.query.pop();
-                self.update_search_matches();
+                self.search_state_mut(kind).query.pop();
+                self.update_matches(kind);
             }
             (Char(c), Mod::NONE) | (Char(c), Mod::SHIFT) => {
-                self.search.query.push(c);
-                self.update_search_matches();
-                if let Some(idx) = self.first_match_at_or_after(self.log.selected) {
-                    self.log.selected = idx;
-                    self.ensure_selected_visible();
-                }
-            }
-            _ => {}
-        }
-    }
-
-    fn handle_diff_search_key(&mut self, key: KeyEvent) {
-        use KeyCode::*;
-        use KeyModifiers as Mod;
-        match (key.code, key.modifiers) {
-            (Esc, _) => {
-                self.diff.search_active = false;
-                self.diff.search_query.clear();
-                self.diff.search_matches.clear();
-            }
-            (Enter, _) => {
-                self.diff.search_active = false;
-                self.jump_to_next_diff_match();
-            }
-            (Backspace, _) => {
-                self.diff.search_query.pop();
-                self.update_diff_search_matches();
-            }
-            (Char(c), Mod::NONE) | (Char(c), Mod::SHIFT) => {
-                self.diff.search_query.push(c);
-                self.update_diff_search_matches();
-                self.jump_to_first_diff_match_at_or_after(self.diff.scroll);
+                self.search_state_mut(kind).query.push(c);
+                self.update_matches(kind);
+                self.jump_first_at_or_after_cursor(kind);
             }
             _ => {}
         }
@@ -406,19 +423,19 @@ impl App {
             }
             (_, Char('y'), Mod::NONE) => self.yank_selected_hash(),
             (Focus::Log, Char('/'), Mod::NONE) => {
+                self.search.clear();
                 self.search.active = true;
-                self.search.query.clear();
-                self.search.matches.clear();
             }
             (Focus::Diff, Char('/'), Mod::NONE) => {
-                self.diff.search_active = true;
-                self.diff.search_query.clear();
-                self.diff.search_matches.clear();
+                self.diff.search.clear();
+                self.diff.search.active = true;
             }
-            (Focus::Log, Char('n'), Mod::NONE) => self.jump_to_next_match(),
-            (Focus::Log, Char('N'), Mod::NONE) => self.jump_to_prev_match(),
-            (Focus::Diff, Char('n'), Mod::NONE) => self.jump_to_next_diff_match(),
-            (Focus::Diff, Char('N'), Mod::NONE) => self.jump_to_prev_diff_match(),
+            (Focus::Log, Char('n'), Mod::NONE) => self.jump_match(SearchKind::Log, 1),
+            // `N` is typically reported with `Mod::SHIFT` since shift produced
+            // the uppercase letter; accept both to be safe across terminals.
+            (Focus::Log, Char('N'), Mod::NONE | Mod::SHIFT) => self.jump_match(SearchKind::Log, -1),
+            (Focus::Diff, Char('n'), Mod::NONE) => self.jump_match(SearchKind::Diff, 1),
+            (Focus::Diff, Char('N'), Mod::NONE | Mod::SHIFT) => self.jump_match(SearchKind::Diff, -1),
             (Focus::Log, Char('s'), Mod::NONE) => {
                 self.status.open = true;
                 self.status.scroll = 0;
@@ -444,14 +461,11 @@ impl App {
             (_, Char('q') | Esc, Mod::NONE) if self.diff.open => {
                 self.diff.open = false;
                 self.focus = Focus::Log;
-                self.diff.search_query.clear();
-                self.diff.search_matches.clear();
-                self.diff.search_current = 0;
+                self.diff.search.clear();
             }
             // Esc clears an active search result set (when diff is not open).
             (_, Esc, Mod::NONE) if !self.search.query.is_empty() => {
-                self.search.query.clear();
-                self.search.matches.clear();
+                self.search.clear();
             }
             (Focus::Log, Char('q'), Mod::NONE) => self.should_quit = true,
             (Focus::Log, Char('j') | Down, Mod::NONE) => self.move_log_down(1),
@@ -488,7 +502,8 @@ impl App {
         self.diff.loading = false;
         self.status.lines.clear();
         self.status.loading = false;
-        self.search.matches.clear();
+        self.search.clear();
+        self.diff.search.clear();
         self.walk_done = false;
         self.walk_gen = self.walk_gen.wrapping_add(1);
         self.error = None;
@@ -581,77 +596,42 @@ impl App {
         }
     }
 
-    fn update_search_matches(&mut self) {
+    fn update_matches(&mut self, kind: SearchKind) {
+        match kind {
+            SearchKind::Log => self.update_log_matches(),
+            SearchKind::Diff => self.update_diff_matches(),
+        }
+    }
+
+    fn update_log_matches(&mut self) {
         let q = self.search.query.to_lowercase();
-        self.search.matches = if q.is_empty() {
-            Vec::new()
-        } else {
-            // Trigger continued loading so the search eventually covers all commits.
-            if !self.walk_done {
-                let _ = self.tx.send(GitReq::LoadMore(LOAD_PAGE));
-            }
-            self.log
-                .rows
-                .iter()
-                .enumerate()
-                .filter_map(|(i, row)| match row {
-                    LogRow::Commit(c) if c.summary_lower.contains(&q) || c.author_lower.contains(q.as_str()) => Some(i),
-                    _ => None,
-                })
-                .collect()
-        };
-    }
-
-    fn first_match_at_or_after(&self, from: usize) -> Option<usize> {
-        self.search.matches.iter().find(|&&i| i >= from).or_else(|| self.search.matches.first()).copied()
-    }
-
-    fn jump_to_next_match(&mut self) {
-        if self.search.matches.is_empty() {
-            return;
-        }
-        let next = self
-            .search
-            .matches
-            .iter()
-            .find(|&&i| i > self.log.selected)
-            .or_else(|| self.search.matches.first())
-            .copied();
-        if let Some(idx) = next {
-            self.log.selected = idx;
-            self.ensure_selected_visible();
-            if self.diff.open {
-                self.fetch_diff_for_selected();
-            }
-        }
-    }
-
-    fn jump_to_prev_match(&mut self) {
-        if self.search.matches.is_empty() {
-            return;
-        }
-        let prev = self
-            .search
-            .matches
-            .iter()
-            .rev()
-            .find(|&&i| i < self.log.selected)
-            .or_else(|| self.search.matches.last())
-            .copied();
-        if let Some(idx) = prev {
-            self.log.selected = idx;
-            self.ensure_selected_visible();
-            if self.diff.open {
-                self.fetch_diff_for_selected();
-            }
-        }
-    }
-
-    fn update_diff_search_matches(&mut self) {
-        let q = self.diff.search_query.to_lowercase();
         if q.is_empty() {
-            self.diff.search_matches.clear();
-            self.diff.search_current = 0;
+            self.search.matches.clear();
+            self.search.current = 0;
+            return;
+        }
+        // Trigger continued loading so the search eventually covers all commits.
+        if !self.walk_done {
+            let _ = self.tx.send(GitReq::LoadMore(LOAD_PAGE));
+        }
+        self.search.matches = self
+            .log
+            .rows
+            .iter()
+            .enumerate()
+            .filter_map(|(i, row)| match row {
+                LogRow::Commit(c) if c.summary_lower.contains(&q) || c.author_lower.contains(q.as_str()) => Some(i),
+                _ => None,
+            })
+            .collect();
+        self.search.current = 0;
+    }
+
+    fn update_diff_matches(&mut self) {
+        let q = self.diff.search.query.to_lowercase();
+        if q.is_empty() {
+            self.diff.search.matches.clear();
+            self.diff.search.current = 0;
             return;
         }
         let header_len = self.diff.header_lines.as_ref().map(|v| v.len()).unwrap_or(0);
@@ -672,37 +652,45 @@ impl App {
                 }
             }
         }
-        self.diff.search_matches = matches;
-        self.diff.search_current = 0;
+        self.diff.search.matches = matches;
+        self.diff.search.current = 0;
     }
 
-    fn jump_to_next_diff_match(&mut self) {
-        let len = self.diff.search_matches.len();
-        if len == 0 { return; }
-        self.diff.search_current = (self.diff.search_current + 1) % len;
-        self.scroll_to_current_diff_match();
+    fn jump_match(&mut self, kind: SearchKind, delta: isize) {
+        if let Some(pos) = self.search_state_mut(kind).advance(delta) {
+            self.apply_match_position(kind, pos);
+        }
     }
 
-    fn jump_to_prev_diff_match(&mut self) {
-        let len = self.diff.search_matches.len();
-        if len == 0 { return; }
-        self.diff.search_current = (self.diff.search_current + len - 1) % len;
-        self.scroll_to_current_diff_match();
+    fn jump_first_at_or_after_cursor(&mut self, kind: SearchKind) {
+        let cursor = match kind {
+            SearchKind::Log => self.log.selected,
+            SearchKind::Diff => self.diff.scroll,
+        };
+        let state = self.search_state_mut(kind);
+        if state.matches.is_empty() {
+            return;
+        }
+        let idx = state.matches.iter().position(|&i| i >= cursor).unwrap_or(0);
+        state.current = idx;
+        let pos = state.matches[idx];
+        self.apply_match_position(kind, pos);
     }
 
-    fn jump_to_first_diff_match_at_or_after(&mut self, from: usize) {
-        if self.diff.search_matches.is_empty() { return; }
-        let idx = self.diff.search_matches.iter()
-            .position(|&i| i >= from)
-            .unwrap_or(0);
-        self.diff.search_current = idx;
-        self.scroll_to_current_diff_match();
-    }
-
-    fn scroll_to_current_diff_match(&mut self) {
-        if let Some(&line_idx) = self.diff.search_matches.get(self.diff.search_current) {
-            // Show a couple lines of context above the match.
-            self.diff.scroll = line_idx.saturating_sub(2);
+    fn apply_match_position(&mut self, kind: SearchKind, pos: usize) {
+        match kind {
+            SearchKind::Log => {
+                self.log.selected = pos;
+                self.ensure_selected_visible();
+                if self.diff.open {
+                    self.fetch_diff_for_selected();
+                }
+            }
+            SearchKind::Diff => {
+                // Keep at least 5 lines of context above the matched line.
+                let max = self.diff.total_visible_lines().saturating_sub(self.diff.view_height);
+                self.diff.scroll = pos.saturating_sub(5).min(max);
+            }
         }
     }
 

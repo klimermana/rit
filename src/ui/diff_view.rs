@@ -1,7 +1,7 @@
 use crate::{
     app::{App, LogRow},
     git::{DiffLine, DiffLineKind, DiffStats, DiffTarget, FileStat},
-    ui::diff_line_to_ratatui,
+    ui::{diff_line_to_ratatui, highlight_matches_in_span},
 };
 use ratatui::{
     layout::Rect,
@@ -66,9 +66,9 @@ pub fn draw_diff(frame: &mut Frame, app: &App, area: Rect, focused: bool) {
     let end = (scroll + height).min(total);
 
     let show_nums = app.diff.show_line_numbers;
-    let search_query = app.diff.search_query.to_lowercase();
+    let search_query = app.diff.search.query.to_lowercase();
     let has_diff_search = !search_query.is_empty();
-    let current_match_line = app.diff.search_matches.get(app.diff.search_current).copied();
+    let current_match_line = app.diff.search.current_pos();
 
     let visible: Vec<Line> = all_lines
         .into_iter()
@@ -78,8 +78,7 @@ pub fn draw_diff(frame: &mut Frame, app: &App, area: Rect, focused: bool) {
         .map(|(i, line)| {
             let global_idx = scroll + i;
             let is_current = has_diff_search && current_match_line == Some(global_idx);
-            let is_match = has_diff_search
-                && app.diff.search_matches.binary_search(&global_idx).is_ok();
+            let is_match = has_diff_search && app.diff.search.matches.binary_search(&global_idx).is_ok();
             // Style for the current (focused) match vs other matches.
             let highlight = if is_current {
                 Style::default().bg(Color::Yellow).fg(Color::Black)
@@ -88,10 +87,7 @@ pub fn draw_diff(frame: &mut Frame, app: &App, area: Rect, focused: bool) {
             };
             let mut spans = Vec::new();
             if show_nums {
-                spans.push(Span::styled(
-                    format!("{:>4} ", global_idx + 1),
-                    Style::default().fg(Color::DarkGray),
-                ));
+                spans.push(Span::styled(format!("{:>4} ", global_idx + 1), Style::default().fg(Color::DarkGray)));
             }
             if is_match {
                 for span in line.spans {
@@ -174,32 +170,4 @@ fn append_diffstat(out: &mut Vec<Line<'static>>, files: &[FileStat], stats: &Dif
     );
     out.push(diff_line_to_ratatui(&DiffLine { kind: DiffLineKind::DiffstatTotal, text: summary }));
     out.push(diff_line_to_ratatui(&DiffLine { kind: DiffLineKind::Blank, text: String::new() }));
-}
-
-/// Split `span` into sub-spans, wrapping each occurrence of `query` (already
-/// lowercased) with `highlight_style`. Non-matching portions keep the
-/// original span style.
-fn highlight_matches_in_span(
-    out: &mut Vec<Span<'static>>,
-    span: Span<'static>,
-    query: &str,
-    highlight_style: Style,
-) {
-    let text: &str = &span.content;
-    let text_lower = text.to_lowercase();
-    let base_style = span.style;
-    let mut last = 0;
-
-    while let Some(pos) = text_lower[last..].find(query) {
-        let abs = last + pos;
-        let end = abs + query.len();
-        if abs > last {
-            out.push(Span::styled(text[last..abs].to_string(), base_style));
-        }
-        out.push(Span::styled(text[abs..end].to_string(), highlight_style));
-        last = end;
-    }
-    if last < text.len() {
-        out.push(Span::styled(text[last..].to_string(), base_style));
-    }
 }

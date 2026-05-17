@@ -1,4 +1,7 @@
-use crate::app::{App, CommitInfo, LogRow, RefKind, WorkingTreeRow};
+use crate::{
+    app::{App, CommitInfo, LogRow, RefKind, WorkingTreeRow},
+    ui::highlight_matches_in_span,
+};
 use ratatui::{
     layout::Rect,
     style::{Color, Modifier, Style},
@@ -32,22 +35,34 @@ pub fn draw_log(frame: &mut Frame, app: &App, area: Rect, focused: bool) {
     let scroll = app.log.scroll;
     let end = (scroll + height).min(app.log.rows.len());
 
+    let search_query = app.search.query.to_lowercase();
+    let has_search = !search_query.is_empty();
+    let current_match_row = app.search.current_pos();
+
     let mut rows: Vec<Line> = Vec::with_capacity(height);
 
     for (i, row) in app.log.rows[scroll..end].iter().enumerate() {
         let global_idx = scroll + i;
         let is_selected = global_idx == app.log.selected;
-        let is_match = !app.search.query.is_empty() && app.search.matches.binary_search(&global_idx).is_ok();
+        let is_match = has_search && app.search.matches.binary_search(&global_idx).is_ok();
+        let is_current = has_search && current_match_row == Some(global_idx);
+
+        // Same convention as the diff view: current match gets a bright
+        // background, other matches get a dim one.
+        let highlight = if is_current {
+            Style::default().bg(Color::Yellow).fg(Color::Black)
+        } else {
+            Style::default().bg(Color::Rgb(100, 80, 0)).fg(Color::White)
+        };
+        let row_query = if is_match { search_query.as_str() } else { "" };
 
         let spans = match row {
             LogRow::WorkingTree(w) => working_tree_spans(w, app),
-            LogRow::Commit(c) => commit_spans(c, app),
+            LogRow::Commit(c) => commit_spans(c, app, row_query, highlight),
         };
 
         let row_style = if is_selected {
             Style::default().bg(Color::DarkGray).fg(Color::White).add_modifier(Modifier::BOLD)
-        } else if is_match {
-            Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)
         } else {
             Style::default()
         };
@@ -58,20 +73,24 @@ pub fn draw_log(frame: &mut Frame, app: &App, area: Rect, focused: bool) {
     frame.render_widget(Paragraph::new(rows), inner);
 }
 
-fn commit_spans<'a>(commit: &'a CommitInfo, app: &App) -> Vec<Span<'a>> {
-    let mut spans: Vec<Span> = Vec::new();
-    // spans.push(Span::styled(format!("{} ", commit.graph), Style::default().fg(Color::DarkGray)));
-    spans.push(Span::styled(commit.short_id.as_str(), Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)));
+fn commit_spans(commit: &CommitInfo, app: &App, search_query: &str, highlight_style: Style) -> Vec<Span<'static>> {
+    let mut spans: Vec<Span<'static>> = Vec::new();
+    spans.push(Span::styled(
+        commit.short_id.to_string(),
+        Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD),
+    ));
     spans.push(Span::raw(" "));
     spans.push(Span::styled(
         format!("{:<width$}", commit.date, width = app.date_col_width()),
         Style::default().fg(Color::Blue),
     ));
     spans.push(Span::raw(" "));
-    spans.push(Span::styled(
+
+    let author_span = Span::styled(
         format!("{:<width$}", commit.author, width = app.author_col_width()),
         Style::default().fg(Color::Green),
-    ));
+    );
+    highlight_matches_in_span(&mut spans, author_span, search_query, highlight_style);
     spans.push(Span::raw(" "));
 
     for label in &commit.refs {
@@ -85,15 +104,14 @@ fn commit_spans<'a>(commit: &'a CommitInfo, app: &App) -> Vec<Span<'a>> {
         spans.push(Span::raw(" "));
     }
 
-    spans.push(Span::raw(commit.summary.as_str()));
+    let summary_span = Span::raw(commit.summary.clone());
+    highlight_matches_in_span(&mut spans, summary_span, search_query, highlight_style);
     spans
 }
 
-fn working_tree_spans<'a>(row: &'a WorkingTreeRow, app: &App) -> Vec<Span<'a>> {
-    let mut spans: Vec<Span> = Vec::new();
+fn working_tree_spans(row: &WorkingTreeRow, app: &App) -> Vec<Span<'static>> {
+    let mut spans: Vec<Span<'static>> = Vec::new();
     let dim = Style::default().fg(Color::DarkGray);
-    // Graph column left blank to line up with the commit rows.
-    //spans.push(Span::raw("  "));
     spans.push(Span::styled("0000000", dim));
     spans.push(Span::raw(" "));
     spans.push(Span::styled(
