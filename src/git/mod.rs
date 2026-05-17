@@ -835,30 +835,6 @@ fn compute_status(repo: &gix::Repository) -> StatusDocument {
     StatusDocument { lines: doc.body }
 }
 
-/// Render staged changes (HEAD vs index) into the sink. Iterates
-/// `gix::status` once and matches only `TreeIndex` items.
-fn render_staged_diff(repo: &gix::Repository, sink: &mut DiffSink<'_>) -> usize {
-    use gix::status::{Item, UntrackedFiles};
-    let Ok(platform) = repo.status(gix::progress::Discard) else {
-        return 0;
-    };
-    let Ok(iter) = platform.untracked_files(UntrackedFiles::None).into_iter(Vec::new()) else {
-        return 0;
-    };
-
-    let mut emitted = 0usize;
-    for item in iter.flatten() {
-        let Item::TreeIndex(change) = item else { continue };
-        if sink.guardrail_exceeded() {
-            sink.account_skipped_file(staged_change_path(&change));
-            emitted += 1;
-            continue;
-        }
-        emitted += render_staged_change(repo, sink, change);
-    }
-    emitted
-}
-
 fn render_staged_change(repo: &gix::Repository, sink: &mut DiffSink<'_>, change: gix::diff::index::Change) -> usize {
     use gix::diff::index::Change;
     match change {
@@ -908,108 +884,101 @@ fn staged_change_path(change: &gix::diff::index::Change) -> String {
     loc.to_string()
 }
 
-/// Render unstaged changes (index vs worktree) into the sink. For each
-/// IndexWorktree::Modification item we fetch the index blob from the ODB
-/// and the worktree file from disk, then defer to the same render_file_*
-/// helpers used everywhere else.
-fn render_unstaged_diff(repo: &gix::Repository, sink: &mut DiffSink<'_>) -> usize {
-    use gix::status::{Item, UntrackedFiles, index_worktree, plumbing::index_as_worktree};
-    let Ok(platform) = repo.status(gix::progress::Discard) else {
-        return 0;
-    };
-    let Ok(iter) = platform.untracked_files(UntrackedFiles::None).into_iter(Vec::new()) else {
-        return 0;
-    };
-    let workdir = repo.workdir().map(|p| p.to_owned());
-
-    let mut emitted = 0usize;
-    for item in iter.flatten() {
-        let Item::IndexWorktree(iw) = item else { continue };
-        let index_worktree::Item::Modification { rela_path, status, entry, .. } = iw else { continue };
-        let path = rela_path.to_string();
-        if sink.guardrail_exceeded() {
-            sink.account_skipped_file(path);
-            emitted += 1;
-            continue;
-        }
-        match status {
-            index_as_worktree::EntryStatus::Change(index_as_worktree::Change::Removed) => {
-                if let Ok(old) = repo.find_object(entry.id) {
-                    render_file_deletion(sink, &path, &old.data);
-                }
-                emitted += 1;
-            }
-            index_as_worktree::EntryStatus::Change(index_as_worktree::Change::Modification { .. })
-            | index_as_worktree::EntryStatus::Change(index_as_worktree::Change::Type { .. }) => {
-                let new = workdir.as_ref().and_then(|wd| std::fs::read(wd.join(&path)).ok()).unwrap_or_default();
-                if let Ok(old) = repo.find_object(entry.id) {
-                    render_file_modification(sink, &path, &old.data, &new);
-                }
-                emitted += 1;
-            }
-            // Conflicts, intent-to-add, submodule modifications, and
-            // stat-refresh hints don't correspond to a unified-diff hunk.
-            _ => {}
-        }
-    }
-    emitted
+/// One unstaged change reduced to "what we need to render the unified
+/// diff" — drops the gix-side `EntryStatus` enum (which contains many
+/// variants that don't map to a hunk) so the renderer only sees the two
+/// cases it actually handles.
+enum UnstagedRender {
+    /// File deleted in worktree; render as a deletion against the index blob.
+    Removed { path: String, index_id: ObjectId },
+    /// File modified or had its type change; diff index blob vs worktree
+    /// bytes.
+    Modified { path: String, index_id: ObjectId },
 }
 
-/// Compute the equivalent of `git status --short` natively via `gix::status`.
+/// Result of the single `repo.status()` pass — everything needed to
+/// render the short-status header, the staged section, and the
+/// unstaged section without re-walking the filesystem.
+struct StatusSweep {
+    /// `path → (staged_char, unstaged_char)` for the short-status header.
+    /// Untracked entries land here as `('?', '?')`.
+    short: std::collections::BTreeMap<String, (char, char)>,
+    /// Index-vs-HEAD changes, ready to feed `render_staged_change`.
+    staged: Vec<gix::diff::index::Change>,
+    /// Worktree-vs-index changes, classified for the renderer.
+    unstaged: Vec<UnstagedRender>,
+}
+
+/// One walk of `gix::status` produces everything three consumers
+/// (short-status, staged diff, unstaged diff) need. Previously each
+/// consumer kicked off its own `repo.status(...)` pass, paying for the
+/// stat-walk three times per working-tree view.
 ///
-/// Each tracked path's two-column status (staged column / unstaged column) is
-/// folded together so files modified in both stages emit a single `MM <path>`
-/// row, matching git. Untracked entries surface as `?? <path>` rows.
-///
-/// Returns `Err` when the underlying `gix::status` platform / iterator
-/// cannot be initialised (detached worktree without an index, ODB error,
-/// etc.) — the caller decides how to render the failure. An empty `Ok`
-/// vec means "actually clean."
-fn compute_short_status_lines_gix(repo: &gix::Repository) -> Result<Vec<DiffLine>> {
+/// Returns `Err` when the platform / iterator can't be created
+/// (corrupt index, detached worktree, ODB error, …). Callers decide
+/// how to surface that.
+fn sweep_status(repo: &gix::Repository) -> Result<StatusSweep> {
     use gix::status::{UntrackedFiles, index_worktree, plumbing::index_as_worktree};
     use std::collections::BTreeMap;
 
     let platform = repo.status(gix::progress::Discard)?;
     let iter = platform.untracked_files(UntrackedFiles::Collapsed).into_iter(Vec::new())?;
 
-    // Per-path: (staged_char, unstaged_char). Space means "no change in that
-    // column". Untracked is special-cased as ('?', '?').
-    let mut by_path: BTreeMap<String, (char, char)> = BTreeMap::new();
+    let mut short: BTreeMap<String, (char, char)> = BTreeMap::new();
+    let mut staged: Vec<gix::diff::index::Change> = Vec::new();
+    let mut unstaged: Vec<UnstagedRender> = Vec::new();
+
     for item in iter.flatten() {
         match item {
             gix::status::Item::TreeIndex(change) => {
                 // Staged (HEAD vs index) — affects the first column.
                 use gix::diff::index::Change;
-                let (path, c) = match change {
+                let (path, c) = match &change {
                     Change::Addition { location, .. } => (location.to_string(), 'A'),
                     Change::Deletion { location, .. } => (location.to_string(), 'D'),
                     Change::Modification { location, .. } => (location.to_string(), 'M'),
-                    Change::Rewrite { location, copy, .. } => (location.to_string(), if copy { 'C' } else { 'R' }),
+                    Change::Rewrite { location, copy, .. } => (location.to_string(), if *copy { 'C' } else { 'R' }),
                 };
-                let entry = by_path.entry(path).or_insert((' ', ' '));
-                entry.0 = c;
+                short.entry(path).or_insert((' ', ' ')).0 = c;
+                staged.push(change);
             }
             gix::status::Item::IndexWorktree(iw) => match iw {
-                index_worktree::Item::Modification { rela_path, status, .. } => {
-                    let c = match status {
-                        index_as_worktree::EntryStatus::Change(index_as_worktree::Change::Removed) => 'D',
+                index_worktree::Item::Modification { rela_path, status, entry, .. } => {
+                    let path = rela_path.to_string();
+                    // Classify into both the short-status char and the
+                    // renderable variant in one match.
+                    let column_char = match &status {
+                        index_as_worktree::EntryStatus::Change(index_as_worktree::Change::Removed) => Some('D'),
                         index_as_worktree::EntryStatus::Change(
                             index_as_worktree::Change::Modification { .. }
                             | index_as_worktree::Change::Type { .. }
                             | index_as_worktree::Change::SubmoduleModification(_),
-                        ) => 'M',
-                        index_as_worktree::EntryStatus::Conflict { .. } => 'U',
-                        index_as_worktree::EntryStatus::IntentToAdd => 'A',
+                        ) => Some('M'),
+                        index_as_worktree::EntryStatus::Conflict { .. } => Some('U'),
+                        index_as_worktree::EntryStatus::IntentToAdd => Some('A'),
                         // NeedsUpdate is a stat-refresh hint, not a user-visible change.
-                        index_as_worktree::EntryStatus::NeedsUpdate(_) => continue,
+                        index_as_worktree::EntryStatus::NeedsUpdate(_) => None,
                     };
-                    let entry = by_path.entry(rela_path.to_string()).or_insert((' ', ' '));
-                    entry.1 = c;
+                    if let Some(c) = column_char {
+                        short.entry(path.clone()).or_insert((' ', ' ')).1 = c;
+                    }
+                    // Submodule and conflict variants don't produce a hunk;
+                    // only Removed and Modification/Type render.
+                    match status {
+                        index_as_worktree::EntryStatus::Change(index_as_worktree::Change::Removed) => {
+                            unstaged.push(UnstagedRender::Removed { path, index_id: entry.id });
+                        }
+                        index_as_worktree::EntryStatus::Change(
+                            index_as_worktree::Change::Modification { .. } | index_as_worktree::Change::Type { .. },
+                        ) => {
+                            unstaged.push(UnstagedRender::Modified { path, index_id: entry.id });
+                        }
+                        _ => {}
+                    }
                 }
                 index_worktree::Item::DirectoryContents { entry, .. } => {
-                    // Only true untracked entries show up as `?? <path>`.
                     if matches!(entry.status, gix::dir::entry::Status::Untracked) {
-                        by_path.entry(entry.rela_path.to_string()).or_insert(('?', '?'));
+                        short.entry(entry.rela_path.to_string()).or_insert(('?', '?'));
                     }
                 }
                 // Rewrites/copies between index and worktree would require
@@ -1021,12 +990,17 @@ fn compute_short_status_lines_gix(repo: &gix::Repository) -> Result<Vec<DiffLine
         }
     }
 
-    if by_path.is_empty() {
-        return Ok(vec![DiffLine::new(DiffLineKind::Good, "Nothing to commit, working tree clean")]);
-    }
+    Ok(StatusSweep { short, staged, unstaged })
+}
 
-    let mut out = Vec::with_capacity(by_path.len());
-    for (path, (a, b)) in by_path {
+/// Render the short-status block from a pre-collected `StatusSweep`.
+/// An empty `short` map means "actually clean".
+fn render_short_status(short: &std::collections::BTreeMap<String, (char, char)>) -> Vec<DiffLine> {
+    if short.is_empty() {
+        return vec![DiffLine::new(DiffLineKind::Good, "Nothing to commit, working tree clean")];
+    }
+    let mut out = Vec::with_capacity(short.len());
+    for (path, &(a, b)) in short {
         let text = format!("{a}{b} {path}");
         let kind = if a == '?' && b == '?' {
             DiffLineKind::StatusTheirs
@@ -1040,13 +1014,69 @@ fn compute_short_status_lines_gix(repo: &gix::Repository) -> Result<Vec<DiffLine
         };
         out.push(DiffLine::new(kind, text));
     }
-    Ok(out)
+    out
 }
 
-/// Assemble the working-tree diff document in a single pass: the short
-/// status header, then the staged section, then the unstaged section. All
-/// three contribute to the same `body` / `files` / `stats` / `flags` so
-/// the diffstat numbers in the title bar reflect everything below.
+/// Render the staged section from pre-collected changes. Returns the
+/// number of files emitted (or skipped by the guardrail) so the caller
+/// can fall back to "(no staged changes)" when empty.
+fn render_staged_section(
+    repo: &gix::Repository,
+    sink: &mut DiffSink<'_>,
+    staged: Vec<gix::diff::index::Change>,
+) -> usize {
+    let mut emitted = 0usize;
+    for change in staged {
+        if sink.guardrail_exceeded() {
+            sink.account_skipped_file(staged_change_path(&change));
+            emitted += 1;
+            continue;
+        }
+        emitted += render_staged_change(repo, sink, change);
+    }
+    emitted
+}
+
+/// Render the unstaged section from pre-collected items. Worktree
+/// bytes are read on demand (one fs::read per Modified item) so the
+/// caller doesn't have to thread `workdir` in.
+fn render_unstaged_section(repo: &gix::Repository, sink: &mut DiffSink<'_>, items: Vec<UnstagedRender>) -> usize {
+    let workdir = repo.workdir().map(|p| p.to_owned());
+    let mut emitted = 0usize;
+    for item in items {
+        let path = match &item {
+            UnstagedRender::Removed { path, .. } | UnstagedRender::Modified { path, .. } => path.clone(),
+        };
+        if sink.guardrail_exceeded() {
+            sink.account_skipped_file(path);
+            emitted += 1;
+            continue;
+        }
+        match item {
+            UnstagedRender::Removed { path, index_id } => {
+                if let Ok(old) = repo.find_object(index_id) {
+                    render_file_deletion(sink, &path, &old.data);
+                }
+                emitted += 1;
+            }
+            UnstagedRender::Modified { path, index_id } => {
+                let new = workdir.as_ref().and_then(|wd| std::fs::read(wd.join(&path)).ok()).unwrap_or_default();
+                if let Ok(old) = repo.find_object(index_id) {
+                    render_file_modification(sink, &path, &old.data, &new);
+                }
+                emitted += 1;
+            }
+        }
+    }
+    emitted
+}
+
+/// Assemble the working-tree diff document. The key win over the prior
+/// implementation: only one `repo.status(...)` pass instead of three
+/// (the staged renderer, unstaged renderer, and short-status header
+/// each used to do their own). On a non-tiny repo the stat-walk
+/// dominates, so collapsing the three passes into one is the biggest
+/// single perf change in this stage.
 fn compute_working_tree_diff(repo: &gix::Repository, target: DiffTarget) -> DiffDocument {
     let mut body: Vec<DiffLine> = Vec::new();
     let mut files: Vec<FileStat> = Vec::new();
@@ -1055,17 +1085,27 @@ fn compute_working_tree_diff(repo: &gix::Repository, target: DiffTarget) -> Diff
 
     body.push(DiffLine::new(DiffLineKind::SectionTitle, "Working Tree Status"));
     body.push(DiffLine::new(DiffLineKind::Blank, ""));
-    match compute_short_status_lines_gix(repo) {
-        Ok(lines) => body.extend(lines),
+
+    let sweep = sweep_status(repo);
+    match &sweep {
+        Ok(items) => body.extend(render_short_status(&items.short)),
         Err(e) => body.push(DiffLine::new(DiffLineKind::Faint, format!("Status query failed: {e}"))),
     }
 
     body.push(DiffLine::new(DiffLineKind::Blank, ""));
     body.push(DiffLine::new(DiffLineKind::SectionStaged, "── Staged ──────────────────────────────────────────────"));
     body.push(DiffLine::new(DiffLineKind::Blank, ""));
+
+    // Extract the staged / unstaged vecs once so we can move them into
+    // the section renderers without re-borrowing `sweep`.
+    let (staged, unstaged) = match sweep {
+        Ok(s) => (s.staged, s.unstaged),
+        Err(_) => (Vec::new(), Vec::new()),
+    };
+
     {
         let mut sink = DiffSink { lines: &mut body, stats: &mut stats, files: &mut files, flags: &mut flags };
-        if render_staged_diff(repo, &mut sink) == 0 {
+        if render_staged_section(repo, &mut sink, staged) == 0 {
             sink.lines.push(DiffLine::new(DiffLineKind::Faint, "(no staged changes)"));
         }
     }
@@ -1075,7 +1115,7 @@ fn compute_working_tree_diff(repo: &gix::Repository, target: DiffTarget) -> Diff
     body.push(DiffLine::new(DiffLineKind::Blank, ""));
     {
         let mut sink = DiffSink { lines: &mut body, stats: &mut stats, files: &mut files, flags: &mut flags };
-        if render_unstaged_diff(repo, &mut sink) == 0 {
+        if render_unstaged_section(repo, &mut sink, unstaged) == 0 {
             sink.lines.push(DiffLine::new(DiffLineKind::Faint, "(no unstaged changes)"));
         }
     }

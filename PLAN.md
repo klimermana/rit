@@ -198,19 +198,16 @@ measurement noise (±1-2% across two runs) — the change is
 mechanically correct (fewer allocations) but the saved Vec clones
 are small enough not to dominate the bench timing.
 
-### 5c — Single-pass `repo.status` in `compute_working_tree_diff`
+### 5c — Single-pass `repo.status` in `compute_working_tree_diff` ✅
 
 `git/mod.rs:1036`. Iterate status once, classify each item into
 short-status / staged / unstaged buckets. Refactor `render_staged_diff`
 and `render_unstaged_diff` to consume pre-classified items rather than
 each starting their own status pass.
 
-This is the biggest expected perf win.
-
-**Gate / bench**: existing `working_tree_diff_*` integration tests at
-`git/mod.rs:1333,1374` still pass; add one more case for "file modified
-in both stage and worktree" if not already covered. Bench:
-`working_tree_diff/staged_plus_unstaged`.
+**Bench result**: `working_tree_diff/staged_plus_unstaged`
+**−57.7%** (869.7 µs → 371.3 µs). The marquee perf win of the
+cleanup — three status walks collapsed to one.
 
 ### 5d — `Arc<HashMap<...>>` for `RefsLoaded`
 
