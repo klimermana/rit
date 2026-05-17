@@ -11,9 +11,6 @@ use ratatui::{backend::Backend, Terminal};
 use std::time::{Duration, Instant};
 
 const YANK_FEEDBACK_DURATION: Duration = Duration::from_secs(2);
-const LOAD_PAGE: usize = 256;
-const INITIAL_LOAD: usize = 64;
-const PREFETCH_THRESHOLD: usize = 32;
 const HALF_PAGE: usize = 10;
 const AUTHOR_COL_WIDTH: usize = 20;
 const DATE_COL_WIDTH: usize = 8;
@@ -274,9 +271,8 @@ impl App {
     where
         B::Error: Send + Sync + 'static,
     {
-        // Kick off the initial walk.
-        self.send_history(HistoryReq::LoadMore(INITIAL_LOAD));
-
+        // The worker self-paces — it streams batches automatically until
+        // walk_done, so the app no longer kicks off a LoadMore.
         loop {
             self.poll_git_msgs();
             self.expire_yank();
@@ -613,9 +609,10 @@ impl App {
         self.walk_done = false;
         self.walk_gen = self.walk_gen.wrapping_add(1);
         self.error = None;
+        // Reload restarts the worker's continuous walk; no explicit
+        // LoadMore needed, the worker streams batches on its own.
         self.send_history(HistoryReq::Reload);
         self.send_inspect(InspectReq::RefreshWorkingTreeMeta);
-        self.send_history(HistoryReq::LoadMore(INITIAL_LOAD));
     }
 
     fn move_log_down(&mut self, n: usize) {
@@ -625,13 +622,10 @@ impl App {
         let new_sel = (self.log.selected + n).min(self.log.rows.len() - 1);
         if new_sel != self.log.selected {
             self.log.selected = new_sel;
-            self.maybe_prefetch();
             self.ensure_selected_visible();
             if self.diff.open {
                 self.fetch_diff_for_selected();
             }
-        } else if new_sel + 1 == self.log.rows.len() {
-            self.maybe_prefetch();
         }
     }
 
@@ -658,19 +652,13 @@ impl App {
         if self.log.rows.is_empty() {
             return;
         }
+        // G jumps to whatever is currently indexed. The worker is already
+        // streaming in the background, so the "bottom" advances on its own
+        // as more arrives.
         self.log.selected = self.log.rows.len() - 1;
-        if !self.walk_done {
-            self.send_history(HistoryReq::LoadMore(LOAD_PAGE));
-        }
         self.ensure_selected_visible();
         if self.diff.open {
             self.fetch_diff_for_selected();
-        }
-    }
-
-    fn maybe_prefetch(&self) {
-        if !self.walk_done && self.log.selected + PREFETCH_THRESHOLD >= self.log.rows.len() {
-            self.send_history(HistoryReq::LoadMore(LOAD_PAGE));
         }
     }
 
@@ -708,10 +696,9 @@ impl App {
             self.search.current = 0;
             return;
         }
-        // Trigger continued loading so the search eventually covers all commits.
-        if !self.walk_done {
-            self.send_history(HistoryReq::LoadMore(LOAD_PAGE));
-        }
+        // No need to prompt the worker — it's already streaming the rest of
+        // history in the background, and update_commit_matches re-runs on
+        // every Commits batch the app receives.
         self.search.matches = self
             .log
             .rows

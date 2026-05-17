@@ -65,45 +65,115 @@ fn run_git_thread_inner(
     let mut walker = Walker::new(&repo, path_filter.clone(), 0, graph_enabled, HashMap::new())?;
     let mut refs_loaded = false;
 
-    while let Ok(req) = req_rx.recv() {
-        match req {
-            GitReq::History(HistoryReq::LoadMore(n)) => {
-                walker.load_more(n, &msg_tx)?;
-                // After the first batch, load refs and backfill.
-                if !refs_loaded {
-                    refs_loaded = true;
-                    let refs_map = load_refs(&repo);
-                    walker.refs_map = refs_map.clone();
-                    let _ = msg_tx
-                        .send(GitMsg::History(HistoryMsg::RefsLoaded { gen: walker.gen, refs_map }));
+    // Self-paced indexing loop:
+    //   1. Drain any pending requests (non-blocking) so Reload and inspect
+    //      operations preempt indexing instead of waiting for the walk to
+    //      finish.
+    //   2. If the walk isn't done, emit one batch and loop.
+    //   3. Otherwise block waiting for the next request.
+    //
+    // The first batch is small for fast first paint; subsequent batches
+    // are page-sized.
+    const INITIAL_BATCH: usize = 64;
+    const PAGE_BATCH: usize = 256;
+
+    loop {
+        // Drain any queued requests first.
+        loop {
+            match req_rx.try_recv() {
+                Ok(req) => {
+                    if !process_request(
+                        req,
+                        &repo,
+                        &repo_path,
+                        &path_filter,
+                        graph_enabled,
+                        &mut walker,
+                        &mut refs_loaded,
+                        &msg_tx,
+                    )? {
+                        return Ok(());
+                    }
                 }
-            }
-            GitReq::History(HistoryReq::Reload) => {
-                let next_gen = walker.gen.wrapping_add(1);
-                let refs_map = load_refs(&repo);
-                walker = Walker::new(&repo, path_filter.clone(), next_gen, graph_enabled, refs_map)?;
-                refs_loaded = true;
-            }
-            GitReq::Inspect(InspectReq::LoadDiff(target)) => {
-                let document = match target {
-                    DiffTarget::Commit(id) => compute_commit_diff(&repo, id),
-                    DiffTarget::WorkingTree => compute_working_tree_diff(&repo_path, target),
-                };
-                let _ = msg_tx.send(GitMsg::Inspect(InspectMsg::DiffLoaded(document)));
-            }
-            GitReq::Inspect(InspectReq::LoadStatus) => {
-                let document = compute_status(&repo_path);
-                let _ = msg_tx.send(GitMsg::Inspect(InspectMsg::StatusLoaded(document)));
-            }
-            GitReq::Inspect(InspectReq::RefreshWorkingTreeMeta) => {
-                let _ = msg_tx.send(GitMsg::Inspect(InspectMsg::WorkingTreeMeta {
-                    author: working_tree_author(&repo),
-                }));
+                Err(crossbeam_channel::TryRecvError::Empty) => break,
+                Err(crossbeam_channel::TryRecvError::Disconnected) => return Ok(()),
             }
         }
-    }
 
-    Ok(())
+        if !walker.done {
+            let n = if refs_loaded { PAGE_BATCH } else { INITIAL_BATCH };
+            walker.load_more(n, &msg_tx)?;
+            // After the first batch, load refs and backfill so branch/tag
+            // decorations appear without blocking startup.
+            if !refs_loaded {
+                refs_loaded = true;
+                let refs_map = load_refs(&repo);
+                walker.refs_map = refs_map.clone();
+                let _ = msg_tx.send(GitMsg::History(HistoryMsg::RefsLoaded { gen: walker.gen, refs_map }));
+            }
+            continue;
+        }
+
+        // Indexing finished — block for the next request.
+        match req_rx.recv() {
+            Ok(req) => {
+                if !process_request(
+                    req,
+                    &repo,
+                    &repo_path,
+                    &path_filter,
+                    graph_enabled,
+                    &mut walker,
+                    &mut refs_loaded,
+                    &msg_tx,
+                )? {
+                    return Ok(());
+                }
+            }
+            Err(_) => return Ok(()),
+        }
+    }
+}
+
+/// Process one request. Returns `Ok(false)` if the loop should exit,
+/// `Ok(true)` to continue. Kept as a free function so both the
+/// try_recv-drain and the blocking-recv branches share it.
+fn process_request<'r>(
+    req: GitReq,
+    repo: &'r gix::Repository,
+    repo_path: &str,
+    path_filter: &Option<PathFilter>,
+    graph_enabled: bool,
+    walker: &mut Walker<'r>,
+    refs_loaded: &mut bool,
+    msg_tx: &Sender<GitMsg>,
+) -> Result<bool> {
+    match req {
+        GitReq::History(HistoryReq::Reload) => {
+            let next_gen = walker.gen.wrapping_add(1);
+            let refs_map = load_refs(repo);
+            // Safety: lifetime ties to `repo`, same as the caller's walker.
+            *walker = Walker::new(repo, path_filter.clone(), next_gen, graph_enabled, refs_map)?;
+            *refs_loaded = true;
+        }
+        GitReq::Inspect(InspectReq::LoadDiff(target)) => {
+            let document = match target {
+                DiffTarget::Commit(id) => compute_commit_diff(repo, id),
+                DiffTarget::WorkingTree => compute_working_tree_diff(repo_path, target),
+            };
+            let _ = msg_tx.send(GitMsg::Inspect(InspectMsg::DiffLoaded(document)));
+        }
+        GitReq::Inspect(InspectReq::LoadStatus) => {
+            let document = compute_status(repo_path);
+            let _ = msg_tx.send(GitMsg::Inspect(InspectMsg::StatusLoaded(document)));
+        }
+        GitReq::Inspect(InspectReq::RefreshWorkingTreeMeta) => {
+            let _ = msg_tx.send(GitMsg::Inspect(InspectMsg::WorkingTreeMeta {
+                author: working_tree_author(repo),
+            }));
+        }
+    }
+    Ok(true)
 }
 
 struct Walker<'r> {

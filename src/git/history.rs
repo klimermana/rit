@@ -10,10 +10,11 @@ use crate::model::{CommitRecord, RefLabel, RepoInfo};
 use gix::ObjectId;
 use std::collections::HashMap;
 
-/// Requests the history side answers.
+/// Requests the history side answers. There is intentionally no
+/// `LoadMore` — the worker streams batches continuously in the
+/// background until the walk is exhausted, so the app never has to
+/// prompt for more.
 pub enum HistoryReq {
-    /// Pull up to `n` more commits from the current walk.
-    LoadMore(usize),
     /// Discard the current walk and start over from HEAD with a fresh
     /// generation. Used after the user presses `R`.
     Reload,
