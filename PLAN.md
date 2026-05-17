@@ -310,18 +310,21 @@ would have added imports without clarifying anything.
 Pre-split: 1545 lines in one file. Post-split: 337 in mod.rs, 440 in
 diff.rs, 370 in status.rs, 295 in walk.rs, 124 in meta.rs.
 
-### 6b — Split `src/app.rs`
+### 6b — Split `src/app.rs` ✅
 
 ```
 app/
-  mod.rs          App + run loop + dispatch
-  state.rs        LogState, DiffState, StatusState, YankFeedback,
-                  LogRow, WorkingTreeRow, Focus
-  search.rs       shared SearchState + should_narrow + cycle +
-                  commit_matches
-  input.rs        handle_input + handle_*_key variants
-  clipboard.rs    yank_to_clipboard with platform cfgs
+  mod.rs        595  App + run loop + apply_msg + nav/search/yank methods
+  state.rs      227  LogState, DiffState, StatusState, YankFeedback,
+                     LogRow, WorkingTreeRow, Focus, *SearchState,
+                     SearchSnapshot
+  input.rs      185  handle_input + handle_*_key variants (impl App)
+  search.rs      69  commit_matches, should_narrow, cycle + tests
+  clipboard.rs   44  yank_to_clipboard (macOS/Linux/other cfgs)
 ```
+
+Pre-split: 1065 lines in one file. Post-split: largest is mod.rs at
+595 (App lifecycle, channel handling, state mutations).
 
 ### 6c — Unify `CommitSearchState` / `DiffSearchState`
 
