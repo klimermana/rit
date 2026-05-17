@@ -12,7 +12,6 @@ use gix::{bstr::ByteSlice, ObjectId};
 use similar::ChangeTag;
 use std::collections::{BTreeMap, HashMap};
 
-
 pub enum GitMsg {
     RepoInfo(RepoInfo),
     /// `gen` matches the worker's current walk generation. The app drops

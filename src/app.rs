@@ -102,7 +102,11 @@ impl CommitSearchState {
     }
 
     pub fn display_index(&self) -> usize {
-        if self.matches.is_empty() { 0 } else { self.current + 1 }
+        if self.matches.is_empty() {
+            0
+        } else {
+            self.current + 1
+        }
     }
 
     pub fn snapshot(&self) -> SearchSnapshot<'_> {
@@ -136,7 +140,11 @@ impl DiffSearchState {
     }
 
     pub fn display_index(&self) -> usize {
-        if self.matches.is_empty() { 0 } else { self.current + 1 }
+        if self.matches.is_empty() {
+            0
+        } else {
+            self.current + 1
+        }
     }
 
     pub fn snapshot(&self) -> SearchSnapshot<'_> {

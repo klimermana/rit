@@ -224,7 +224,11 @@ fn match_prefix_len(text: &str, start: usize, query: &str) -> Option<usize> {
         }
     }
     // Ran out of text before query was fully consumed.
-    if q_chars.next().is_none() { Some(consumed) } else { None }
+    if q_chars.next().is_none() {
+        Some(consumed)
+    } else {
+        None
+    }
 }
 
 #[cfg(test)]
