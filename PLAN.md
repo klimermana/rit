@@ -7,7 +7,8 @@
 | 0 | `fb5a6be` | Prep + baselines: pathspec bench, criterion `pre-cleanup` saved, 2 vs 51 clippy warnings recorded |
 | 1 | `cc37902` | Move `[workspace.lints.clippy]` → `[lints.clippy]`. 2 → 60 warnings now firing. CLAUDE.md CI note added. |
 | 2 | `b85a710` | Resolve all 60 violations. `cargo clippy --no-deps` is silent. No `#[allow]` left — every dead-code site is either truly used (annotation removed), kept via `pub` field, or `#[expect(..., reason = "…")]`. |
-| 3 | _pending_ | Edition 2024 migration |
+| 3 | `7fbcea5` | Edition 2024 + `gen` → `generation` rename + `collapsible_if` let-chain rewrites. Tail-expr-drop-order changes audited and ruled harmless. |
+| 4 | _pending_ | Correctness fixes (4a–4d) |
 
 Project plan derived from the 2026-05-17 code review. Implements every
 item raised in the review (correctness, perf, refactor) and turns the
@@ -115,7 +116,7 @@ Run `./fix` at the end.
 
 ---
 
-## Stage 3 — Edition 2024 migration
+## Stage 3 — Edition 2024 migration ✅
 
 1. `cargo fix --edition --allow-dirty --all-targets`.
 2. Bump `edition = "2024"` in `Cargo.toml`.
@@ -136,7 +137,7 @@ Run `./fix` at the end.
 
 ## Stage 4 — Correctness fixes (one commit each)
 
-### 4a — `hunk_header` empty-range fix
+### 4a — `hunk_header` empty-range fix ✅
 
 `git/mod.rs:779`. Display start = `0` when length is `0`, else
 `start + 1`.

@@ -784,7 +784,13 @@ fn hunk_header(group: &[similar::DiffOp]) -> String {
     let nr_end = group.last().map(|op| op.new_range().end).unwrap_or(0);
     let or_len = or_end.saturating_sub(or_start);
     let nr_len = nr_end.saturating_sub(nr_start);
-    format!("@@ -{},{} +{},{} @@", or_start + 1, or_len, nr_start + 1, nr_len)
+    // Unified-diff convention: when a side's range is empty, the start
+    // is reported as 0 (the line before which the insertion happens,
+    // or after which the deletion happens). Otherwise it's the 1-based
+    // line number of the first line in the range.
+    let or_display_start = if or_len == 0 { 0 } else { or_start + 1 };
+    let nr_display_start = if nr_len == 0 { 0 } else { nr_start + 1 };
+    format!("@@ -{or_display_start},{or_len} +{nr_display_start},{nr_len} @@")
 }
 
 fn push_change(
@@ -1215,6 +1221,26 @@ mod tests {
         assert_eq!(headers[0], "@@ -1,6 +1,6 @@");
         // Second hunk: lines around index 27 -> 1-based 28, 3 above and 2 below.
         assert_eq!(headers[1], "@@ -25,6 +25,6 @@");
+    }
+
+    #[test]
+    fn header_uses_zero_start_for_empty_old_range() {
+        // Pure insertion into a previously empty file. Git's unified-diff
+        // convention is `@@ -0,0 +1,N @@`, not `-1,0`. The old `start + 1`
+        // form would have emitted `-1,0`.
+        let diff = TextDiff::from_lines("", "x\ny\n");
+        let groups: Vec<_> = diff.grouped_ops(3).into_iter().collect();
+        assert_eq!(groups.len(), 1);
+        assert_eq!(hunk_header(&groups[0]), "@@ -0,0 +1,2 @@");
+    }
+
+    #[test]
+    fn header_uses_zero_start_for_empty_new_range() {
+        // Pure deletion that empties the file. Git emits `@@ -1,N +0,0 @@`.
+        let diff = TextDiff::from_lines("x\ny\n", "");
+        let groups: Vec<_> = diff.grouped_ops(3).into_iter().collect();
+        assert_eq!(groups.len(), 1);
+        assert_eq!(hunk_header(&groups[0]), "@@ -1,2 +0,0 @@");
     }
 
     #[test]
