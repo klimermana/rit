@@ -20,7 +20,55 @@
 | 5f | `83e37ae` | `extend_commit_matches` reuses `last_query`; one fewer Unicode lowercase per batch. |
 | 5g | `7a29c11` | DiffLine prefix moved to render-time. README "Known limitations" updated. **−32%** on `diff_generation/large_5000_lines`. |
 | 5h | `764fe0e` | Pathspec tree-diff LRU cache + new `pathspec_walk_then_diff` bench. Cumulative Stage 5 wins land. |
-| 6 | _pending_ | Structural refactor (6a–6e) |
+| 6e | `393c800` | Test fixtures extracted to `src/test_support.rs`. |
+| 6a | `068fb41` | `git/mod.rs` 1545 → 5 files (mod 337, diff 440, status 370, walk 295, meta 124). |
+| 6b | `d1c53d7` | `app.rs` 1065 → 5 files (mod 595, state 227, input 185, search 69, clipboard 44). |
+| 6c | `db22712` | Unified `SearchState`. `DiffSearchState` is now a type alias; `CommitSearchState` composes `state` + narrowing fields. |
+| 6d | `d91c0fa` | `jump_first_at_or_after` helper folds the two cursor-jump methods into 4-line dispatchers. |
+| 7 | `(this commit)` | Final validation: full build/clippy/test/bench pass, summary table added below. |
+
+## Final summary
+
+**Code size**
+
+| Metric | pre-cleanup | post-cleanup |
+|---|---|---|
+| Largest `src/` file | `git/mod.rs` 1414 lines | `app/mod.rs` 595 lines |
+| Second-largest | `app.rs` 1056 lines | `git/diff.rs` 439 lines |
+| Total `src/` LOC | 3660 | 3977 (header comments + per-module imports) |
+| Tests | 28 | 32 |
+| Clippy warnings (defaults) | 2 | 0 |
+| Clippy warnings (curated config) | dead config (0 fires) | 0 |
+
+**Bench deltas (`pre-cleanup` → final)**
+
+| Bench | pre-cleanup | final | Δ |
+|---|---|---|---|
+| `diff_generation/small_10_lines` | 58.6 µs | 44.9 µs | **−23.4%** |
+| `diff_generation/large_5000_lines` | 296.3 µs | 192.8 µs | **−35.2%** |
+| `working_tree_diff/staged_plus_unstaged` | 869.7 µs | 372.8 µs | **−57.4%** |
+| `indexing/50` | 2.54 ms | within noise | flat |
+| `indexing/200` | 7.60 ms | within noise | flat |
+| `indexing/with_pathspec/50` | 5.83 ms | within noise | flat |
+| `indexing/with_pathspec/200` | 23.96 ms | within noise | flat |
+| `search/*` | unchanged | within noise | flat |
+| `pathspec_walk_then_diff/walk_50_then_diff_head` | (new bench) | 5.8 ms | n/a |
+
+The wins land where the work was: the working-tree diff path
+(single status pass) and the commit-diff body renderer (dropped
+`format!` allocations + borrowed blobs). Walking and search are
+unchanged.
+
+**Manual UI smoke (Stage 7 instructions, not yet executed by the
+automated pass — recommended before merge)**
+
+- `cargo run --release` in this repo
+- Log scrolls (j/k/Ctrl-D/Ctrl-U/g/G), `/` search both panes,
+  `n`/`N` cycles, Esc clears
+- `Enter` opens diff, `Tab` swaps focus, `q`/Esc closes
+- `s` opens status, `q` closes
+- `R` reloads, `y` yanks (verify clipboard)
+- `?` help, `#` toggle line numbers, `v` toggle hunks
 
 Project plan derived from the 2026-05-17 code review. Implements every
 item raised in the review (correctness, perf, refactor) and turns the
@@ -289,7 +337,7 @@ becomes the baseline for future work.
 
 ---
 
-## Stage 6 — Structural refactor (zero behaviour change)
+## Stage 6 — Structural refactor (zero behaviour change) ✅
 
 ### 6a — Split `src/git/mod.rs` ✅
 
@@ -373,7 +421,7 @@ feature-flag indirection isn't worth it for ~50 lines of fixture).
 
 ---
 
-## Stage 7 — Final validation
+## Stage 7 — Final validation ✅
 
 - `./fix && cargo build && cargo build --benches && cargo clippy --no-deps && cargo test --tests`.
 - `cargo bench -- --baseline pre-cleanup` — capture criterion output as
