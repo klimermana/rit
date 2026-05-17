@@ -489,12 +489,7 @@ fn diff_trees<'r>(
                 let mut file_add = 0usize;
                 let mut file_del = 0usize;
                 for group in diff.grouped_ops(3) {
-                    let or = group.first().map(|op| op.old_range()).unwrap_or(0..0);
-                    let nr = group.first().map(|op| op.new_range()).unwrap_or(0..0);
-                    lines.push(DiffLine::new(
-                        DiffLineKind::HunkHeader,
-                        format!("@@ -{},{} +{},{} @@", or.start + 1, or.len(), nr.start + 1, nr.len()),
-                    ));
+                    lines.push(DiffLine::new(DiffLineKind::HunkHeader, hunk_header(&group)));
                     for op in &group {
                         for ch in diff.iter_changes(op) {
                             push_change(lines, stats, &mut file_add, &mut file_del, ch.tag(), ch.value());
@@ -508,6 +503,22 @@ fn diff_trees<'r>(
         }
     }
     Ok(())
+}
+
+/// Build a `@@ -old_start,old_len +new_start,new_len @@` header that covers
+/// the entire grouped op set, not just its first op. The earlier
+/// implementation used `group.first()` for both start and length, which
+/// truncated the range on any group containing more than one op
+/// (e.g. Context + Replace + Context) — the emitted header would describe
+/// only the leading context.
+fn hunk_header(group: &[similar::DiffOp]) -> String {
+    let or_start = group.first().map(|op| op.old_range().start).unwrap_or(0);
+    let or_end = group.last().map(|op| op.old_range().end).unwrap_or(0);
+    let nr_start = group.first().map(|op| op.new_range().start).unwrap_or(0);
+    let nr_end = group.last().map(|op| op.new_range().end).unwrap_or(0);
+    let or_len = or_end.saturating_sub(or_start);
+    let nr_len = nr_end.saturating_sub(nr_start);
+    format!("@@ -{},{} +{},{} @@", or_start + 1, or_len, nr_start + 1, nr_len)
 }
 
 fn push_change(
@@ -669,4 +680,61 @@ fn run_numstat(repo_path: &str, cached: bool) -> Vec<FileStat> {
         result.push(FileStat { path: p.to_string(), additions, deletions });
     }
     result
+}
+
+#[cfg(test)]
+mod tests {
+    use super::hunk_header;
+    use similar::TextDiff;
+
+    #[test]
+    fn header_spans_full_group_not_just_first_op() {
+        // Single replacement surrounded by enough context that the diff
+        // produces one group of [Context, Replace, Context]. The old
+        // implementation used only the first op's range, which would
+        // truncate the header to the leading context window.
+        let old = "a\nb\nc\nd\ne\n";
+        let new = "a\nb\nX\nd\ne\n";
+        let diff = TextDiff::from_lines(old, new);
+        let groups: Vec<_> = diff.grouped_ops(3).into_iter().collect();
+        assert_eq!(groups.len(), 1, "expected one grouped hunk for this small diff");
+        // The whole 5-line file is one group: lines 1..=5 on both sides.
+        assert_eq!(hunk_header(&groups[0]), "@@ -1,5 +1,5 @@");
+    }
+
+    #[test]
+    fn header_for_pure_insertion_at_end() {
+        // Appending lines: old has 2 lines, new has 4. The trailing
+        // additions form a group; the header should cover the appended
+        // range on the new side and zero-length on the old side at the
+        // appropriate offset.
+        let old = "a\nb\n";
+        let new = "a\nb\nc\nd\n";
+        let diff = TextDiff::from_lines(old, new);
+        let groups: Vec<_> = diff.grouped_ops(3).into_iter().collect();
+        assert_eq!(groups.len(), 1);
+        // Group covers the trailing 2 context lines + 2 inserts. With
+        // 3-line context the whole file fits: old 1..=2 (len 2), new 1..=4 (len 4).
+        assert_eq!(hunk_header(&groups[0]), "@@ -1,2 +1,4 @@");
+    }
+
+    #[test]
+    fn header_with_two_disjoint_groups() {
+        // Two changes far enough apart to produce two separate groups,
+        // each with its own correct range.
+        let old: String = (0..30).map(|i| format!("line{i}\n")).collect();
+        let mut new_lines: Vec<String> = (0..30).map(|i| format!("line{i}\n")).collect();
+        new_lines[2] = "CHANGED\n".to_string();
+        new_lines[27] = "CHANGED\n".to_string();
+        let new: String = new_lines.concat();
+        let diff = TextDiff::from_lines(&old, &new);
+        let groups: Vec<_> = diff.grouped_ops(3).into_iter().collect();
+        assert_eq!(groups.len(), 2, "expected two separate hunks");
+        let headers: Vec<String> = groups.iter().map(|g| hunk_header(g)).collect();
+        // First hunk: lines around index 2 -> 1-based 3 with 3 context above
+        // and below, so old 1..=6 (len 6), new 1..=6 (len 6).
+        assert_eq!(headers[0], "@@ -1,6 +1,6 @@");
+        // Second hunk: lines around index 27 -> 1-based 28, 3 above and 2 below.
+        assert_eq!(headers[1], "@@ -25,6 +25,6 @@");
+    }
 }
