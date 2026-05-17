@@ -560,23 +560,24 @@ impl App {
                 }
             }
             (_, Char('R'), Mod::NONE) => self.reload(),
-            (_, Tab, Mod::NONE) if self.diff.open => {
-                self.focus = match self.focus {
-                    Focus::Log => Focus::Diff,
-                    Focus::Diff => Focus::Log,
-                };
-            }
+            (_, Tab, Mod::NONE) if self.diff.open => self.cycle_focus(),
             (Focus::Log, Enter, Mod::NONE) => {
                 self.diff.open = true;
                 self.focus = Focus::Diff;
                 self.diff.scroll = 0;
+                // Carry an active commit search over so the query keeps
+                // working in the diff pane. update_diff_matches will run
+                // again once the diff payload arrives.
+                self.migrate_search_to_diff();
                 self.fetch_diff_for_selected();
             }
             // q/Esc pops the diff pane if open; otherwise quits from log.
             (_, Char('q') | Esc, Mod::NONE) if self.diff.open => {
                 self.diff.open = false;
                 self.focus = Focus::Log;
-                self.diff.search.clear();
+                // Carry an active diff search back to the log so the query
+                // keeps working there. No-op if diff search is empty.
+                self.migrate_search_to_log();
             }
             // Esc clears an active search result set (when diff is not open).
             (_, Esc, Mod::NONE) if !self.search.query.is_empty() => {
@@ -843,6 +844,58 @@ impl App {
         // Keep at least 5 lines of context above the matched line.
         let max = self.diff.total_visible_lines().saturating_sub(self.diff.view_height);
         self.diff.scroll = pos.saturating_sub(5).min(max);
+    }
+
+    /// Tab between panes. Searches "follow focus": only one pane has an
+    /// active query at a time, and the query migrates with focus so the
+    /// user keeps searching the same thing across panes.
+    fn cycle_focus(&mut self) {
+        match self.focus {
+            Focus::Log => {
+                self.focus = Focus::Diff;
+                self.migrate_search_to_diff();
+            }
+            Focus::Diff => {
+                self.focus = Focus::Log;
+                self.migrate_search_to_log();
+            }
+        }
+    }
+
+    /// Move an active commit-search query onto the diff pane and run it
+    /// against the current diff content. No-op when the commit search is
+    /// empty (so callers can fire this unconditionally on focus change).
+    fn migrate_search_to_diff(&mut self) {
+        if self.search.query.is_empty() {
+            return;
+        }
+        let q = std::mem::take(&mut self.search.query);
+        // Drain leftover commit-search state so n/N on a future return to
+        // log doesn't try to narrow against a now-empty match set.
+        self.search.active = false;
+        self.search.matches.clear();
+        self.search.current = 0;
+        self.search.last_query.clear();
+        self.search.last_generation = 0;
+
+        self.diff.search.query = q;
+        self.update_diff_matches();
+        self.diff_jump_first_at_or_after_cursor();
+    }
+
+    /// Symmetric: move an active diff-search query back onto the log pane.
+    fn migrate_search_to_log(&mut self) {
+        if self.diff.search.query.is_empty() {
+            return;
+        }
+        let q = std::mem::take(&mut self.diff.search.query);
+        self.diff.search.active = false;
+        self.diff.search.matches.clear();
+        self.diff.search.current = 0;
+
+        self.search.query = q;
+        self.update_commit_matches();
+        self.commit_jump_first_at_or_after_cursor();
     }
 
     fn yank_selected_hash(&mut self) {
