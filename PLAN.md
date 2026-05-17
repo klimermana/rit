@@ -8,7 +8,11 @@
 | 1 | `cc37902` | Move `[workspace.lints.clippy]` → `[lints.clippy]`. 2 → 60 warnings now firing. CLAUDE.md CI note added. |
 | 2 | `b85a710` | Resolve all 60 violations. `cargo clippy --no-deps` is silent. No `#[allow]` left — every dead-code site is either truly used (annotation removed), kept via `pub` field, or `#[expect(..., reason = "…")]`. |
 | 3 | `7fbcea5` | Edition 2024 + `gen` → `generation` rename + `collapsible_if` let-chain rewrites. Tail-expr-drop-order changes audited and ruled harmless. |
-| 4 | _pending_ | Correctness fixes (4a–4d) |
+| 4a | `37f5755` | `hunk_header` emits 0-start for empty old/new range (unified-diff convention). 2 new tests. |
+| 4b | `3114846` | `compute_short_status_lines_gix` returns `Result`; caller renders "Status query failed: …" instead of reporting clean. |
+| 4c | `2f95511` | `change_path` / `staged_change_path` return `String` (was `Option<String>`); callers collapse to one-liners. |
+| 4d | `8c01e50` | `relative_time` clamps future dates to "now" instead of emitting negative-seconds strings. 2 new tests. |
+| 5 | _pending_ | Performance fixes (5a–5h) |
 
 Project plan derived from the 2026-05-17 code review. Implements every
 item raised in the review (correctness, perf, refactor) and turns the
@@ -176,7 +180,7 @@ Workflow per commit: edit → `./fix` →
 `cargo bench --bench <relevant> -- --baseline pre-cleanup` → quote the
 criterion lines in the commit body.
 
-### 5a — `commits_len()` O(1)
+### 5a — `commits_len()` O(1) ✅
 
 `app.rs:931`. Replace the filter+count with `rows.len() - 1`.
 

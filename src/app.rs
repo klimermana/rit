@@ -921,9 +921,12 @@ impl App {
     }
 
     /// Number of real commits in the log (excludes the pseudo "Not Committed
-    /// Yet" row).
+    /// Yet" row at index 0). The working-tree row is created in `App::new`
+    /// and replaced 1-for-1 in `reload`, never removed — so a direct
+    /// `rows.len() - 1` is exact and O(1), important because this runs on
+    /// every redraw via the status-bar renderer.
     pub fn commits_len(&self) -> usize {
-        self.log.rows.iter().filter(|r| matches!(r, LogRow::Commit(_))).count()
+        self.log.rows.len().saturating_sub(1)
     }
 
     fn diff_scroll_down(&mut self, n: usize) {
