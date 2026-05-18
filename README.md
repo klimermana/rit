@@ -12,6 +12,7 @@ A terminal git log/diff viewer in the spirit of [tig](https://github.com/jonas/t
 - Working-tree status view (staged / unstaged diffs)
 - Path filter: limit the log to commits touching a given path
 - Lazy commit walking (handles large histories without blocking the UI)
+- Off-thread working-tree scan — first paint stays fast even on wide checkouts (10k+ tracked files)
 - Yank commit hash to clipboard (`pbcopy` / `xclip` / `xsel`)
 - Event-driven UI — idles at 0% CPU between keystrokes
 
@@ -74,11 +75,13 @@ Actions
 
 ## Architecture, briefly
 
-Three threads communicate via bounded crossbeam channels:
+Three long-lived threads communicate via bounded crossbeam channels:
 
 - **Main / UI thread** — runs the ratatui draw loop, parked in `select!` on input + git messages + a yank-feedback timer. Redraws only when something changes.
-- **Git worker thread** — owns the `gix::Repository`, walks history lazily in response to `LoadMore` requests, services `FetchDiff` / `FetchStatus` / `Reload` on demand. Tags emitted commits with a generation counter so stale messages from a previous walk are dropped after a reload.
+- **Git worker thread** — owns the `gix::Repository`, walks history continuously in the background (self-paced, no `LoadMore` ping required) and services `LoadDiff` / `LoadStatus` / `RefreshWorkingTreeMeta` / `Reload` on demand. Tags emitted commits with a generation counter so stale messages from a previous walk are dropped after a reload.
 - **Input thread** — polls crossterm and forwards key events.
+
+A short-lived fourth thread also gets spawned by the worker: `quick_is_dirty` runs the full `gix::status` sweep, which on a wide checkout takes long enough to block the first commit batch. Pulling it off the worker thread keeps first paint constant-time in the worktree dimension; the dirty bit lands as a follow-up `WorkingTreeMeta` message whenever the scan finishes.
 
 The diff/status content is stored as a domain `DiffLine { kind, text }` and only converted to ratatui `Line` at draw time, which keeps the data model decoupled from the rendering library.
 
