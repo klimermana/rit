@@ -39,6 +39,10 @@ harness = false
 name = "diff_generation"
 harness = false
 
+[[bench]]
+name = "startup"
+harness = false
+
 [lints.clippy]
 # Don't Panic - prevent panics from unwraps and unsafe slicing or indexing
 string_slice = "warn"
