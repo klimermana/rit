@@ -6,7 +6,7 @@ A terminal git log/diff viewer in the spirit of [tig](https://github.com/jonas/t
 
 ## Features
 
-- Browse commit log with ASCII graph, refs, author, relative date
+- Browse commit log with refs, author, relative date — and an optional ASCII commit graph column (`-g`)
 - Side-by-side or stacked diff view, depending on terminal aspect ratio
 - Live incremental search by commit message or author
 - Working-tree status view (staged / unstaged diffs)
@@ -31,6 +31,7 @@ rit                       # show full log
 rit path/to/file.rs       # pathspec filter (git log -- semantics)
 rit 'src/**/*.rs'         # glob pathspec
 rit ':!target'            # exclusion pathspec
+rit -g                    # render the ASCII commit-graph column (opt-in; -g / --graph)
 rit --help
 ```
 
@@ -44,6 +45,7 @@ Navigation
   k / ↑                Move up
   g / G                Top / bottom
   Ctrl+D / Ctrl+U      Half-page down / up
+  PageDown / PageUp    Full-page down / up
 
 Diff view
   Enter                Open diff for the selected commit
@@ -55,11 +57,14 @@ Search
   n / N                Next / previous match
   Esc                  Clear search
 
+Display
+  #                    Toggle line numbers in diff view
+  v                    Toggle patch hunks in diff view (summary-only when off)
+
 Actions
   y                    Yank commit hash to clipboard
   s                    Toggle working-tree status view
   R                    Reload log from HEAD
-  #                    Toggle line numbers in diff view
   ?                    Toggle help
   q / Ctrl+C           Quit
 ```

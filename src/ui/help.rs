@@ -42,6 +42,7 @@ pub fn draw_help(frame: &mut Frame, area: Rect) {
         row!("  k / ↑          ", "Move up"),
         row!("  g / G          ", "Top / Bottom"),
         row!("  Ctrl+D / Ctrl+U", "Half-page down / up"),
+        row!("  PageDown / PageUp", "Full-page down / up"),
         Line::from(""),
         Line::from(Span::styled("Diff View", h)),
         row!("  Enter          ", "Open diff pane for selected commit"),
