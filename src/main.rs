@@ -1,9 +1,5 @@
 use anyhow::Result;
 use clap::Parser;
-
-#[cfg(feature = "mimalloc")]
-#[global_allocator]
-static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 use crossbeam_channel::{Sender, bounded};
 use crossterm::{
     event::{self, Event},

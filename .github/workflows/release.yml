@@ -23,13 +23,10 @@ jobs:
         include:
           - target: x86_64-unknown-linux-musl
             os: ubuntu-latest
-            features: mimalloc
           - target: aarch64-apple-darwin
             os: macos-14
-            features: ""
           - target: x86_64-apple-darwin
             os: macos-13
-            features: ""
     env:
       MACOSX_DEPLOYMENT_TARGET: "11.0"
     steps:
@@ -48,12 +45,7 @@ jobs:
           key: ${{ matrix.target }}
 
       - name: Build release
-        run: |
-          if [ -n "${{ matrix.features }}" ]; then
-            cargo build --release --locked --target ${{ matrix.target }} --features ${{ matrix.features }}
-          else
-            cargo build --release --locked --target ${{ matrix.target }}
-          fi
+        run: cargo build --release --locked --target ${{ matrix.target }}
 
       - name: Strip macOS binary
         if: runner.os == 'macOS'
