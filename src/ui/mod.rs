@@ -54,9 +54,14 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
                 .areas(main_area);
             (left, Some(right))
         } else {
+            // Stacked layout: diff takes the lion's share. When the user
+            // opens the diff pane the diff is the working surface, so it
+            // gets enough rows to actually read a hunk in one viewport;
+            // the log keeps ~35% for selection context, which is still a
+            // ~17-row column on a 50-row terminal.
             let [top, bottom] = Layout::default()
                 .direction(Direction::Vertical)
-                .constraints([Constraint::Percentage(60), Constraint::Percentage(40)])
+                .constraints([Constraint::Percentage(35), Constraint::Percentage(65)])
                 .areas(main_area);
             (top, Some(bottom))
         }
