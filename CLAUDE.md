@@ -10,6 +10,20 @@ and stable rustfmt sometimes disagrees.
 ./fix && git add -u && git commit ...
 ```
 
+## Before every commit: update `CHANGELOG.md`
+
+If the change is user-visible — new CLI flag or arg, changed UI
+behavior, new keybinding, perf win worth mentioning, bug fix users
+would notice — add a bullet under `## [Unreleased]` in
+`CHANGELOG.md`, using the Keep-a-Changelog sections (`Added`,
+`Changed`, `Fixed`, `Removed`, `Deprecated`, `Security`). Skip the
+changelog for pure refactors, internal cleanups, test-only changes,
+and CI/build tweaks that don't affect users.
+
+Stage the `CHANGELOG.md` edit alongside the code change in the same
+commit — the entry and the code that justifies it should land
+together.
+
 ## Perf-affecting changes: confirm with benchmarks, don't guess
 
 This repo ships a criterion bench harness with three targets:
