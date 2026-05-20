@@ -11,6 +11,7 @@ A terminal git log/diff viewer in the spirit of [tig](https://github.com/jonas/t
 - Live incremental search by commit message or author
 - Working-tree status view (staged / unstaged diffs)
 - Path filter: limit the log to commits touching a given path
+- Revision arg: pass a commit hash (full or short), branch, tag, or `HEAD~3` to walk from that commit instead of HEAD
 - Lazy commit walking (handles large histories without blocking the UI)
 - Off-thread working-tree scan — first paint stays fast even on wide checkouts (10k+ tracked files)
 - Yank commit hash to clipboard (`pbcopy` / `xclip` / `xsel`)
@@ -27,13 +28,21 @@ The binary lands at `target/release/rit`.
 ## Usage
 
 ```bash
-rit                       # show full log
+rit                       # show full log (walks from HEAD)
+rit abc1234               # walk from this commit (full or short hash)
+rit v1.2.0                # walk from a tag
+rit HEAD~10               # any gix rev-parse expression
 rit path/to/file.rs       # pathspec filter (git log -- semantics)
 rit 'src/**/*.rs'         # glob pathspec
 rit ':!target'            # exclusion pathspec
 rit -g                    # render the ASCII commit-graph column (opt-in; -g / --graph)
 rit --help
 ```
+
+The positional arg is tried as a revision first and falls back to a
+pathspec if rev-parse can't resolve it. If you have a file whose
+name collides with a hash you can still match it with an explicit
+pathspec — e.g. `rit './abc1234'`.
 
 `rit` discovers the repo from the current directory upward, like git itself.
 

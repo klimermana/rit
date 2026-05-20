@@ -7,7 +7,7 @@ use crossterm::{
     terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
 };
 use ratatui::{Terminal, backend::CrosstermBackend};
-use rit::{app::App, git, model::PathFilter};
+use rit::{app::App, git};
 use std::{
     io::{self, BufWriter},
     panic,
@@ -18,10 +18,12 @@ use std::{
 #[derive(Parser, Debug)]
 #[command(version, about, long_about = None)]
 struct Cli {
-    /// Limit the log to commits touching this pathspec. Matches
-    /// `git log -- <pathspec>` semantics (supports globs and
-    /// `:!exclude` magic).
-    path: Option<String>,
+    /// Either a commit revision (full/short hash, branch, tag, `HEAD~3`,
+    /// …) to walk from, or a pathspec to filter the log. Tried as a
+    /// revision first; on rev-parse failure falls back to pathspec —
+    /// matching `git log -- <pathspec>` semantics (globs, `:!exclude`,
+    /// etc.).
+    revision_or_path: Option<String>,
 
     /// Render the ASCII commit graph column. Off by default because the
     /// per-commit lane bookkeeping is non-trivial on deep monorepos.
@@ -31,7 +33,7 @@ struct Cli {
 
 fn main() -> Result<()> {
     let cli = Cli::parse();
-    let path_filter = cli.path.map(PathFilter::new);
+    let positional = cli.revision_or_path;
     let graph_enabled = cli.graph;
 
     // Restore terminal on panic.
@@ -57,7 +59,7 @@ fn main() -> Result<()> {
 
     let git_tx = msg_tx.clone();
     std::thread::spawn(move || {
-        git::run_git_thread(req_rx, git_tx, path_filter, graph_enabled);
+        git::run_git_thread(req_rx, git_tx, positional, graph_enabled);
     });
 
     std::thread::spawn(move || {

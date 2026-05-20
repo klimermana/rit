@@ -141,10 +141,10 @@ pub enum GitMsg {
 pub fn run_git_thread(
     req_rx: Receiver<GitReq>,
     msg_tx: Sender<GitMsg>,
-    path_filter: Option<PathFilter>,
+    positional: Option<String>,
     graph_enabled: bool,
 ) {
-    if let Err(e) = run_git_thread_inner(req_rx, msg_tx.clone(), path_filter, graph_enabled) {
+    if let Err(e) = run_git_thread_inner(req_rx, msg_tx.clone(), positional, graph_enabled) {
         _ = msg_tx.send(GitMsg::History(HistoryMsg::Error(format!("git worker died: {e}"))));
     }
 }
@@ -152,7 +152,7 @@ pub fn run_git_thread(
 fn run_git_thread_inner(
     req_rx: Receiver<GitReq>,
     msg_tx: Sender<GitMsg>,
-    path_filter: Option<PathFilter>,
+    positional: Option<String>,
     graph_enabled: bool,
 ) -> Result<()> {
     let repo = match gix::discover(".") {
@@ -162,6 +162,13 @@ fn run_git_thread_inner(
             return Ok(());
         }
     };
+
+    // Try the positional as a revision (full or short hash, branch, tag,
+    // `HEAD~3`, etc.); fall back to pathspec only when rev-parse can't
+    // peel it to a commit. Hash-first matches the user's expectation
+    // that `rit abc1234` walks from that commit even when a path with
+    // the same name happens to exist.
+    let (start_id, path_filter) = resolve_positional(&repo, positional);
 
     _ = msg_tx.send(GitMsg::History(HistoryMsg::RepoInfo(meta::repo_info_for(&repo))));
     // Send the working-tree author immediately so the UI can paint the
@@ -176,7 +183,8 @@ fn run_git_thread_inner(
     _ = msg_tx
         .send(GitMsg::Inspect(InspectMsg::WorkingTreeMeta { author: meta::working_tree_author(&repo), dirty: None }));
 
-    let mut walker = walk::Walker::new(&repo, path_filter.clone(), 0, graph_enabled, Arc::new(HashMap::new()))?;
+    let mut walker =
+        walk::Walker::new(&repo, path_filter.clone(), start_id, 0, graph_enabled, Arc::new(HashMap::new()))?;
     let mut refs_loaded = false;
     // Per-worker shared cache: the pathspec filter populates it during
     // walking; LoadDiff requests for the same commit reuse the records.
@@ -209,6 +217,7 @@ fn run_git_thread_inner(
                         req,
                         &repo,
                         &path_filter,
+                        start_id,
                         graph_enabled,
                         &mut walker,
                         &mut refs_loaded,
@@ -258,6 +267,7 @@ fn run_git_thread_inner(
                     req,
                     &repo,
                     &path_filter,
+                    start_id,
                     graph_enabled,
                     &mut walker,
                     &mut refs_loaded,
@@ -278,12 +288,13 @@ fn run_git_thread_inner(
 /// try_recv-drain and the blocking-recv branches share it.
 #[expect(
     clippy::too_many_arguments,
-    reason = "single worker-loop callsite; all params are intrinsic worker state (now including the dirty-check join handles), no wrapper struct would clarify"
+    reason = "single worker-loop callsite; all params are intrinsic worker state (dirty-check handles, walk root, etc.), no wrapper struct would clarify"
 )]
 fn process_request<'r>(
     req: GitReq,
     repo: &'r gix::Repository,
     path_filter: &Option<PathFilter>,
+    start_id: Option<ObjectId>,
     graph_enabled: bool,
     walker: &mut walk::Walker<'r>,
     refs_loaded: &mut bool,
@@ -299,8 +310,9 @@ fn process_request<'r>(
             // the caller's walker — overwriting in place is fine.
             // The tree-diff cache survives reload: oids are
             // content-addressed so entries from the prior generation
-            // are still valid.
-            *walker = walk::Walker::new(repo, path_filter.clone(), next_gen, graph_enabled, refs_map)?;
+            // are still valid. `start_id` is captured at CLI parse
+            // time, so reload keeps walking from the same pinned root.
+            *walker = walk::Walker::new(repo, path_filter.clone(), start_id, next_gen, graph_enabled, refs_map)?;
             *refs_loaded = true;
         }
         GitReq::Inspect(InspectReq::LoadDiff(target)) => {
@@ -323,6 +335,28 @@ fn process_request<'r>(
         }
     }
     Ok(true)
+}
+
+/// Interpret the CLI positional arg. If it rev-parses to something that
+/// peels to a commit (full or short hash, branch, tag, `HEAD~3`, …)
+/// it's used as the walk root and no pathspec is applied; otherwise
+/// it's handed to `PathFilter` for the usual `git log -- <pathspec>`
+/// behaviour. Hash-first matches the user-confirmed disambiguation:
+/// when both forms could match, the commit wins.
+fn resolve_positional(repo: &gix::Repository, positional: Option<String>) -> (Option<ObjectId>, Option<PathFilter>) {
+    let Some(raw) = positional else {
+        return (None, None);
+    };
+    let commit_id = repo
+        .rev_parse_single(raw.as_str())
+        .ok()
+        .and_then(|id| id.object().ok())
+        .and_then(|obj| obj.peel_to_kind(gix::object::Kind::Commit).ok())
+        .map(|obj| obj.id);
+    match commit_id {
+        Some(id) => (Some(id), None),
+        None => (None, Some(PathFilter::new(raw))),
+    }
 }
 
 /// Off-thread `quick_is_dirty`. The worktree scan it performs is
@@ -375,7 +409,10 @@ impl Drop for DirtyJoin {
 
 #[cfg(test)]
 mod tests {
-    use super::meta::{quick_is_dirty, relative_time};
+    use super::{
+        meta::{quick_is_dirty, relative_time},
+        resolve_positional,
+    };
     use crate::test_support::{commit_all, make_fixture_repo, write_file};
 
     #[test]
@@ -406,5 +443,52 @@ mod tests {
         assert_eq!(quick_is_dirty(&repo), Some(false), "after commit, back to clean");
         std::fs::write(path.join("new_untracked.txt"), "x").expect("write");
         assert_eq!(quick_is_dirty(&repo), Some(true), "untracked file should count as dirty");
+    }
+
+    #[test]
+    fn resolve_positional_recognizes_full_hash() {
+        let (td, repo) = make_fixture_repo();
+        write_file(td.path(), "a.txt", "x\n");
+        commit_all(td.path(), "first");
+        let head = repo.head_id().expect("head").detach();
+
+        let (start, path_filter) = resolve_positional(&repo, Some(head.to_string()));
+        assert_eq!(start, Some(head));
+        assert!(path_filter.is_none());
+    }
+
+    #[test]
+    fn resolve_positional_recognizes_short_hash() {
+        let (td, repo) = make_fixture_repo();
+        write_file(td.path(), "a.txt", "x\n");
+        commit_all(td.path(), "first");
+        let head = repo.head_id().expect("head").detach();
+
+        let short = head.to_hex_with_len(7).to_string();
+        let (start, path_filter) = resolve_positional(&repo, Some(short));
+        assert_eq!(start, Some(head));
+        assert!(path_filter.is_none());
+    }
+
+    #[test]
+    fn resolve_positional_falls_back_to_pathspec() {
+        let (td, repo) = make_fixture_repo();
+        write_file(td.path(), "a.txt", "x\n");
+        commit_all(td.path(), "first");
+
+        let (start, path_filter) = resolve_positional(&repo, Some("src/foo.rs".to_string()));
+        assert!(start.is_none());
+        assert_eq!(path_filter.as_ref().map(|p| p.as_str()), Some("src/foo.rs"));
+    }
+
+    #[test]
+    fn resolve_positional_none_means_no_filter() {
+        let (td, repo) = make_fixture_repo();
+        write_file(td.path(), "a.txt", "x\n");
+        commit_all(td.path(), "first");
+
+        let (start, path_filter) = resolve_positional(&repo, None);
+        assert!(start.is_none());
+        assert!(path_filter.is_none());
     }
 }

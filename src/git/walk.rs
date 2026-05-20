@@ -9,7 +9,7 @@ use crate::{
 use anyhow::Result;
 use compact_str::CompactString;
 use crossbeam_channel::Sender;
-use gix::{ObjectId, bstr::ByteSlice};
+use gix::{ObjectId, bstr::ByteSlice, prelude::ObjectIdExt};
 use std::{collections::HashMap, sync::Arc};
 
 pub struct Walker<'r> {
@@ -31,13 +31,18 @@ impl<'r> Walker<'r> {
     pub fn new(
         repo: &'r gix::Repository,
         path_filter: Option<PathFilter>,
+        start_id: Option<ObjectId>,
         generation: u64,
         graph_enabled: bool,
         refs_map: Arc<HashMap<ObjectId, Vec<RefLabel>>>,
     ) -> Result<Self> {
-        let (iter, done) = match repo.head_id() {
-            Ok(head_id) => (Some(head_id.ancestors().all()?), false),
-            Err(_) => (None, true),
+        // `start_id` lets a CLI-supplied commit hash pin the walk root;
+        // falling back to HEAD preserves the no-arg behavior. A bare
+        // repo with no HEAD still produces an empty walk.
+        let start: Option<ObjectId> = start_id.or_else(|| repo.head_id().ok().map(|h| h.detach()));
+        let (iter, done) = match start {
+            Some(oid) => (Some(oid.attach(repo).ancestors().all()?), false),
+            None => (None, true),
         };
         let pathspec = match path_filter {
             Some(pf) => Some(build_pathspec_search(&pf)?),
@@ -245,7 +250,7 @@ mod tests {
         commit_all(path, "modify doc");
 
         let pf = PathFilter::new("src");
-        let mut walker = Walker::new(&repo, Some(pf), 0, false, Arc::new(HashMap::new())).expect("walker");
+        let mut walker = Walker::new(&repo, Some(pf), None, 0, false, Arc::new(HashMap::new())).expect("walker");
         let (tx, rx) = crossbeam_channel::bounded::<GitMsg>(256);
         walker.load_more(100, &mut TreeDiffCache::new(), &tx).expect("load_more");
 
@@ -266,7 +271,7 @@ mod tests {
         commit_all(path, "modify api/baz");
 
         let pf = PathFilter::new("src/api");
-        let mut walker = Walker::new(&repo, Some(pf), 0, false, Arc::new(HashMap::new())).expect("walker");
+        let mut walker = Walker::new(&repo, Some(pf), None, 0, false, Arc::new(HashMap::new())).expect("walker");
         let (tx, rx) = crossbeam_channel::bounded::<GitMsg>(256);
         walker.load_more(100, &mut TreeDiffCache::new(), &tx).expect("load_more");
 
@@ -277,6 +282,30 @@ mod tests {
             !summaries.iter().any(|s| s == "modify cli/bar"),
             "cli commit leaked through src/api spec: {summaries:?}",
         );
+    }
+
+    #[test]
+    fn walker_start_id_walks_from_named_commit_only() {
+        let (td, repo) = make_fixture_repo();
+        let path = td.path();
+
+        // Three commits; capture the middle one as the start root.
+        write_file(path, "a.txt", "1\n");
+        commit_all(path, "first");
+        write_file(path, "a.txt", "2\n");
+        commit_all(path, "second");
+        let middle = repo.head_id().expect("head after second").detach();
+        write_file(path, "a.txt", "3\n");
+        commit_all(path, "third");
+
+        let mut walker = Walker::new(&repo, None, Some(middle), 0, false, Arc::new(HashMap::new())).expect("walker");
+        let (tx, rx) = crossbeam_channel::bounded::<GitMsg>(256);
+        walker.load_more(100, &mut TreeDiffCache::new(), &tx).expect("load_more");
+
+        let summaries: Vec<String> = drain_commits(&rx).into_iter().map(|c| c.summary).collect();
+        // Walking from `second` should include `second` and `first` (its
+        // ancestor), but never the descendant commit `third`.
+        assert_eq!(summaries, vec!["second".to_string(), "first".to_string()]);
     }
 
     #[test]

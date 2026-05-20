@@ -135,8 +135,6 @@ fn bench_working_tree_diff(c: &mut Criterion) {
 /// open the diff for the HEAD commit. The pathspec filter pre-populates
 /// the cache during walking, so the LoadDiff request is a cache hit.
 fn bench_pathspec_walk_then_diff(c: &mut Criterion) {
-    use rit::model::PathFilter;
-
     let mut group = c.benchmark_group("pathspec_walk_then_diff");
     group.sample_size(20);
 
@@ -150,7 +148,7 @@ fn bench_pathspec_walk_then_diff(c: &mut Criterion) {
             let (req_tx, req_rx) = bounded::<GitReq>(64);
             let (msg_tx, msg_rx) = bounded::<GitMsg>(2048);
             let handle = std::thread::spawn(move || {
-                rit::git::run_git_thread(req_rx, msg_tx, Some(PathFilter::new("file_*.txt")), false);
+                rit::git::run_git_thread(req_rx, msg_tx, Some("file_*.txt".to_string()), false);
             });
 
             // Walk until done, capturing HEAD.

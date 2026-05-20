@@ -9,10 +9,7 @@ mod common;
 
 use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
 use crossbeam_channel::{RecvTimeoutError, bounded};
-use rit::{
-    git::{self, GitMsg, GitReq, HistoryMsg},
-    model::PathFilter,
-};
+use rit::git::{self, GitMsg, GitReq, HistoryMsg};
 use std::time::Duration;
 
 fn drain_until_walk_done(rx: &crossbeam_channel::Receiver<GitMsg>) -> usize {
@@ -91,7 +88,7 @@ fn bench_pathspec_history_indexing(c: &mut Criterion) {
                 let (req_tx, req_rx) = bounded::<GitReq>(64);
                 let (msg_tx, msg_rx) = bounded::<GitMsg>(2048);
                 let handle = std::thread::spawn(move || {
-                    git::run_git_thread(req_rx, msg_tx, Some(PathFilter::new("file_*.txt")), false);
+                    git::run_git_thread(req_rx, msg_tx, Some("file_*.txt".to_string()), false);
                 });
 
                 _ = drain_until_walk_done(&msg_rx);
