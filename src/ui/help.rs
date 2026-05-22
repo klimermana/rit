@@ -52,7 +52,7 @@ pub fn draw_help(frame: &mut Frame, area: Rect) {
         row!("  q / Esc        ", "Close diff pane (or quit from log)"),
         Line::from(""),
         Line::from(Span::styled("Search", h)),
-        row!("  /              ", "Start search (message, author, or tag)"),
+        row!("  /              ", "Start search (message, author, branch, or tag)"),
         row!("  n / N          ", "Next / previous match"),
         row!("  Esc            ", "Clear search"),
         Line::from(""),

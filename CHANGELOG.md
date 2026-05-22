@@ -9,9 +9,10 @@ Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Changed
 
-- Log search now also matches against tag names attached to a commit,
-  alongside the existing message and author fields. Useful for jumping
-  to a release commit by typing the tag (`v0.2.0`, etc.).
+- Log search now also matches against ref names attached to a commit
+  (tags, local branches, remote branches, HEAD) alongside the existing
+  message and author fields. Useful for jumping to a release commit by
+  typing the tag (`v0.2.0`) or to a feature head by typing the branch.
 
 ### Added
 

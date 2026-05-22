@@ -58,11 +58,12 @@ pub struct CommitRecord {
 pub struct CommitSearchText {
     pub author_lower: CompactString,
     pub summary_lower: String,
-    /// Space-joined, lowercased names of every `RefKind::Tag` attached to
-    /// the commit. Empty for the common case of an untagged commit, and
-    /// rebuilt by `RefsLoaded` backfill when refs land after the commit
-    /// row was first emitted.
-    pub tags_lower: CompactString,
+    /// Space-joined, lowercased names of every `RefLabel` attached to the
+    /// commit — tags, local branches, remote branches, and HEAD alike.
+    /// Empty for the common case of a refless commit, and rebuilt by
+    /// `RefsLoaded` backfill when refs land after the commit row was
+    /// first emitted.
+    pub refs_lower: CompactString,
 }
 
 #[derive(Clone)]

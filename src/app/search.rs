@@ -5,11 +5,12 @@
 use crate::model::CommitRecord;
 
 /// Substring-match a commit against a pre-lowercased query. The summary
-/// check tends to hit first in practice, so it goes first; tags are last
-/// because the blob is empty for nearly every commit and short-circuit
-/// evaluation makes the cost essentially free in the no-tag case.
+/// check tends to hit first in practice, so it goes first; refs (tags,
+/// branches, HEAD) come last because the blob is empty for nearly every
+/// commit and short-circuit evaluation makes the cost essentially free
+/// in the refless case.
 pub fn commit_matches(c: &CommitRecord, q: &str) -> bool {
-    c.search.summary_lower.contains(q) || c.search.author_lower.contains(q) || c.search.tags_lower.contains(q)
+    c.search.summary_lower.contains(q) || c.search.author_lower.contains(q) || c.search.refs_lower.contains(q)
 }
 
 /// Decide whether the current commit-search update can be served by
@@ -51,7 +52,7 @@ mod tests {
     use compact_str::CompactString;
     use gix::ObjectId;
 
-    fn make_commit(summary: &str, author: &str, tags_lower: &str) -> CommitRecord {
+    fn make_commit(summary: &str, author: &str, refs_lower: &str) -> CommitRecord {
         CommitRecord {
             id: ObjectId::null(gix::hash::Kind::Sha1),
             short_id: "0000000".into(),
@@ -64,24 +65,26 @@ mod tests {
             search: CommitSearchText {
                 author_lower: author.to_lowercase().into(),
                 summary_lower: summary.to_lowercase(),
-                tags_lower: tags_lower.into(),
+                refs_lower: refs_lower.into(),
             },
         }
     }
 
     #[test]
-    fn commit_matches_finds_tag_substring() {
+    fn commit_matches_finds_ref_substring() {
         // Query is already lowercased by the caller — match the search
-        // pipeline's contract.
-        let c = make_commit("unrelated message", "Someone Else", "v0.2.0 stable");
+        // pipeline's contract. The blob mixes a tag and a branch name to
+        // confirm both are reachable through the same field.
+        let c = make_commit("unrelated message", "Someone Else", "v0.2.0 feature/login");
         assert!(commit_matches(&c, "v0.2"));
-        assert!(commit_matches(&c, "stable"));
+        assert!(commit_matches(&c, "feature/login"));
+        assert!(commit_matches(&c, "login"));
         assert!(!commit_matches(&c, "v0.3"));
     }
 
     #[test]
-    fn commit_matches_skips_when_no_tag_blob_set() {
-        // Empty tags projection means the commit has no tags — query
+    fn commit_matches_skips_when_no_ref_blob_set() {
+        // Empty refs projection means the commit has no labels — query
         // must not falsely hit on it.
         let c = make_commit("hello world", "alex", "");
         assert!(commit_matches(&c, "hello"));
