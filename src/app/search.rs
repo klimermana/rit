@@ -5,9 +5,11 @@
 use crate::model::CommitRecord;
 
 /// Substring-match a commit against a pre-lowercased query. The summary
-/// check tends to hit first in practice, so it goes first.
+/// check tends to hit first in practice, so it goes first; tags are last
+/// because the blob is empty for nearly every commit and short-circuit
+/// evaluation makes the cost essentially free in the no-tag case.
 pub fn commit_matches(c: &CommitRecord, q: &str) -> bool {
-    c.search.summary_lower.contains(q) || c.search.author_lower.contains(q)
+    c.search.summary_lower.contains(q) || c.search.author_lower.contains(q) || c.search.tags_lower.contains(q)
 }
 
 /// Decide whether the current commit-search update can be served by
@@ -44,7 +46,47 @@ pub fn cycle(matches: &[usize], current: &mut usize, delta: isize) -> Option<usi
 
 #[cfg(test)]
 mod tests {
-    use super::should_narrow;
+    use super::{commit_matches, should_narrow};
+    use crate::model::{CommitRecord, CommitSearchText};
+    use compact_str::CompactString;
+    use gix::ObjectId;
+
+    fn make_commit(summary: &str, author: &str, tags_lower: &str) -> CommitRecord {
+        CommitRecord {
+            id: ObjectId::null(gix::hash::Kind::Sha1),
+            short_id: "0000000".into(),
+            authored_unix_secs: 0,
+            authored_relative: "now".into(),
+            author: author.into(),
+            summary: summary.to_string(),
+            refs: Vec::new(),
+            graph: CompactString::default(),
+            search: CommitSearchText {
+                author_lower: author.to_lowercase().into(),
+                summary_lower: summary.to_lowercase(),
+                tags_lower: tags_lower.into(),
+            },
+        }
+    }
+
+    #[test]
+    fn commit_matches_finds_tag_substring() {
+        // Query is already lowercased by the caller — match the search
+        // pipeline's contract.
+        let c = make_commit("unrelated message", "Someone Else", "v0.2.0 stable");
+        assert!(commit_matches(&c, "v0.2"));
+        assert!(commit_matches(&c, "stable"));
+        assert!(!commit_matches(&c, "v0.3"));
+    }
+
+    #[test]
+    fn commit_matches_skips_when_no_tag_blob_set() {
+        // Empty tags projection means the commit has no tags — query
+        // must not falsely hit on it.
+        let c = make_commit("hello world", "alex", "");
+        assert!(commit_matches(&c, "hello"));
+        assert!(!commit_matches(&c, "v1"));
+    }
 
     #[test]
     fn narrow_when_query_extends_within_same_generation() {

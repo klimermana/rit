@@ -4,7 +4,7 @@
 
 use crate::{
     git::{GitMsg, TreeDiffCache, compute_tree_diff_records, graph, history::HistoryMsg, meta::relative_time},
-    model::{CommitRecord, CommitSearchText, PathFilter, RefLabel},
+    model::{CommitRecord, CommitSearchText, PathFilter, RefKind, RefLabel},
 };
 use anyhow::Result;
 use compact_str::CompactString;
@@ -140,6 +140,7 @@ pub fn build_commit_info(
     let summary = decoded.message().summary().to_str_lossy().into_owned();
     let summary_lower = summary.to_lowercase();
     let refs = refs_map.get(&id).cloned().unwrap_or_default();
+    let tags_lower = tags_lower_from_refs(&refs);
     let graph_prefix = graph_state.map(|gs| gs.next(id, parent_ids)).unwrap_or_default();
 
     Some(CommitRecord {
@@ -151,8 +152,26 @@ pub fn build_commit_info(
         summary,
         refs,
         graph: graph_prefix,
-        search: CommitSearchText { author_lower, summary_lower },
+        search: CommitSearchText { author_lower, summary_lower, tags_lower },
     })
+}
+
+/// Build the lowercased, space-joined tag-name blob stored on a commit's
+/// `CommitSearchText`. Shared between fresh builds in the walker and the
+/// `RefsLoaded` backfill path that fills refs in on commits which were
+/// emitted before the refs table was ready.
+pub fn tags_lower_from_refs(refs: &[RefLabel]) -> CompactString {
+    let mut out = String::new();
+    for r in refs.iter().filter(|r| matches!(r.kind, RefKind::Tag)) {
+        if !out.is_empty() {
+            out.push(' ');
+        }
+        // Tag names rarely contain uppercase, but lowercasing here means
+        // `commit_matches` can stick to a single `.contains` against the
+        // already-lowercased query.
+        out.extend(r.name.chars().flat_map(|c| c.to_lowercase()));
+    }
+    out.into()
 }
 
 /// Parse the CLI path argument into a `gix::pathspec::Search`. Treats the

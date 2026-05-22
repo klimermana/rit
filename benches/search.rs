@@ -31,6 +31,7 @@ fn fake_commits(n: usize) -> Vec<CommitRecord> {
                 search: CommitSearchText {
                     author_lower: CompactString::from(author.to_lowercase().as_str()),
                     summary_lower: summary.to_lowercase(),
+                    tags_lower: CompactString::default(),
                 },
             }
         })
@@ -38,7 +39,7 @@ fn fake_commits(n: usize) -> Vec<CommitRecord> {
 }
 
 fn matches(c: &CommitRecord, q: &str) -> bool {
-    c.search.summary_lower.contains(q) || c.search.author_lower.contains(q)
+    c.search.summary_lower.contains(q) || c.search.author_lower.contains(q) || c.search.tags_lower.contains(q)
 }
 
 fn bench_search(c: &mut Criterion) {

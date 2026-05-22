@@ -23,7 +23,7 @@ use crate::{
         clipboard::yank_to_clipboard,
         search::{commit_matches, jump_first_at_or_after, should_narrow},
     },
-    git::{GitMsg, GitReq, HistoryMsg, HistoryReq, InspectMsg, InspectReq},
+    git::{GitMsg, GitReq, HistoryMsg, HistoryReq, InspectMsg, InspectReq, walk::tags_lower_from_refs},
     model::{DiffTarget, RepoInfo},
     ui,
 };
@@ -225,6 +225,10 @@ impl App {
                             && let Some(labels) = refs_map.get(&c.id)
                         {
                             c.refs = labels.clone();
+                            // Refresh the searchable tag projection too — without
+                            // this, tag search wouldn't find these prefix commits
+                            // because their original build saw no refs.
+                            c.search.tags_lower = tags_lower_from_refs(&c.refs);
                         }
                     }
                 }
