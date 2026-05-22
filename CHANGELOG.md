@@ -9,6 +9,10 @@ Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- Horizontal scroll in the diff pane. `h` / `l` (or `←` / `→`) shift
+  the view 4 columns at a time so truncated long lines can be read in
+  full; `0` snaps back to column 0. Reset automatically when a new
+  diff is loaded.
 - Positional CLI arg now accepts a commit revision (full or short hash,
   branch, tag, `HEAD~3`, …) and walks the log from that commit instead
   of HEAD. The arg is tried as a revision first via `gix` rev-parse and

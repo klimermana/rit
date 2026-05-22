@@ -71,6 +71,7 @@ impl App {
                 target: None,
                 document: None,
                 scroll: 0,
+                horizontal_scroll: 0,
                 loading: false,
                 show_line_numbers: true,
                 show_hunks: true,
@@ -242,6 +243,7 @@ impl App {
                     self.diff.loading = false;
                     self.diff.document = Some(document);
                     self.diff.scroll = 0;
+                    self.diff.horizontal_scroll = 0;
                     // New content invalidates the lowercased mirrors.
                     self.diff.header_lower = None;
                     self.diff.body_lower = None;

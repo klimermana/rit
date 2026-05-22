@@ -102,7 +102,12 @@ pub fn draw_diff(frame: &mut Frame, app: &App, area: Rect, focused: bool) {
         })
         .collect();
 
-    frame.render_widget(Paragraph::new(visible), inner);
+    // Horizontal scroll is applied via Paragraph::scroll. The whole pane
+    // (line numbers, +/- prefix, content) shifts together — simplest
+    // behavior, and `#` is available to hide the gutter when the user
+    // wants every column for content.
+    let hscroll = u16::try_from(app.diff.horizontal_scroll).unwrap_or(u16::MAX);
+    frame.render_widget(Paragraph::new(visible).scroll((0, hscroll)), inner);
 }
 
 fn diff_title(app: &App) -> String {

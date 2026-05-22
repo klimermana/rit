@@ -143,6 +143,10 @@ pub struct DiffState {
     pub target: Option<DiffTarget>,
     pub document: Option<DiffDocument>,
     pub scroll: usize,
+    /// Column offset for horizontal scroll. Applied via the underlying
+    /// `Paragraph::scroll` so the gutter (line numbers, +/-) shifts with
+    /// the content. Reset to 0 whenever the diff document changes.
+    pub horizontal_scroll: usize,
     pub loading: bool,
     pub show_line_numbers: bool,
     pub show_hunks: bool,

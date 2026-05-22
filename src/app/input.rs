@@ -11,6 +11,11 @@ use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 /// Half-page increment for Ctrl+D/U. Matches tig's default.
 const HALF_PAGE: usize = 10;
 
+/// Column step for horizontal scroll in the diff pane. One "tab" worth so
+/// repeated taps cover ground quickly; precision past that is rarely
+/// needed in a diff viewer.
+const HORIZONTAL_STEP: usize = 4;
+
 impl App {
     pub fn handle_input(&mut self, key: KeyEvent) {
         if self.show_help {
@@ -179,6 +184,13 @@ impl App {
             (Focus::Diff, PageUp, _) => {
                 self.diff.scroll = self.diff.scroll.saturating_sub(self.diff.view_height.max(1));
             }
+            (Focus::Diff, Char('h') | Left, Mod::NONE) => {
+                self.diff.horizontal_scroll = self.diff.horizontal_scroll.saturating_sub(HORIZONTAL_STEP);
+            }
+            (Focus::Diff, Char('l') | Right, Mod::NONE) => {
+                self.diff.horizontal_scroll = self.diff.horizontal_scroll.saturating_add(HORIZONTAL_STEP);
+            }
+            (Focus::Diff, Char('0'), Mod::NONE) => self.diff.horizontal_scroll = 0,
             _ => {}
         }
     }
