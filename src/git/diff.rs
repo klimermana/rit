@@ -4,14 +4,15 @@
 
 use crate::{
     git::{
-        MAX_INLINE_DIFF_BYTES, MAX_INLINE_DIFF_FILES, MAX_INLINE_DIFF_LINES, TreeDiffCache, compute_tree_diff_records,
-        meta::format_timestamp,
+        MAX_INLINE_DIFF_BYTES, MAX_INLINE_DIFF_FILES, MAX_INLINE_DIFF_LINES, PARALLEL_FILE_THRESHOLD, TreeDiffCache,
+        compute_tree_diff_records, meta::format_timestamp,
     },
     model::{DiffDocument, DiffFlags, DiffLine, DiffLineKind, DiffStats, DiffTarget, FileStat},
 };
 use anyhow::Result;
 use gix::{ObjectId, bstr::ByteSlice};
 use imara_diff::{Algorithm, Diff, Hunk, InternedInput};
+use rayon::prelude::*;
 
 /// Lines of context preserved on either side of a hunk. Matches both
 /// `git diff -U3` (the unified-diff default) and the value used by
@@ -95,39 +96,87 @@ fn compute_commit_diff_inner(
 /// Render previously-computed tree-diff records into the sink. Split
 /// out of the old `diff_trees` so the cache lookup can sit outside the
 /// renderer.
+///
+/// Per-file diff work is independent — same blobs in, same hunks out
+/// — so the records that survive the file-count guardrail are
+/// rendered in parallel via rayon and concatenated serially into the
+/// sink. The serial concat enforces the line-count guardrail (which
+/// depends on cumulative output size and can't be applied during
+/// parallel rendering).
 pub fn render_diff_records(
     repo: &gix::Repository,
     records: &[gix::diff::tree::recorder::Change],
     sink: &mut DiffSink<'_>,
 ) {
     use gix::diff::tree::recorder::Change;
-    for change in records {
-        // File-count and line-count caps apply before we even fetch blobs.
-        if sink.guardrail_exceeded() {
-            sink.account_skipped_file(change_path(change));
-            continue;
-        }
 
+    // File-count cap kicks in before any blob is fetched. `headroom`
+    // is how many more files the sink can absorb full diffs for;
+    // anything past that is accounted as a skipped file with the
+    // truncation note pinned to the document.
+    let headroom = MAX_INLINE_DIFF_FILES.saturating_sub(sink.stats.files);
+    let (render_records, skip_records) = if records.len() > headroom {
+        let (a, b) = records.split_at(headroom);
+        (a, Some(b))
+    } else {
+        (records, None)
+    };
+
+    // Render every surviving record. Above `PARALLEL_FILE_THRESHOLD`
+    // we go through rayon's `map_init`: `gix::Repository` is `Send`
+    // but `!Sync` (interior `RefCell`s for pack caches, inflate
+    // buffers, etc.) so each worker needs its own clone — gix's
+    // `ThreadSafeRepository` (`into_sync()` + `to_thread_local()`)
+    // does that without re-opening the repo. Below the threshold the
+    // per-call rayon setup costs more than it saves on a 1- or
+    // 2-file diff, so we stay serial.
+    let render_one = |worker_repo: &gix::Repository, change: &Change| -> Option<FileDiffOutput> {
         match change {
             Change::Addition { entry_mode, oid, path, .. } if entry_mode.is_blob() => {
                 let p = path.to_str_lossy().into_owned();
-                if let Ok(new) = repo.find_object(*oid) {
-                    render_file_addition(sink, &p, &new.data);
-                }
+                let new = worker_repo.find_object(*oid).ok()?;
+                Some(file_addition_output(&p, &new.data))
             }
             Change::Deletion { entry_mode, oid, path, .. } if entry_mode.is_blob() => {
                 let p = path.to_str_lossy().into_owned();
-                if let Ok(old) = repo.find_object(*oid) {
-                    render_file_deletion(sink, &p, &old.data);
-                }
+                let old = worker_repo.find_object(*oid).ok()?;
+                Some(file_deletion_output(&p, &old.data))
             }
             Change::Modification { entry_mode, previous_oid, oid, path, .. } if entry_mode.is_blob() => {
                 let p = path.to_str_lossy().into_owned();
-                if let (Ok(old), Ok(new)) = (repo.find_object(*previous_oid), repo.find_object(*oid)) {
-                    render_file_modification(sink, &p, &old.data, &new.data);
-                }
+                let old = worker_repo.find_object(*previous_oid).ok()?;
+                let new = worker_repo.find_object(*oid).ok()?;
+                Some(file_modification_output(&p, &old.data, &new.data))
             }
-            _ => {}
+            _ => None,
+        }
+    };
+
+    let outputs: Vec<FileDiffOutput> = if render_records.len() >= PARALLEL_FILE_THRESHOLD {
+        let sync_repo = repo.clone().into_sync();
+        render_records
+            .par_iter()
+            .map_init(|| sync_repo.to_thread_local(), |worker_repo, change| render_one(worker_repo, change))
+            .flatten()
+            .collect()
+    } else {
+        render_records.iter().filter_map(|change| render_one(repo, change)).collect()
+    };
+
+    for out in outputs {
+        if sink.guardrail_exceeded() {
+            sink.account_skipped_file(out.path);
+            continue;
+        }
+        merge_file_output_into_sink(sink, out);
+    }
+
+    if let Some(skipped) = skip_records {
+        // Trip the truncation note once before draining the tail so
+        // the message lines up with the file-count guardrail caller.
+        let _ = sink.guardrail_exceeded();
+        for change in skipped {
+            sink.account_skipped_file(change_path(change));
         }
     }
 }
@@ -182,81 +231,148 @@ impl DiffSink<'_> {
     }
 }
 
-/// Render a pure-addition file diff (new file in the new revision).
-///
-/// Body lines are stored without the leading `+` — the renderer prepends
-/// the marker at draw time based on `DiffLineKind::Add`. The per-line
-/// `format!` was a measurable allocation in the original implementation
-/// on large diffs.
-pub fn render_file_addition(sink: &mut DiffSink<'_>, path: &str, new: &[u8]) {
-    push_file_headers(sink.lines, path, Some("new file"));
-    let (additions, deletions) = match classify_skip(&[], new) {
+/// One file's worth of diff output, ready to fold into a `DiffSink`.
+/// The split between this pure-data variant and the sink-pushing
+/// renderers (`render_file_addition` / `…_deletion` / `…_modification`)
+/// is what lets the commit-diff render and the staged/unstaged
+/// sections parallelize per-file work via rayon: each task produces a
+/// `FileDiffOutput`, and the final merge into the sink happens
+/// serially so guardrail bookkeeping and ordering stay deterministic.
+pub struct FileDiffOutput {
+    pub path: String,
+    pub lines: Vec<DiffLine>,
+    pub additions: usize,
+    pub deletions: usize,
+    /// `Some` when the file was suppressed by `classify_skip` —
+    /// merge code bumps the matching counter on `DiffFlags`.
+    pub skip_reason: Option<SkipReason>,
+}
+
+/// Pure variant of `render_file_addition` — produces a `FileDiffOutput`
+/// instead of mutating a sink. Safe to call from a rayon worker.
+pub fn file_addition_output(path: &str, new: &[u8]) -> FileDiffOutput {
+    let mut lines: Vec<DiffLine> = Vec::new();
+    push_file_headers(&mut lines, path, Some("new file"));
+    let (additions, deletions, skip_reason) = match classify_skip(&[], new) {
         Some(reason) => {
-            push_skip_summary(sink.lines, sink.flags, reason, new.len());
-            (0, 0)
+            lines.push(DiffLine::new(DiffLineKind::Faint, skip_summary_text(&reason, new.len())));
+            (0, 0, Some(reason))
         }
         None => {
             let mut count = 0usize;
             for line in new.to_str_lossy().lines() {
-                sink.stats.insertions += 1;
                 count += 1;
-                sink.lines.push(DiffLine::new(DiffLineKind::Add, line));
+                lines.push(DiffLine::new(DiffLineKind::Add, line));
             }
-            (count, 0)
+            (count, 0, None)
         }
     };
-    sink.record_file(path.to_string(), additions, deletions);
+    FileDiffOutput { path: path.to_string(), lines, additions, deletions, skip_reason }
 }
 
-/// Render a pure-deletion file diff (file present in old, absent in new).
-/// Body lines are stored without the leading `-` (same convention as
-/// `render_file_addition`).
-pub fn render_file_deletion(sink: &mut DiffSink<'_>, path: &str, old: &[u8]) {
-    push_file_headers(sink.lines, path, Some("deleted file"));
-    let (additions, deletions) = match classify_skip(old, &[]) {
+/// Pure variant of `render_file_deletion`.
+pub fn file_deletion_output(path: &str, old: &[u8]) -> FileDiffOutput {
+    let mut lines: Vec<DiffLine> = Vec::new();
+    push_file_headers(&mut lines, path, Some("deleted file"));
+    let (additions, deletions, skip_reason) = match classify_skip(old, &[]) {
         Some(reason) => {
-            push_skip_summary(sink.lines, sink.flags, reason, old.len());
-            (0, 0)
+            lines.push(DiffLine::new(DiffLineKind::Faint, skip_summary_text(&reason, old.len())));
+            (0, 0, Some(reason))
         }
         None => {
             let mut count = 0usize;
             for line in old.to_str_lossy().lines() {
-                sink.stats.deletions += 1;
                 count += 1;
-                sink.lines.push(DiffLine::new(DiffLineKind::Del, line));
+                lines.push(DiffLine::new(DiffLineKind::Del, line));
             }
-            (0, count)
+            (0, count, None)
         }
     };
-    sink.record_file(path.to_string(), additions, deletions);
+    FileDiffOutput { path: path.to_string(), lines, additions, deletions, skip_reason }
 }
 
-/// Render a per-file modification (both sides present) as one or more
-/// `@@`-headed hunks. Shared between commit diffs (HEAD vs HEAD~1), staged
-/// diffs (HEAD vs index), and unstaged diffs (index vs worktree).
+/// Pure variant of `render_file_modification`.
+pub fn file_modification_output(path: &str, old: &[u8], new: &[u8]) -> FileDiffOutput {
+    let mut lines: Vec<DiffLine> = Vec::new();
+    push_file_headers(&mut lines, path, None);
+    let (additions, deletions, skip_reason) = match classify_skip(old, new) {
+        Some(reason) => {
+            lines.push(DiffLine::new(DiffLineKind::Faint, skip_summary_text(&reason, old.len().max(new.len()))));
+            (0, 0, Some(reason))
+        }
+        None => {
+            let (file_add, file_del) = render_unified_into(&mut lines, old, new);
+            (file_add, file_del, None)
+        }
+    };
+    FileDiffOutput { path: path.to_string(), lines, additions, deletions, skip_reason }
+}
+
+/// Fold a per-file output into a sink, applying its skip/flag updates
+/// and recording the file in the diffstat. Used by both the
+/// sink-pushing wrappers below and the parallel renderers.
+pub fn merge_file_output_into_sink(sink: &mut DiffSink<'_>, output: FileDiffOutput) {
+    if let Some(reason) = output.skip_reason {
+        match reason {
+            SkipReason::Binary => sink.flags.skipped_binary_files += 1,
+            SkipReason::Oversize => sink.flags.skipped_large_files += 1,
+        }
+        sink.flags.truncated = true;
+    }
+    sink.stats.insertions += output.additions;
+    sink.stats.deletions += output.deletions;
+    sink.lines.extend(output.lines);
+    sink.record_file(output.path, output.additions, output.deletions);
+}
+
+/// Sink-pushing wrapper around `file_addition_output`. Kept so the
+/// working-tree status renderer (which is already serial) doesn't
+/// have to construct + merge by hand.
+pub fn render_file_addition(sink: &mut DiffSink<'_>, path: &str, new: &[u8]) {
+    merge_file_output_into_sink(sink, file_addition_output(path, new));
+}
+
+/// Sink-pushing wrapper around `file_deletion_output`.
+pub fn render_file_deletion(sink: &mut DiffSink<'_>, path: &str, old: &[u8]) {
+    merge_file_output_into_sink(sink, file_deletion_output(path, old));
+}
+
+/// Sink-pushing wrapper around `file_modification_output`. Shared
+/// between commit diffs (HEAD vs HEAD~1), staged diffs (HEAD vs
+/// index), and unstaged diffs (index vs worktree).
 ///
 /// Uses `imara-diff`'s Histogram algorithm (a port of git's libxdiff).
 /// On text-heavy real-world inputs it consistently outperforms the
 /// `similar` crate's Myers implementation, which was previously the
 /// algorithmic gap between `rit`'s diff render and `git diff`.
 pub fn render_file_modification(sink: &mut DiffSink<'_>, path: &str, old: &[u8], new: &[u8]) {
-    push_file_headers(sink.lines, path, None);
-    let (additions, deletions) = match classify_skip(old, new) {
-        Some(reason) => {
-            push_skip_summary(sink.lines, sink.flags, reason, old.len().max(new.len()));
-            (0, 0)
+    merge_file_output_into_sink(sink, file_modification_output(path, old, new));
+}
+
+/// Text used by the "skipped" placeholder when `classify_skip` fires.
+/// Shared between the pure and sink-pushing render paths so they
+/// produce byte-identical lines.
+fn skip_summary_text(reason: &SkipReason, biggest_side_bytes: usize) -> String {
+    match reason {
+        SkipReason::Binary => "Binary file — diff suppressed".to_string(),
+        SkipReason::Oversize => {
+            let kib = biggest_side_bytes / 1024;
+            format!("Large file ({kib} KiB) — diff suppressed (>{} KiB)", MAX_INLINE_DIFF_BYTES / 1024)
         }
-        None => render_unified(sink, old, new),
-    };
-    sink.record_file(path.to_string(), additions, deletions);
+    }
 }
 
 /// Drive `imara-diff` over `old` / `new` byte slices and emit hunks
-/// into `sink`. Mirrors the structure of `imara_diff::UnifiedDiff` (so
-/// hunk grouping and headers match `git diff -U3`) but pushes
-/// structured `DiffLine`s rather than a unified-diff string, which is
-/// what the TUI renderer wants downstream.
-fn render_unified(sink: &mut DiffSink<'_>, old: &[u8], new: &[u8]) -> (usize, usize) {
+/// into the provided `lines` buffer. Returns `(additions, deletions)`
+/// for the file; the caller folds them into stats. Mirrors the
+/// structure of `imara_diff::UnifiedDiff` (so hunk grouping and
+/// headers match `git diff -U3`) but pushes structured `DiffLine`s
+/// rather than a unified-diff string.
+///
+/// Takes `&mut Vec<DiffLine>` rather than `&mut DiffSink` so the
+/// pure file-output builders can call it from a rayon worker without
+/// touching the shared sink.
+fn render_unified_into(lines: &mut Vec<DiffLine>, old: &[u8], new: &[u8]) -> (usize, usize) {
     let input = InternedInput::new(old, new);
     let mut diff = Diff::compute(Algorithm::Histogram, &input);
     // Indent-based slider postprocessing — same default `git diff` uses
@@ -296,7 +412,7 @@ fn render_unified(sink: &mut DiffSink<'_>, old: &[u8], new: &[u8]) -> (usize, us
         let group_after_start = group.first().map(|h| h.after.start).unwrap_or(0).saturating_sub(HUNK_CONTEXT_LEN);
         let group_after_end = (group.last().map(|h| h.after.end).unwrap_or(0) + HUNK_CONTEXT_LEN).min(after_total);
 
-        sink.lines.push(DiffLine::new(
+        lines.push(DiffLine::new(
             DiffLineKind::HunkHeader,
             hunk_header_str(
                 group_before_start,
@@ -313,23 +429,21 @@ fn render_unified(sink: &mut DiffSink<'_>, old: &[u8], new: &[u8]) -> (usize, us
         let mut cursor = group_before_start;
         for h in &group {
             while cursor < h.before.start {
-                push_token_line(sink.lines, DiffLineKind::Context, &input, cursor, /* before */ true);
+                push_token_line(lines, DiffLineKind::Context, &input, cursor, /* before */ true);
                 cursor += 1;
             }
             for i in h.before.start..h.before.end {
-                push_token_line(sink.lines, DiffLineKind::Del, &input, i, /* before */ true);
-                sink.stats.deletions += 1;
+                push_token_line(lines, DiffLineKind::Del, &input, i, /* before */ true);
                 file_del += 1;
             }
             cursor = h.before.end;
             for i in h.after.start..h.after.end {
-                push_token_line(sink.lines, DiffLineKind::Add, &input, i, /* before */ false);
-                sink.stats.insertions += 1;
+                push_token_line(lines, DiffLineKind::Add, &input, i, /* before */ false);
                 file_add += 1;
             }
         }
         while cursor < group_before_end {
-            push_token_line(sink.lines, DiffLineKind::Context, &input, cursor, /* before */ true);
+            push_token_line(lines, DiffLineKind::Context, &input, cursor, /* before */ true);
             cursor += 1;
         }
     }
@@ -342,7 +456,7 @@ fn render_unified(sink: &mut DiffSink<'_>, old: &[u8], new: &[u8]) -> (usize, us
 /// newline (kept by `imara-diff`'s tokenizer to detect EOL changes)
 /// is stripped — the renderer prepends its own marker at draw time.
 ///
-/// `idx` is always a valid offset into the chosen side: `render_unified`
+/// `idx` is always a valid offset into the chosen side: `render_unified_into`
 /// only ever feeds indices it pulled from `Diff::hunks()` on this same
 /// `InternedInput`, and the cursor walks `[group_before_start, group_before_end)`
 /// which is clamped to the side's length. Likewise for the after side
@@ -354,7 +468,7 @@ fn push_token_line(
     idx: u32,
     before: bool,
 ) {
-    #[expect(clippy::indexing_slicing, reason = "idx is bounded by render_unified's hunk walk; see fn doc")]
+    #[expect(clippy::indexing_slicing, reason = "idx is bounded by render_unified_into's hunk walk; see fn doc")]
     let token = if before { input.before[idx as usize] } else { input.after[idx as usize] };
     let bytes = input.interner[token];
     let trimmed = bytes.strip_suffix(b"\n").unwrap_or(bytes);
@@ -390,22 +504,6 @@ pub fn classify_skip(old: &[u8], new: &[u8]) -> Option<SkipReason> {
         return Some(SkipReason::Oversize);
     }
     None
-}
-
-fn push_skip_summary(lines: &mut Vec<DiffLine>, flags: &mut DiffFlags, reason: SkipReason, biggest_side_bytes: usize) {
-    let text = match reason {
-        SkipReason::Binary => {
-            flags.skipped_binary_files += 1;
-            "Binary file — diff suppressed".to_string()
-        }
-        SkipReason::Oversize => {
-            flags.skipped_large_files += 1;
-            let kib = biggest_side_bytes / 1024;
-            format!("Large file ({kib} KiB) — diff suppressed (>{} KiB)", MAX_INLINE_DIFF_BYTES / 1024)
-        }
-    };
-    flags.truncated = true;
-    lines.push(DiffLine::new(DiffLineKind::Faint, text));
 }
 
 fn push_file_headers(lines: &mut Vec<DiffLine>, path: &str, mode_meta: Option<&str>) {

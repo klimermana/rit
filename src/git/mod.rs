@@ -34,6 +34,16 @@ pub const MAX_INLINE_DIFF_BYTES: usize = 256 * 1024;
 pub const MAX_INLINE_DIFF_LINES: usize = 20_000;
 pub const MAX_INLINE_DIFF_FILES: usize = 200;
 
+/// Below this many changed files, the per-file diff renderers stay
+/// serial. The rayon `par_iter().map_init` setup (work-stealing
+/// scheduler hookup + the gix `ThreadSafeRepository` clone for each
+/// worker) costs a few hundred microseconds of fixed overhead — fine
+/// when amortised across many files, pure waste on a 1-or-2-file
+/// commit. Picked from the `working_tree_diff/wide_checkout_5000_tracked`
+/// bench, which has 2 modified files: above-threshold parallelization
+/// regressed it by ~25% before this cutoff was added.
+pub const PARALLEL_FILE_THRESHOLD: usize = 8;
+
 /// Upper bound on the pathspec → commit-diff cache. 64 entries are
 /// enough to absorb a few seconds of scrollback while the user
 /// navigates a pathspec-filtered log; the eviction policy is LRU.

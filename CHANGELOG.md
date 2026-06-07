@@ -22,6 +22,11 @@ Versioning](https://semver.org/spec/v2.0.0.html).
   Matches `git diff -U3`'s hunk grouping and produces identical
   headers. Indent-based slider postprocessing keeps hunks aligned on
   syntactic boundaries.
+- Per-file diff work (commit diffs, staged section, unstaged section)
+  is parallelized via rayon above a small file-count threshold. On a
+  200-file commit, the bench `diff_generation/many_files_200` drops
+  from 3.0 ms to 1.83 ms (-39%). Below the threshold the renderer
+  stays serial so 1–2-file diffs don't pay scheduler overhead.
 
 - Log search now also matches against ref names attached to a commit
   (tags, local branches, remote branches, HEAD) alongside the existing

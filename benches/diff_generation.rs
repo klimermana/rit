@@ -110,6 +110,29 @@ fn bench_diff_generation(c: &mut Criterion) {
         drop(req_tx);
         _ = handle.join();
     }
+
+    // Many-file commit (root commit creating 200 files). Targets the
+    // rayon-parallelized per-file render path: each file is an
+    // independent diff job, so a single-thread renderer scales
+    // linearly with file count while a worker-pool renderer doesn't.
+    {
+        let fix = common::FixtureRepo::new();
+        fix.seed_commits_fast_with_files(1, 200);
+        let path = fix.path_buf();
+        let (req_tx, msg_rx, head, handle) = boot_worker(&path);
+        let head = head.expect("must have at least one commit");
+
+        group.bench_with_input(BenchmarkId::from_parameter("many_files_200"), &head, |b, head| {
+            b.iter(|| {
+                req_tx.send(GitReq::Inspect(InspectReq::LoadDiff(DiffTarget::Commit(*head)))).expect("send");
+                await_diff(&msg_rx);
+            });
+        });
+
+        drop(req_tx);
+        _ = handle.join();
+    }
+
     group.finish();
 }
 

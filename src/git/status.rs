@@ -15,11 +15,15 @@
 //! (`compute_status`) keeps the synchronous full sweep.
 
 use crate::{
-    git::diff::{DiffSink, render_file_addition, render_file_deletion, render_file_modification},
+    git::diff::{
+        DiffSink, FileDiffOutput, file_addition_output, file_deletion_output, file_modification_output,
+        merge_file_output_into_sink,
+    },
     model::{DiffDocument, DiffFlags, DiffLine, DiffLineKind, DiffStats, DiffTarget, FileStat, StatusDocument},
 };
 use anyhow::Result;
 use gix::{ObjectId, status::UntrackedFiles};
+use rayon::prelude::*;
 
 /// Working-tree status pane. Synchronous full sweep — untracked files
 /// are inline rather than streamed, since the status pane is the
@@ -33,53 +37,57 @@ pub fn compute_status(repo: &gix::Repository) -> StatusDocument {
     StatusDocument { lines: body }
 }
 
-fn render_staged_change(repo: &gix::Repository, sink: &mut DiffSink<'_>, change: gix::diff::index::Change) -> usize {
-    use gix::diff::index::Change;
-    match change {
-        Change::Addition { location, id, .. } => {
-            let path = location.to_string();
-            if let Ok(new) = repo.find_object(id.into_owned()) {
-                render_file_addition(sink, &path, &new.data);
-            }
-            1
-        }
-        Change::Deletion { location, id, .. } => {
-            let path = location.to_string();
-            if let Ok(old) = repo.find_object(id.into_owned()) {
-                render_file_deletion(sink, &path, &old.data);
-            }
-            1
-        }
-        Change::Modification { location, previous_id, id, .. } => {
-            let path = location.to_string();
-            if let (Ok(old), Ok(new)) = (repo.find_object(previous_id.into_owned()), repo.find_object(id.into_owned()))
-            {
-                render_file_modification(sink, &path, &old.data, &new.data);
-            }
-            1
-        }
-        Change::Rewrite { location, source_id, id, .. } => {
-            // Treat renames as modifications under the destination path. A
-            // rename header `R old -> new` is a follow-up; today both git
-            // and we show this as a modification at the new path.
-            let path = location.to_string();
-            if let (Ok(old), Ok(new)) = (repo.find_object(source_id.into_owned()), repo.find_object(id.into_owned())) {
-                render_file_modification(sink, &path, &old.data, &new.data);
-            }
-            1
-        }
-    }
+/// Staged change normalised to the (path, oids) shape `rayon` can
+/// chew on. The original `gix::diff::index::Change` references
+/// borrowed `BString`s; this owns them so worker threads can take
+/// ownership without coordinating lifetimes back to the iterator.
+enum StagedRender {
+    Addition {
+        path: String,
+        oid: ObjectId,
+    },
+    Deletion {
+        path: String,
+        oid: ObjectId,
+    },
+    /// Modification *and* rewrite collapse here — `git diff` displays
+    /// renames as a modification at the destination path today, and
+    /// the per-file render only needs old/new oids.
+    Modification {
+        path: String,
+        old_oid: ObjectId,
+        new_oid: ObjectId,
+    },
 }
 
-fn staged_change_path(change: &gix::diff::index::Change) -> String {
-    use gix::diff::index::Change;
-    let loc = match change {
-        Change::Addition { location, .. }
-        | Change::Deletion { location, .. }
-        | Change::Modification { location, .. }
-        | Change::Rewrite { location, .. } => location,
-    };
-    loc.to_string()
+impl StagedRender {
+    fn path(&self) -> &str {
+        match self {
+            Self::Addition { path, .. } | Self::Deletion { path, .. } | Self::Modification { path, .. } => path,
+        }
+    }
+
+    fn from_change(change: gix::diff::index::Change) -> Self {
+        use gix::diff::index::Change;
+        match change {
+            Change::Addition { location, id, .. } => {
+                Self::Addition { path: location.to_string(), oid: id.into_owned() }
+            }
+            Change::Deletion { location, id, .. } => {
+                Self::Deletion { path: location.to_string(), oid: id.into_owned() }
+            }
+            Change::Modification { location, previous_id, id, .. } => Self::Modification {
+                path: location.to_string(),
+                old_oid: previous_id.into_owned(),
+                new_oid: id.into_owned(),
+            },
+            Change::Rewrite { location, source_id, id, .. } => Self::Modification {
+                path: location.to_string(),
+                old_oid: source_id.into_owned(),
+                new_oid: id.into_owned(),
+            },
+        }
+    }
 }
 
 /// One unstaged change reduced to "what we need to render the unified
@@ -237,55 +245,128 @@ fn render_short_status(
     out
 }
 
-/// Render the staged section from pre-collected changes. Returns the
-/// number of files emitted (or skipped by the guardrail) so the caller
-/// can fall back to "(no staged changes)" when empty.
+/// Render the staged section from pre-collected changes. Each file's
+/// diff is built on a rayon worker (see `render_diff_records` in
+/// `diff.rs` for the matching pattern + the `ThreadSafeRepository`
+/// rationale); the merge back into the sink is serial so guardrails
+/// and ordering stay deterministic. Returns the number of files
+/// emitted (or skipped by the guardrail) so the caller can fall back
+/// to "(no staged changes)" when empty.
 fn render_staged_section(
     repo: &gix::Repository,
     sink: &mut DiffSink<'_>,
     staged: Vec<gix::diff::index::Change>,
 ) -> usize {
-    let mut emitted = 0usize;
-    for change in staged {
-        if sink.guardrail_exceeded() {
-            sink.account_skipped_file(staged_change_path(&change));
-            emitted += 1;
-            continue;
+    use crate::git::MAX_INLINE_DIFF_FILES;
+
+    let renders: Vec<StagedRender> = staged.into_iter().map(StagedRender::from_change).collect();
+    let headroom = MAX_INLINE_DIFF_FILES.saturating_sub(sink.stats.files);
+    let (renderable, skipped) =
+        if renders.len() > headroom { renders.split_at(headroom) } else { (renders.as_slice(), [].as_slice()) };
+
+    let render_one = |worker_repo: &gix::Repository, item: &StagedRender| -> Option<FileDiffOutput> {
+        match item {
+            StagedRender::Addition { path, oid } => {
+                let new = worker_repo.find_object(*oid).ok()?;
+                Some(file_addition_output(path, &new.data))
+            }
+            StagedRender::Deletion { path, oid } => {
+                let old = worker_repo.find_object(*oid).ok()?;
+                Some(file_deletion_output(path, &old.data))
+            }
+            StagedRender::Modification { path, old_oid, new_oid } => {
+                let old = worker_repo.find_object(*old_oid).ok()?;
+                let new = worker_repo.find_object(*new_oid).ok()?;
+                Some(file_modification_output(path, &old.data, &new.data))
+            }
         }
-        emitted += render_staged_change(repo, sink, change);
+    };
+
+    let outputs: Vec<FileDiffOutput> = if renderable.len() >= crate::git::PARALLEL_FILE_THRESHOLD {
+        let sync_repo = repo.clone().into_sync();
+        renderable
+            .par_iter()
+            .map_init(|| sync_repo.to_thread_local(), |worker_repo, item| render_one(worker_repo, item))
+            .flatten()
+            .collect()
+    } else {
+        renderable.iter().filter_map(|item| render_one(repo, item)).collect()
+    };
+
+    let mut emitted = 0usize;
+    for out in outputs {
+        if sink.guardrail_exceeded() {
+            sink.account_skipped_file(out.path);
+        } else {
+            merge_file_output_into_sink(sink, out);
+        }
+        emitted += 1;
+    }
+    if !skipped.is_empty() {
+        let _ = sink.guardrail_exceeded();
+        for item in skipped {
+            sink.account_skipped_file(item.path().to_string());
+            emitted += 1;
+        }
     }
     emitted
 }
 
-/// Render the unstaged section from pre-collected items. Worktree
-/// bytes are read on demand (one fs::read per Modified item) so the
-/// caller doesn't have to thread `workdir` in.
+/// Render the unstaged section. Same parallel-then-merge shape as
+/// `render_staged_section`, with one wrinkle: the new side of each
+/// modification comes from the worktree (`fs::read`) rather than the
+/// ODB, so the rayon workers do the disk reads concurrently — useful
+/// on slow filesystems or wide working trees.
 fn render_unstaged_section(repo: &gix::Repository, sink: &mut DiffSink<'_>, items: Vec<UnstagedRender>) -> usize {
+    use crate::git::MAX_INLINE_DIFF_FILES;
+
+    let headroom = MAX_INLINE_DIFF_FILES.saturating_sub(sink.stats.files);
+    let (renderable, skipped) =
+        if items.len() > headroom { items.split_at(headroom) } else { (items.as_slice(), [].as_slice()) };
+
     let workdir = repo.workdir().map(|p| p.to_owned());
-    let mut emitted = 0usize;
-    for item in items {
-        let path = match &item {
-            UnstagedRender::Removed { path, .. } | UnstagedRender::Modified { path, .. } => path.clone(),
-        };
-        if sink.guardrail_exceeded() {
-            sink.account_skipped_file(path);
-            emitted += 1;
-            continue;
-        }
+    let render_one = |worker_repo: &gix::Repository, item: &UnstagedRender| -> Option<FileDiffOutput> {
         match item {
             UnstagedRender::Removed { path, index_id } => {
-                if let Ok(old) = repo.find_object(index_id) {
-                    render_file_deletion(sink, &path, &old.data);
-                }
-                emitted += 1;
+                let old = worker_repo.find_object(*index_id).ok()?;
+                Some(file_deletion_output(path, &old.data))
             }
             UnstagedRender::Modified { path, index_id } => {
-                let new = workdir.as_ref().and_then(|wd| std::fs::read(wd.join(&path)).ok()).unwrap_or_default();
-                if let Ok(old) = repo.find_object(index_id) {
-                    render_file_modification(sink, &path, &old.data, &new);
-                }
-                emitted += 1;
+                let new = workdir.as_ref().and_then(|wd| std::fs::read(wd.join(path)).ok()).unwrap_or_default();
+                let old = worker_repo.find_object(*index_id).ok()?;
+                Some(file_modification_output(path, &old.data, &new))
             }
+        }
+    };
+
+    let outputs: Vec<FileDiffOutput> = if renderable.len() >= crate::git::PARALLEL_FILE_THRESHOLD {
+        let sync_repo = repo.clone().into_sync();
+        renderable
+            .par_iter()
+            .map_init(|| sync_repo.to_thread_local(), |worker_repo, item| render_one(worker_repo, item))
+            .flatten()
+            .collect()
+    } else {
+        renderable.iter().filter_map(|item| render_one(repo, item)).collect()
+    };
+
+    let mut emitted = 0usize;
+    for out in outputs {
+        if sink.guardrail_exceeded() {
+            sink.account_skipped_file(out.path);
+        } else {
+            merge_file_output_into_sink(sink, out);
+        }
+        emitted += 1;
+    }
+    if !skipped.is_empty() {
+        let _ = sink.guardrail_exceeded();
+        for item in skipped {
+            let path = match item {
+                UnstagedRender::Removed { path, .. } | UnstagedRender::Modified { path, .. } => path.clone(),
+            };
+            sink.account_skipped_file(path);
+            emitted += 1;
         }
     }
     emitted

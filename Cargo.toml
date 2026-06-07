@@ -21,6 +21,7 @@ anyhow = "1"
 chrono = "0.4"
 compact_str = "0.9"
 imara-diff = "0.2"
+rayon = "1"
 clap = { version = "4.6.1", features = ["derive"] }
 
 [profile.release]
