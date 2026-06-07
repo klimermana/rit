@@ -11,7 +11,14 @@ use crate::{
 };
 use anyhow::Result;
 use gix::{ObjectId, bstr::ByteSlice};
-use similar::ChangeTag;
+use imara_diff::{Algorithm, Diff, Hunk, InternedInput};
+
+/// Lines of context preserved on either side of a hunk. Matches both
+/// `git diff -U3` (the unified-diff default) and the value used by
+/// `imara_diff::UnifiedDiffConfig::default()`. Hunks closer than
+/// `2 * HUNK_CONTEXT_LEN` lines are merged into one block — same rule
+/// `git diff` and `imara-diff`'s built-in unified printer use.
+const HUNK_CONTEXT_LEN: u32 = 3;
 
 pub fn empty_error_document(target: DiffTarget, e: anyhow::Error) -> DiffDocument {
     DiffDocument {
@@ -227,6 +234,11 @@ pub fn render_file_deletion(sink: &mut DiffSink<'_>, path: &str, old: &[u8]) {
 /// Render a per-file modification (both sides present) as one or more
 /// `@@`-headed hunks. Shared between commit diffs (HEAD vs HEAD~1), staged
 /// diffs (HEAD vs index), and unstaged diffs (index vs worktree).
+///
+/// Uses `imara-diff`'s Histogram algorithm (a port of git's libxdiff).
+/// On text-heavy real-world inputs it consistently outperforms the
+/// `similar` crate's Myers implementation, which was previously the
+/// algorithmic gap between `rit`'s diff render and `git diff`.
 pub fn render_file_modification(sink: &mut DiffSink<'_>, path: &str, old: &[u8], new: &[u8]) {
     push_file_headers(sink.lines, path, None);
     let (additions, deletions) = match classify_skip(old, new) {
@@ -234,24 +246,129 @@ pub fn render_file_modification(sink: &mut DiffSink<'_>, path: &str, old: &[u8],
             push_skip_summary(sink.lines, sink.flags, reason, old.len().max(new.len()));
             (0, 0)
         }
-        None => {
-            let old_s = old.to_str_lossy();
-            let new_s = new.to_str_lossy();
-            let diff = similar::TextDiff::from_lines(old_s.as_ref(), new_s.as_ref());
-            let mut file_add = 0usize;
-            let mut file_del = 0usize;
-            for group in diff.grouped_ops(3) {
-                sink.lines.push(DiffLine::new(DiffLineKind::HunkHeader, hunk_header(&group)));
-                for op in &group {
-                    for ch in diff.iter_changes(op) {
-                        push_change(sink.lines, sink.stats, &mut file_add, &mut file_del, ch.tag(), ch.value());
-                    }
-                }
-            }
-            (file_add, file_del)
-        }
+        None => render_unified(sink, old, new),
     };
     sink.record_file(path.to_string(), additions, deletions);
+}
+
+/// Drive `imara-diff` over `old` / `new` byte slices and emit hunks
+/// into `sink`. Mirrors the structure of `imara_diff::UnifiedDiff` (so
+/// hunk grouping and headers match `git diff -U3`) but pushes
+/// structured `DiffLine`s rather than a unified-diff string, which is
+/// what the TUI renderer wants downstream.
+fn render_unified(sink: &mut DiffSink<'_>, old: &[u8], new: &[u8]) -> (usize, usize) {
+    let input = InternedInput::new(old, new);
+    let mut diff = Diff::compute(Algorithm::Histogram, &input);
+    // Indent-based slider postprocessing — same default `git diff` uses
+    // — produces hunks that line up on syntactic boundaries instead of
+    // sliding into adjacent equal lines. Skipping it would produce
+    // technically-correct but visually noisier diffs.
+    diff.postprocess_lines(&input);
+
+    let before_total = input.before.len() as u32;
+    let after_total = input.after.len() as u32;
+
+    let mut file_add = 0usize;
+    let mut file_del = 0usize;
+    let mut hunks = diff.hunks().peekable();
+    while let Some(first) = hunks.next() {
+        // Collect a chain of hunks whose context windows overlap. The
+        // merge condition `gap <= 2 * context_len` matches
+        // `imara_diff::UnifiedDiff`'s rule, which in turn matches
+        // `git diff -U3`.
+        let mut group: Vec<Hunk> = vec![first];
+        while let Some(next) = hunks.peek() {
+            let last_end = group.last().map(|h| h.before.end).unwrap_or(0);
+            let gap = next.before.start.saturating_sub(last_end);
+            if gap <= 2 * HUNK_CONTEXT_LEN {
+                // The `peek().is_some()` immediately above guarantees
+                // `next()` returns Some; `unwrap_or_default()` keeps
+                // the `unwrap_used` lint quiet without panicking even
+                // in the (impossible) None case.
+                group.push(hunks.next().unwrap_or_default());
+            } else {
+                break;
+            }
+        }
+
+        let group_before_start = group.first().map(|h| h.before.start).unwrap_or(0).saturating_sub(HUNK_CONTEXT_LEN);
+        let group_before_end = (group.last().map(|h| h.before.end).unwrap_or(0) + HUNK_CONTEXT_LEN).min(before_total);
+        let group_after_start = group.first().map(|h| h.after.start).unwrap_or(0).saturating_sub(HUNK_CONTEXT_LEN);
+        let group_after_end = (group.last().map(|h| h.after.end).unwrap_or(0) + HUNK_CONTEXT_LEN).min(after_total);
+
+        sink.lines.push(DiffLine::new(
+            DiffLineKind::HunkHeader,
+            hunk_header_str(
+                group_before_start,
+                group_before_end.saturating_sub(group_before_start),
+                group_after_start,
+                group_after_end.saturating_sub(group_after_start),
+            ),
+        ));
+
+        // Walk the before side as a cursor; for each hunk emit the
+        // intervening context (lines `cursor..hunk.before.start`),
+        // then the hunk's deletions, then the hunk's additions, then
+        // advance the cursor past the deletions.
+        let mut cursor = group_before_start;
+        for h in &group {
+            while cursor < h.before.start {
+                push_token_line(sink.lines, DiffLineKind::Context, &input, cursor, /* before */ true);
+                cursor += 1;
+            }
+            for i in h.before.start..h.before.end {
+                push_token_line(sink.lines, DiffLineKind::Del, &input, i, /* before */ true);
+                sink.stats.deletions += 1;
+                file_del += 1;
+            }
+            cursor = h.before.end;
+            for i in h.after.start..h.after.end {
+                push_token_line(sink.lines, DiffLineKind::Add, &input, i, /* before */ false);
+                sink.stats.insertions += 1;
+                file_add += 1;
+            }
+        }
+        while cursor < group_before_end {
+            push_token_line(sink.lines, DiffLineKind::Context, &input, cursor, /* before */ true);
+            cursor += 1;
+        }
+    }
+
+    (file_add, file_del)
+}
+
+/// Pull line bytes out of the interner for a given token offset on
+/// either side and push them as a `DiffLine` of `kind`. Trailing
+/// newline (kept by `imara-diff`'s tokenizer to detect EOL changes)
+/// is stripped — the renderer prepends its own marker at draw time.
+///
+/// `idx` is always a valid offset into the chosen side: `render_unified`
+/// only ever feeds indices it pulled from `Diff::hunks()` on this same
+/// `InternedInput`, and the cursor walks `[group_before_start, group_before_end)`
+/// which is clamped to the side's length. Likewise for the after side
+/// (`h.after.start..h.after.end` ⊆ `0..input.after.len()`).
+fn push_token_line(
+    lines: &mut Vec<DiffLine>,
+    kind: DiffLineKind,
+    input: &InternedInput<&[u8]>,
+    idx: u32,
+    before: bool,
+) {
+    #[expect(clippy::indexing_slicing, reason = "idx is bounded by render_unified's hunk walk; see fn doc")]
+    let token = if before { input.before[idx as usize] } else { input.after[idx as usize] };
+    let bytes = input.interner[token];
+    let trimmed = bytes.strip_suffix(b"\n").unwrap_or(bytes);
+    lines.push(DiffLine::new(kind, String::from_utf8_lossy(trimmed)));
+}
+
+/// Format a unified-diff hunk header from already-computed ranges.
+/// Inputs are 0-based line indices; output uses the unified-diff
+/// convention of `0` for the start of an empty range and otherwise
+/// `start + 1` (1-based).
+fn hunk_header_str(or_start: u32, or_len: u32, nr_start: u32, nr_len: u32) -> String {
+    let or_display_start = if or_len == 0 { 0 } else { or_start + 1 };
+    let nr_display_start = if nr_len == 0 { 0 } else { nr_start + 1 };
+    format!("@@ -{or_display_start},{or_len} +{nr_display_start},{nr_len} @@")
 }
 
 /// Reason a file's inline diff was omitted. Each maps to a single
@@ -313,77 +430,40 @@ fn change_path(change: &gix::diff::tree::recorder::Change) -> String {
     path.to_str_lossy().into_owned()
 }
 
-/// Build a `@@ -old_start,old_len +new_start,new_len @@` header that covers
-/// the entire grouped op set, not just its first op. The earlier
-/// implementation used `group.first()` for both start and length, which
-/// truncated the range on any group containing more than one op
-/// (e.g. Context + Replace + Context) — the emitted header would describe
-/// only the leading context.
-pub fn hunk_header(group: &[similar::DiffOp]) -> String {
-    let or_start = group.first().map(|op| op.old_range().start).unwrap_or(0);
-    let or_end = group.last().map(|op| op.old_range().end).unwrap_or(0);
-    let nr_start = group.first().map(|op| op.new_range().start).unwrap_or(0);
-    let nr_end = group.last().map(|op| op.new_range().end).unwrap_or(0);
-    let or_len = or_end.saturating_sub(or_start);
-    let nr_len = nr_end.saturating_sub(nr_start);
-    // Unified-diff convention: when a side's range is empty, the start
-    // is reported as 0 (the line before which the insertion happens,
-    // or after which the deletion happens). Otherwise it's the 1-based
-    // line number of the first line in the range.
-    let or_display_start = if or_len == 0 { 0 } else { or_start + 1 };
-    let nr_display_start = if nr_len == 0 { 0 } else { nr_start + 1 };
-    format!("@@ -{or_display_start},{or_len} +{nr_display_start},{nr_len} @@")
-}
-
-fn push_change(
-    lines: &mut Vec<DiffLine>,
-    stats: &mut DiffStats,
-    file_add: &mut usize,
-    file_del: &mut usize,
-    tag: ChangeTag,
-    value: &str,
-) {
-    let v = value.trim_end_matches('\n');
-    match tag {
-        ChangeTag::Insert => {
-            stats.insertions += 1;
-            *file_add += 1;
-            lines.push(DiffLine::new(DiffLineKind::Add, v));
-        }
-        ChangeTag::Delete => {
-            stats.deletions += 1;
-            *file_del += 1;
-            lines.push(DiffLine::new(DiffLineKind::Del, v));
-        }
-        ChangeTag::Equal => {
-            lines.push(DiffLine::new(DiffLineKind::Context, v));
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
-    use super::{MAX_INLINE_DIFF_BYTES, SkipReason, classify_skip, hunk_header};
-    use similar::TextDiff;
+    use super::{DiffSink, MAX_INLINE_DIFF_BYTES, SkipReason, classify_skip, render_file_modification};
+    use crate::model::{DiffFlags, DiffLine, DiffLineKind, DiffStats, FileStat};
+
+    /// Drive `render_file_modification` and pull out the hunk-header
+    /// strings it emitted. The header math is most robustly checked
+    /// against the public renderer; that way the imara-diff swap is
+    /// also exercised end-to-end.
+    fn headers_for(old: &[u8], new: &[u8]) -> Vec<String> {
+        let mut lines: Vec<DiffLine> = Vec::new();
+        let mut stats = DiffStats { files: 0, insertions: 0, deletions: 0 };
+        let mut files: Vec<FileStat> = Vec::new();
+        let mut flags = DiffFlags::default();
+        {
+            let mut sink = DiffSink { lines: &mut lines, stats: &mut stats, files: &mut files, flags: &mut flags };
+            render_file_modification(&mut sink, "x.txt", old, new);
+        }
+        lines
+            .into_iter()
+            .filter_map(|l| if matches!(l.kind, DiffLineKind::HunkHeader) { Some(l.text) } else { None })
+            .collect()
+    }
 
     #[test]
-    fn header_spans_full_group_not_just_first_op() {
-        let old = "a\nb\nc\nd\ne\n";
-        let new = "a\nb\nX\nd\ne\n";
-        let diff = TextDiff::from_lines(old, new);
-        let groups: Vec<_> = diff.grouped_ops(3).into_iter().collect();
-        assert_eq!(groups.len(), 1, "expected one grouped hunk for this small diff");
-        assert_eq!(hunk_header(&groups[0]), "@@ -1,5 +1,5 @@");
+    fn header_for_single_replace_in_middle() {
+        let headers = headers_for(b"a\nb\nc\nd\ne\n", b"a\nb\nX\nd\ne\n");
+        assert_eq!(headers, vec!["@@ -1,5 +1,5 @@".to_string()]);
     }
 
     #[test]
     fn header_for_pure_insertion_at_end() {
-        let old = "a\nb\n";
-        let new = "a\nb\nc\nd\n";
-        let diff = TextDiff::from_lines(old, new);
-        let groups: Vec<_> = diff.grouped_ops(3).into_iter().collect();
-        assert_eq!(groups.len(), 1);
-        assert_eq!(hunk_header(&groups[0]), "@@ -1,2 +1,4 @@");
+        let headers = headers_for(b"a\nb\n", b"a\nb\nc\nd\n");
+        assert_eq!(headers, vec!["@@ -1,2 +1,4 @@".to_string()]);
     }
 
     #[test]
@@ -393,28 +473,45 @@ mod tests {
         new_lines[2] = "CHANGED\n".to_string();
         new_lines[27] = "CHANGED\n".to_string();
         let new: String = new_lines.concat();
-        let diff = TextDiff::from_lines(&old, &new);
-        let groups: Vec<_> = diff.grouped_ops(3).into_iter().collect();
-        assert_eq!(groups.len(), 2, "expected two separate hunks");
-        let headers: Vec<String> = groups.iter().map(|g| hunk_header(g)).collect();
-        assert_eq!(headers[0], "@@ -1,6 +1,6 @@");
-        assert_eq!(headers[1], "@@ -25,6 +25,6 @@");
+        let headers = headers_for(old.as_bytes(), new.as_bytes());
+        assert_eq!(headers, vec!["@@ -1,6 +1,6 @@".to_string(), "@@ -25,6 +25,6 @@".to_string()]);
     }
 
     #[test]
     fn header_uses_zero_start_for_empty_old_range() {
-        let diff = TextDiff::from_lines("", "x\ny\n");
-        let groups: Vec<_> = diff.grouped_ops(3).into_iter().collect();
-        assert_eq!(groups.len(), 1);
-        assert_eq!(hunk_header(&groups[0]), "@@ -0,0 +1,2 @@");
+        let headers = headers_for(b"", b"x\ny\n");
+        assert_eq!(headers, vec!["@@ -0,0 +1,2 @@".to_string()]);
     }
 
     #[test]
     fn header_uses_zero_start_for_empty_new_range() {
-        let diff = TextDiff::from_lines("x\ny\n", "");
-        let groups: Vec<_> = diff.grouped_ops(3).into_iter().collect();
-        assert_eq!(groups.len(), 1);
-        assert_eq!(hunk_header(&groups[0]), "@@ -1,2 +0,0 @@");
+        let headers = headers_for(b"x\ny\n", b"");
+        assert_eq!(headers, vec!["@@ -1,2 +0,0 @@".to_string()]);
+    }
+
+    #[test]
+    fn modification_emits_add_and_del_lines_at_expected_kinds() {
+        let mut lines: Vec<DiffLine> = Vec::new();
+        let mut stats = DiffStats { files: 0, insertions: 0, deletions: 0 };
+        let mut files: Vec<FileStat> = Vec::new();
+        let mut flags = DiffFlags::default();
+        {
+            let mut sink = DiffSink { lines: &mut lines, stats: &mut stats, files: &mut files, flags: &mut flags };
+            render_file_modification(&mut sink, "x.txt", b"a\nb\nc\n", b"a\nB\nc\n");
+        }
+        let adds: Vec<&str> = lines
+            .iter()
+            .filter_map(|l| if matches!(l.kind, DiffLineKind::Add) { Some(l.text.as_str()) } else { None })
+            .collect();
+        let dels: Vec<&str> = lines
+            .iter()
+            .filter_map(|l| if matches!(l.kind, DiffLineKind::Del) { Some(l.text.as_str()) } else { None })
+            .collect();
+        assert_eq!(adds, vec!["B"]);
+        assert_eq!(dels, vec!["b"]);
+        assert_eq!(stats.insertions, 1);
+        assert_eq!(stats.deletions, 1);
+        assert_eq!(files.len(), 1);
     }
 
     #[test]

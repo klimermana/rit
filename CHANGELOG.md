@@ -17,6 +17,11 @@ Versioning](https://semver.org/spec/v2.0.0.html).
   drops from 68 ms to 6.0 ms (~11× faster). A faint
   "(scanning for untracked files…)" placeholder sits in the spot
   until the result arrives.
+- Per-file diff rendering swapped from the `similar` crate to
+  `imara-diff`'s Histogram algorithm (a port of git's libxdiff).
+  Matches `git diff -U3`'s hunk grouping and produces identical
+  headers. Indent-based slider postprocessing keeps hunks aligned on
+  syntactic boundaries.
 
 - Log search now also matches against ref names attached to a commit
   (tags, local branches, remote branches, HEAD) alongside the existing
