@@ -9,6 +9,15 @@ Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Changed
 
+- Working-tree diff: the untracked-files walk now runs on a side
+  thread instead of the diff critical path. The diff pane shows
+  staged/unstaged content as soon as the index walk finishes and the
+  `?? path` rows fold in once the dir walk completes. On a 5000-file
+  flat checkout the bench `working_tree_diff/wide_checkout_5000_tracked`
+  drops from 68 ms to 6.0 ms (~11× faster). A faint
+  "(scanning for untracked files…)" placeholder sits in the spot
+  until the result arrives.
+
 - Log search now also matches against ref names attached to a commit
   (tags, local branches, remote branches, HEAD) alongside the existing
   message and author fields. Useful for jumping to a release commit by

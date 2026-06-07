@@ -100,6 +100,14 @@ pub struct DiffDocument {
     /// Per-document guardrail state — surfaced in the diff title bar
     /// via `truncation_tag`.
     pub flags: DiffFlags,
+    /// Index in `body` of the "(scanning for untracked files…)"
+    /// placeholder line. Set by `compute_working_tree_diff` when it
+    /// defers the untracked walk to a side thread; consumed by the
+    /// app on `InspectMsg::UntrackedFilesUpdate` to splice the actual
+    /// `?? path` entries into place. `None` once consumed (so stale
+    /// updates from a prior LoadDiff become no-ops) and `None` for
+    /// commit diffs, which have no untracked section.
+    pub untracked_anchor: Option<usize>,
 }
 
 /// Out-of-band info about how the diff was produced — the binary /

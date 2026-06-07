@@ -24,7 +24,7 @@ use crate::{
         search::{commit_matches, jump_first_at_or_after, should_narrow},
     },
     git::{GitMsg, GitReq, HistoryMsg, HistoryReq, InspectMsg, InspectReq, walk::refs_lower_from_refs},
-    model::{DiffTarget, RepoInfo},
+    model::{DiffLine, DiffLineKind, DiffTarget, RepoInfo},
     ui,
 };
 use anyhow::Result;
@@ -270,7 +270,53 @@ impl App {
                     }
                 }
             }
+            InspectMsg::UntrackedFilesUpdate { target, paths } => {
+                self.apply_untracked_update(target, paths);
+            }
         }
+    }
+
+    /// Splice the side-thread untracked-files result into the current
+    /// working-tree `DiffDocument`, in place of the placeholder line.
+    ///
+    /// Gate checks (any failure = silently drop, the update is stale):
+    /// - the diff pane is still showing this `target`
+    /// - the document has an `untracked_anchor` (consuming it makes
+    ///   stale follow-ups no-ops, including after a future reload kicks
+    ///   off a second walk while the first is mid-flight)
+    fn apply_untracked_update(&mut self, target: DiffTarget, paths: Vec<String>) {
+        if self.diff.target != Some(target) {
+            return;
+        }
+        let Some(doc) = self.diff.document.as_mut() else { return };
+        if doc.target != target {
+            return;
+        }
+        let Some(anchor) = doc.untracked_anchor.take() else { return };
+
+        // Pick what replaces the placeholder. When the working tree has
+        // no staged/unstaged changes and no untracked files either, this
+        // is the moment we emit the "clean" message that the diff-time
+        // renderer suppressed pending the walk result.
+        let replacement: Vec<DiffLine> = if !paths.is_empty() {
+            paths.into_iter().map(|p| DiffLine::new(DiffLineKind::StatusTheirs, format!("?? {p}"))).collect()
+        } else if doc.stats.files == 0 {
+            vec![DiffLine::new(DiffLineKind::Good, "Nothing to commit, working tree clean")]
+        } else {
+            // Staged or unstaged changes exist but no untracked entries —
+            // splice the placeholder out without leaving a stand-in line.
+            Vec::new()
+        };
+
+        doc.body.splice(anchor..anchor + 1, replacement);
+
+        // Body indices shifted, so the lowercased mirrors and any
+        // active diff-search match set are stale. Mirror the
+        // invalidation path `DiffLoaded` already does so the next
+        // search keystroke sees fresh content.
+        self.diff.header_lower = None;
+        self.diff.body_lower = None;
+        self.update_diff_matches();
     }
 
     pub(crate) fn reload(&mut self) {

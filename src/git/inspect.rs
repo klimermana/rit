@@ -35,4 +35,13 @@ pub enum InspectMsg {
         /// differs from HEAD; `Some(false)` for a clean tree.
         dirty: Option<bool>,
     },
+    /// Follow-up to a `LoadDiff(WorkingTree)` once the off-thread
+    /// untracked-files walk completes. The app splices `paths` into the
+    /// current `DiffDocument` at its `untracked_anchor`. Carries `target`
+    /// so the app can ignore stale results after the user navigated to
+    /// another diff before the walk finished.
+    UntrackedFilesUpdate {
+        target: DiffTarget,
+        paths: Vec<String>,
+    },
 }

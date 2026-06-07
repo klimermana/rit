@@ -21,6 +21,7 @@ pub fn empty_error_document(target: DiffTarget, e: anyhow::Error) -> DiffDocumen
         files: Vec::new(),
         stats: DiffStats { files: 0, insertions: 0, deletions: 0 },
         flags: DiffFlags::default(),
+        untracked_anchor: None,
     }
 }
 
@@ -81,7 +82,7 @@ fn compute_commit_diff_inner(
         render_diff_records(repo, &records, &mut sink);
     }
 
-    Ok(DiffDocument { target, header, body, files, stats, flags })
+    Ok(DiffDocument { target, header, body, files, stats, flags, untracked_anchor: None })
 }
 
 /// Render previously-computed tree-diff records into the sink. Split

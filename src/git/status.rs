@@ -3,20 +3,34 @@
 //! staged section, and the unstaged section, all into the same
 //! `DiffDocument`. Pre-cleanup this code did three separate
 //! `repo.status()` passes; collapsing them into one is the 5c perf win.
+//!
+//! Untracked-file discovery is split off the diff critical path: the
+//! diff-view entry point `compute_working_tree_diff` calls
+//! `sweep_status` with `UntrackedFiles::None` (so the worktree dir
+//! walk is skipped), parks a placeholder line in the status header,
+//! and exposes the anchor via `DiffDocument.untracked_anchor`. The
+//! worker spawns `collect_untracked_paths` on a side thread; when it
+//! returns, an `InspectMsg::UntrackedFilesUpdate` splices the actual
+//! `?? path` rows into place. The standalone status pane
+//! (`compute_status`) keeps the synchronous full sweep.
 
 use crate::{
     git::diff::{DiffSink, render_file_addition, render_file_deletion, render_file_modification},
     model::{DiffDocument, DiffFlags, DiffLine, DiffLineKind, DiffStats, DiffTarget, FileStat, StatusDocument},
 };
 use anyhow::Result;
-use gix::ObjectId;
+use gix::{ObjectId, status::UntrackedFiles};
 
-/// Working-tree status pane. Reuses `compute_working_tree_diff`'s body
-/// production so the status pane and the working-tree diff pane stay in
-/// lockstep — there is exactly one renderer.
+/// Working-tree status pane. Synchronous full sweep — untracked files
+/// are inline rather than streamed, since the status pane is the
+/// dedicated "show me everything `git status` would" view.
+///
+/// The body is produced via `assemble_working_tree_body` with the same
+/// renderers `compute_working_tree_diff` uses, so the staged/unstaged
+/// rendering stays in lockstep across the two entry points.
 pub fn compute_status(repo: &gix::Repository) -> StatusDocument {
-    let doc = compute_working_tree_diff(repo, DiffTarget::WorkingTree);
-    StatusDocument { lines: doc.body }
+    let (body, _, _, _, _) = assemble_working_tree_body(repo, UntrackedFiles::Collapsed, /* placeholder */ false);
+    StatusDocument { lines: body }
 }
 
 fn render_staged_change(repo: &gix::Repository, sink: &mut DiffSink<'_>, change: gix::diff::index::Change) -> usize {
@@ -98,15 +112,23 @@ struct StatusSweep {
 /// consumer kicked off its own `repo.status(...)` pass, paying for the
 /// stat-walk three times per working-tree view.
 ///
+/// `untracked_files` controls whether the worktree dir walk runs:
+/// `None` skips it entirely (so the resulting `short` map has no `??`
+/// entries and `DirectoryContents` iterator items are not produced) —
+/// the fast path used by `compute_working_tree_diff` so a separate
+/// side thread can stream untracked entries in afterwards. `Collapsed`
+/// keeps the legacy behavior for callers (like `compute_status`) that
+/// want the full sweep synchronously.
+///
 /// Returns `Err` when the platform / iterator can't be created
 /// (corrupt index, detached worktree, ODB error, …). Callers decide
 /// how to surface that.
-fn sweep_status(repo: &gix::Repository) -> Result<StatusSweep> {
-    use gix::status::{UntrackedFiles, index_worktree, plumbing::index_as_worktree};
+fn sweep_status(repo: &gix::Repository, untracked_files: UntrackedFiles) -> Result<StatusSweep> {
+    use gix::status::{index_worktree, plumbing::index_as_worktree};
     use std::collections::BTreeMap;
 
     let platform = repo.status(gix::progress::Discard)?;
-    let iter = platform.untracked_files(UntrackedFiles::Collapsed).into_iter(Vec::new())?;
+    let iter = platform.untracked_files(untracked_files).into_iter(Vec::new())?;
 
     let mut short: BTreeMap<String, (char, char)> = BTreeMap::new();
     let mut staged: Vec<gix::diff::index::Change> = Vec::new();
@@ -178,10 +200,24 @@ fn sweep_status(repo: &gix::Repository) -> Result<StatusSweep> {
 }
 
 /// Render the short-status block from a pre-collected `StatusSweep`.
-/// An empty `short` map means "actually clean".
-fn render_short_status(short: &std::collections::BTreeMap<String, (char, char)>) -> Vec<DiffLine> {
-    if short.is_empty() {
+/// An empty `short` map means "actually clean" *only* when the caller
+/// already collected untracked files synchronously. When
+/// `untracked_pending` is true the caller is going to drop a
+/// placeholder right after this block; emitting "Nothing to commit"
+/// here would race the side-thread result and clobber it on apply.
+fn render_short_status(
+    short: &std::collections::BTreeMap<String, (char, char)>,
+    untracked_pending: bool,
+) -> Vec<DiffLine> {
+    if short.is_empty() && !untracked_pending {
         return vec![DiffLine::new(DiffLineKind::Good, "Nothing to commit, working tree clean")];
+    }
+    if short.is_empty() {
+        // Pending case: leave the block empty; the placeholder line
+        // appended by the caller covers it until untracked arrives,
+        // at which point the app picks the right message based on
+        // what was found.
+        return Vec::new();
     }
     let mut out = Vec::with_capacity(short.len());
     for (path, &(a, b)) in short {
@@ -255,13 +291,28 @@ fn render_unstaged_section(repo: &gix::Repository, sink: &mut DiffSink<'_>, item
     emitted
 }
 
-/// Assemble the working-tree diff document. The key win over the prior
-/// implementation: only one `repo.status(...)` pass instead of three
-/// (the staged renderer, unstaged renderer, and short-status header
-/// each used to do their own). On a non-tiny repo the stat-walk
-/// dominates, so collapsing the three passes into one is the biggest
-/// single perf change in this stage.
-pub fn compute_working_tree_diff(repo: &gix::Repository, target: DiffTarget) -> DiffDocument {
+/// Text of the faint placeholder reserved for untracked entries while
+/// the side-thread walk is in flight. Lives at `body[untracked_anchor]`
+/// until `InspectMsg::UntrackedFilesUpdate` arrives.
+pub const UNTRACKED_PENDING_PLACEHOLDER: &str = "(scanning for untracked files…)";
+
+/// Shared body assembly used by both `compute_working_tree_diff` and
+/// `compute_status`. Returns the rendered `body` plus the aggregates
+/// the diff-view entry point needs to stuff into a `DiffDocument`
+/// (`files`, `stats`, `flags`, and the placeholder anchor when one
+/// was inserted).
+///
+/// When `reserve_untracked_anchor` is true, a faint placeholder line
+/// is appended right after the short-status section and its index is
+/// returned in the last tuple slot. The placeholder is the contract
+/// between this renderer and the app's `UntrackedFilesUpdate` handler:
+/// finding the anchor means the document is still waiting for its
+/// untracked rows.
+fn assemble_working_tree_body(
+    repo: &gix::Repository,
+    untracked_files: UntrackedFiles,
+    reserve_untracked_anchor: bool,
+) -> (Vec<DiffLine>, Vec<FileStat>, DiffStats, DiffFlags, Option<usize>) {
     let mut body: Vec<DiffLine> = Vec::new();
     let mut files: Vec<FileStat> = Vec::new();
     let mut stats = DiffStats { files: 0, insertions: 0, deletions: 0 };
@@ -270,11 +321,22 @@ pub fn compute_working_tree_diff(repo: &gix::Repository, target: DiffTarget) -> 
     body.push(DiffLine::new(DiffLineKind::SectionTitle, "Working Tree Status"));
     body.push(DiffLine::new(DiffLineKind::Blank, ""));
 
-    let sweep = sweep_status(repo);
+    let sweep = sweep_status(repo, untracked_files);
     match &sweep {
-        Ok(items) => body.extend(render_short_status(&items.short)),
+        Ok(items) => body.extend(render_short_status(&items.short, reserve_untracked_anchor)),
         Err(e) => body.push(DiffLine::new(DiffLineKind::Faint, format!("Status query failed: {e}"))),
     }
+
+    // Park the placeholder at the end of the short-status block so
+    // splicing it later doesn't shift the staged/unstaged section
+    // headers by more than the count of untracked rows that land.
+    let untracked_anchor = if reserve_untracked_anchor {
+        let idx = body.len();
+        body.push(DiffLine::new(DiffLineKind::Faint, UNTRACKED_PENDING_PLACEHOLDER));
+        Some(idx)
+    } else {
+        None
+    };
 
     body.push(DiffLine::new(DiffLineKind::Blank, ""));
     body.push(DiffLine::new(DiffLineKind::SectionStaged, "── Staged ──────────────────────────────────────────────"));
@@ -304,12 +366,59 @@ pub fn compute_working_tree_diff(repo: &gix::Repository, target: DiffTarget) -> 
         }
     }
 
-    DiffDocument { target, header: Vec::new(), body, files, stats, flags }
+    (body, files, stats, flags, untracked_anchor)
+}
+
+/// Assemble the working-tree diff document with the untracked walk
+/// deferred to a side thread. The returned document has a
+/// `untracked_anchor` pointing at a faint placeholder in `body`; the
+/// worker spawns `collect_untracked_paths` separately and an
+/// `InspectMsg::UntrackedFilesUpdate` replaces the placeholder once
+/// the walk finishes. On a wide-checkout monorepo, skipping the dir
+/// walk here is what closes the gap with `git diff`'s wall clock.
+pub fn compute_working_tree_diff(repo: &gix::Repository, target: DiffTarget) -> DiffDocument {
+    let (body, files, stats, flags, untracked_anchor) =
+        assemble_working_tree_body(repo, UntrackedFiles::None, /* placeholder */ true);
+    DiffDocument { target, header: Vec::new(), body, files, stats, flags, untracked_anchor }
+}
+
+/// Walk just the untracked-files dimension of `gix::status`, returning
+/// the entries the dir walk surfaces. Used by the worker's side thread
+/// to fill in a `DiffDocument`'s placeholder anchor without blocking
+/// the diff-view's first paint.
+///
+/// We re-enter `repo.status(...)` here rather than reusing the
+/// fast-path sweep because `gix::status` exposes one combined
+/// iterator: there's no public knob to ask for just the dir walk. The
+/// extra index-walk this implies is the same constant cost the
+/// fast-path already paid, run concurrently on the side thread. Net
+/// CPU goes up; wall clock for the user-visible diff goes down, which
+/// is the trade we want.
+pub fn collect_untracked_paths(repo: &gix::Repository) -> Vec<String> {
+    use gix::status::{Item, index_worktree};
+
+    let Ok(platform) = repo.status(gix::progress::Discard) else {
+        return Vec::new();
+    };
+    let Ok(iter) = platform.untracked_files(UntrackedFiles::Collapsed).into_iter(Vec::new()) else {
+        return Vec::new();
+    };
+
+    let mut paths: Vec<String> = Vec::new();
+    for item in iter.flatten() {
+        if let Item::IndexWorktree(index_worktree::Item::DirectoryContents { entry, .. }) = item
+            && matches!(entry.status, gix::dir::entry::Status::Untracked)
+        {
+            paths.push(entry.rela_path.to_string());
+        }
+    }
+    paths.sort();
+    paths
 }
 
 #[cfg(test)]
 mod tests {
-    use super::compute_working_tree_diff;
+    use super::{UNTRACKED_PENDING_PLACEHOLDER, collect_untracked_paths, compute_status, compute_working_tree_diff};
     use crate::{
         model::{DiffLineKind, DiffTarget},
         test_support::{commit_all, make_fixture_repo, run_git, write_file},
@@ -348,6 +457,12 @@ mod tests {
         assert!(paths.contains(&"unstaged.txt"));
         assert!(doc.stats.files >= 2);
         assert!(doc.stats.insertions > 0);
+
+        // Untracked walk is deferred: a placeholder sits at the
+        // anchor index, and `?? path` rows have not been emitted yet.
+        let anchor = doc.untracked_anchor.expect("working-tree diff defers untracked walk");
+        assert_eq!(doc.body[anchor].text, UNTRACKED_PENDING_PLACEHOLDER);
+        assert!(!doc.body.iter().any(|l| l.text.starts_with("?? ")), "no untracked rows on the diff critical path");
     }
 
     #[test]
@@ -360,11 +475,51 @@ mod tests {
         let doc = compute_working_tree_diff(&repo, DiffTarget::WorkingTree);
         let body_text: String = doc.body.iter().map(|l| l.text.as_str()).collect::<Vec<_>>().join("\n");
 
-        assert!(body_text.contains("Nothing to commit, working tree clean"));
+        // The "Nothing to commit" line is now chosen at apply-time by
+        // the app when it learns the untracked list is also empty —
+        // here we just assert the staged/unstaged placeholders and
+        // the pending untracked placeholder are present.
+        assert!(body_text.contains(UNTRACKED_PENDING_PLACEHOLDER));
         assert!(body_text.contains("(no staged changes)"));
         assert!(body_text.contains("(no unstaged changes)"));
+        assert!(doc.untracked_anchor.is_some(), "anchor reserved for the pending untracked walk");
         assert_eq!(doc.stats.files, 0);
         assert_eq!(doc.stats.insertions, 0);
         assert_eq!(doc.stats.deletions, 0);
+    }
+
+    #[test]
+    fn collect_untracked_paths_returns_only_untracked_entries() {
+        let (td, repo) = make_fixture_repo();
+        let path = td.path();
+        write_file(path, "tracked.txt", "hi\n");
+        commit_all(path, "baseline");
+        // Modify tracked, add a new untracked file, stage one change.
+        write_file(path, "tracked.txt", "hi\nthere\n");
+        write_file(path, "untracked_a.txt", "x\n");
+        write_file(path, "untracked_b.txt", "y\n");
+
+        let paths = collect_untracked_paths(&repo);
+        assert_eq!(paths, vec!["untracked_a.txt".to_string(), "untracked_b.txt".to_string()]);
+    }
+
+    #[test]
+    fn compute_status_includes_untracked_inline() {
+        // The standalone status pane stays synchronous: untracked
+        // rows are in the document by the time it returns.
+        let (td, repo) = make_fixture_repo();
+        let path = td.path();
+        write_file(path, "tracked.txt", "hi\n");
+        commit_all(path, "baseline");
+        write_file(path, "new_untracked.txt", "x\n");
+
+        let doc = compute_status(&repo);
+        let body_text: String = doc.lines.iter().map(|l| l.text.as_str()).collect::<Vec<_>>().join("\n");
+        assert!(body_text.contains("?? new_untracked.txt"));
+        assert!(
+            !body_text.contains(UNTRACKED_PENDING_PLACEHOLDER),
+            "status pane should not emit the async placeholder"
+        );
+        let _ = DiffLineKind::Faint;
     }
 }

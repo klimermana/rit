@@ -70,6 +70,24 @@ fn await_diff(rx: &crossbeam_channel::Receiver<GitMsg>) {
     }
 }
 
+/// Drain until the off-thread untracked-files walk reports back.
+/// Used by `working_tree_diff` benches as untimed teardown between
+/// iterations so the next iteration's status sweep doesn't contend
+/// with the previous side-thread scan (which would conflate
+/// concurrent FS access into the measurement). Returns silently if
+/// no untracked update arrives — commit-diff requests don't spawn
+/// one.
+fn drain_untracked_update(rx: &crossbeam_channel::Receiver<GitMsg>) {
+    let timeout = Duration::from_secs(30);
+    loop {
+        match rx.recv_timeout(timeout) {
+            Ok(GitMsg::Inspect(InspectMsg::UntrackedFilesUpdate { .. })) => return,
+            Ok(_) => {}
+            Err(_) => return,
+        }
+    }
+}
+
 fn bench_diff_generation(c: &mut Criterion) {
     let mut group = c.benchmark_group("diff_generation");
     group.sample_size(20);
@@ -100,34 +118,94 @@ fn bench_diff_generation(c: &mut Criterion) {
 /// shellouts. Setup: a fixture repo with one baseline commit, then one
 /// staged modification and one unstaged modification — so both renderers
 /// have content to produce.
+///
+/// Two scenarios, sharing a group so criterion compares them side by side:
+///
+/// - `staged_plus_unstaged` — 2 tracked files, exercises just the
+///   per-file diff render.
+/// - `wide_checkout_5000_tracked` — 5000 tracked files at the worktree
+///   root, two of them modified. The dir-walk cost of `gix::status`
+///   dominates here; this is the scenario monorepos look like and the
+///   one the untracked-files-async change targets.
 fn bench_working_tree_diff(c: &mut Criterion) {
     let mut group = c.benchmark_group("working_tree_diff");
     group.sample_size(20);
 
-    let fix = common::FixtureRepo::new();
-    let path = fix.path();
-    // Baseline so the index has prior content.
-    std::fs::write(path.join("staged.txt"), "alpha\nbeta\ngamma\n").expect("write");
-    std::fs::write(path.join("unstaged.txt"), "one\ntwo\nthree\n").expect("write");
-    common::run_git(path, &["add", "-A"]);
-    common::run_git(path, &["commit", "-q", "-m", "baseline"]);
-    // Stage one change, leave another unstaged.
-    std::fs::write(path.join("staged.txt"), "alpha\nBETA\ngamma\nfour\n").expect("write");
-    common::run_git(path, &["add", "staged.txt"]);
-    std::fs::write(path.join("unstaged.txt"), "one\nTWO\nthree\n").expect("write");
+    {
+        let fix = common::FixtureRepo::new();
+        let path = fix.path();
+        // Baseline so the index has prior content.
+        std::fs::write(path.join("staged.txt"), "alpha\nbeta\ngamma\n").expect("write");
+        std::fs::write(path.join("unstaged.txt"), "one\ntwo\nthree\n").expect("write");
+        common::run_git(path, &["add", "-A"]);
+        common::run_git(path, &["commit", "-q", "-m", "baseline"]);
+        // Stage one change, leave another unstaged.
+        std::fs::write(path.join("staged.txt"), "alpha\nBETA\ngamma\nfour\n").expect("write");
+        common::run_git(path, &["add", "staged.txt"]);
+        std::fs::write(path.join("unstaged.txt"), "one\nTWO\nthree\n").expect("write");
 
-    let repo_path = fix.path_buf();
-    let (req_tx, msg_rx, _, handle) = boot_worker(&repo_path);
+        let repo_path = fix.path_buf();
+        let (req_tx, msg_rx, _, handle) = boot_worker(&repo_path);
 
-    group.bench_function("staged_plus_unstaged", |b| {
-        b.iter(|| {
-            req_tx.send(GitReq::Inspect(InspectReq::LoadDiff(DiffTarget::WorkingTree))).expect("send");
-            await_diff(&msg_rx);
+        group.bench_function("staged_plus_unstaged", |b| {
+            b.iter_custom(|iters| {
+                let mut total = Duration::ZERO;
+                for _ in 0..iters {
+                    let start = std::time::Instant::now();
+                    req_tx.send(GitReq::Inspect(InspectReq::LoadDiff(DiffTarget::WorkingTree))).expect("send");
+                    await_diff(&msg_rx);
+                    total += start.elapsed();
+                    // Untimed: let the previous iter's side-thread
+                    // untracked walk finish so the next iter's status
+                    // sweep doesn't share FS bandwidth with it.
+                    drain_untracked_update(&msg_rx);
+                }
+                total
+            });
         });
-    });
 
-    drop(req_tx);
-    _ = handle.join();
+        drop(req_tx);
+        _ = handle.join();
+    }
+
+    {
+        let fix = common::FixtureRepo::new();
+        // 5000 tracked files at the worktree root. `seed_commits_fast_with_files`
+        // leaves the worktree synced to HEAD, so the index walk has plenty
+        // of tracked entries to stat and the dir walk has many on-disk
+        // entries to compare against the index.
+        fix.seed_commits_fast_with_files(1, 5000);
+        let path = fix.path();
+
+        // Stage one change, leave one unstaged, both on existing tracked
+        // files (so the staged/unstaged sections have a tiny amount of
+        // content to render — the work being measured is the status walk,
+        // not the diff body).
+        std::fs::write(path.join("file_0000000.txt"), "modified-staged\n").expect("write");
+        common::run_git(path, &["add", "file_0000000.txt"]);
+        std::fs::write(path.join("file_0000001.txt"), "modified-unstaged\n").expect("write");
+
+        let repo_path = fix.path_buf();
+        let (req_tx, msg_rx, _, handle) = boot_worker(&repo_path);
+
+        group.bench_function("wide_checkout_5000_tracked", |b| {
+            b.iter_custom(|iters| {
+                let mut total = Duration::ZERO;
+                for _ in 0..iters {
+                    let start = std::time::Instant::now();
+                    req_tx.send(GitReq::Inspect(InspectReq::LoadDiff(DiffTarget::WorkingTree))).expect("send");
+                    await_diff(&msg_rx);
+                    total += start.elapsed();
+                    drain_untracked_update(&msg_rx);
+                }
+                total
+            });
+        });
+
+        drop(req_tx);
+        _ = handle.join();
+    }
+
     group.finish();
 }
 

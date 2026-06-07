@@ -321,7 +321,16 @@ fn process_request<'r>(
                 DiffTarget::Commit(id) => diff::compute_commit_diff(repo, id, tree_diff_cache),
                 DiffTarget::WorkingTree => status::compute_working_tree_diff(repo, target),
             };
+            // For working-tree diffs the document carries an
+            // `untracked_anchor`; spawn the dir walk on a side thread
+            // *after* DiffLoaded is on the channel so the UI paints
+            // the staged/unstaged content immediately and the
+            // untracked rows fold in via `UntrackedFilesUpdate`.
+            let needs_untracked_walk = matches!(target, DiffTarget::WorkingTree) && document.untracked_anchor.is_some();
             _ = msg_tx.send(GitMsg::Inspect(InspectMsg::DiffLoaded(document)));
+            if needs_untracked_walk {
+                dirty_handles.0.push(spawn_untracked_scan(repo, target, msg_tx.clone()));
+            }
         }
         GitReq::Inspect(InspectReq::LoadStatus) => {
             let document = status::compute_status(repo);
@@ -376,6 +385,24 @@ fn spawn_dirty_check(repo: &gix::Repository, msg_tx: crossbeam_channel::Sender<G
         let author = meta::working_tree_author(&repo);
         let dirty = meta::quick_is_dirty(&repo);
         _ = msg_tx.send(GitMsg::Inspect(InspectMsg::WorkingTreeMeta { author, dirty }));
+    })
+}
+
+/// Off-thread untracked-files walk for a `LoadDiff(WorkingTree)`. The
+/// diff document has already been sent to the app at this point; this
+/// scan only fills in the `?? path` rows. Same shutdown discipline as
+/// `spawn_dirty_check` — handle goes into the `DirtyJoin` guard so a
+/// bench iteration's teardown waits for the walk rather than letting
+/// it race the next iteration's status sweep.
+fn spawn_untracked_scan(
+    repo: &gix::Repository,
+    target: crate::model::DiffTarget,
+    msg_tx: crossbeam_channel::Sender<GitMsg>,
+) -> std::thread::JoinHandle<()> {
+    let repo = repo.clone();
+    std::thread::spawn(move || {
+        let paths = status::collect_untracked_paths(&repo);
+        _ = msg_tx.send(GitMsg::Inspect(InspectMsg::UntrackedFilesUpdate { target, paths }));
     })
 }
 
