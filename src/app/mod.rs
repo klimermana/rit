@@ -15,7 +15,7 @@ pub mod state;
 
 pub use state::{
     AuthorMode, CommitSearchState, DateMode, DiffSearchState, DiffState, DisplayOptions, Focus, LogRow, LogState,
-    SearchSnapshot, StatusState, WorkingTreeRow, YankFeedback,
+    RefsState, SearchSnapshot, StatusState, WorkingTreeRow, YankFeedback,
 };
 
 use crate::{
@@ -40,6 +40,7 @@ pub struct App {
     pub search: CommitSearchState,
     pub diff: DiffState,
     pub status: StatusState,
+    pub refs: RefsState,
     pub focus: Focus,
     /// Render-time display toggles (`D` date, `A` author, `X` hash).
     pub display: DisplayOptions,
@@ -86,6 +87,7 @@ impl App {
                 body_lower: None,
             },
             status: StatusState { open: false, document: None, scroll: 0, loading: false },
+            refs: RefsState::new(),
             focus: Focus::Log,
             display: DisplayOptions::default(),
             show_help: false,
@@ -269,6 +271,11 @@ impl App {
                 self.status.loading = false;
                 self.status.document = Some(document);
             }
+            InspectMsg::RefsListLoaded(entries) => {
+                self.refs.loading = false;
+                self.refs.entries = entries;
+                self.refs.selected = self.refs.selected.min(self.refs.entries.len().saturating_sub(1));
+            }
             InspectMsg::WorkingTreeMeta { author, dirty } => {
                 if let Some(LogRow::WorkingTree(w)) = self.log.rows.first_mut() {
                     w.author = author.into();
@@ -345,6 +352,14 @@ impl App {
     }
 
     pub(crate) fn reload(&mut self) {
+        // `root: None` keeps the worker's current walk root.
+        self.reload_with_root(None);
+    }
+
+    /// Reset the log/diff/search state and restart the walk. `Some(id)`
+    /// re-roots the walk at that commit (refs-view `Enter`); `None`
+    /// keeps the worker's current root (plain `R`).
+    pub(crate) fn reload_with_root(&mut self, root: Option<gix::ObjectId>) {
         let author = match self.log.rows.first() {
             Some(LogRow::WorkingTree(w)) => w.author.clone(),
             _ => "you".into(),
@@ -366,8 +381,7 @@ impl App {
         self.error = None;
         // Reload restarts the worker's continuous walk; no explicit
         // LoadMore needed, the worker streams batches on its own.
-        // `root: None` keeps the worker's current walk root.
-        self.send_history(HistoryReq::Reload { generation: self.walk_gen, root: None });
+        self.send_history(HistoryReq::Reload { generation: self.walk_gen, root });
         self.send_inspect(InspectReq::RefreshWorkingTreeMeta);
     }
 
@@ -670,6 +684,45 @@ impl App {
     pub(crate) fn diff_scroll_to_bottom(&mut self) {
         let total = self.diff.total_visible_lines();
         self.diff.scroll = total.saturating_sub(self.diff.view_height);
+    }
+
+    /// Open the refs view and request a fresh listing (refs may have
+    /// been created/moved since the last look).
+    pub(crate) fn open_refs_view(&mut self) {
+        self.refs.open = true;
+        self.refs.loading = true;
+        self.refs.selected = 0;
+        self.refs.scroll = 0;
+        self.send_inspect(InspectReq::LoadRefs);
+    }
+
+    /// Move the refs-view selection by `delta`, clamped, keeping the
+    /// selection visible within the pane (clamped at input time — the
+    /// renderer only reads `scroll`).
+    pub(crate) fn refs_move(&mut self, delta: isize) {
+        if self.refs.entries.is_empty() {
+            return;
+        }
+        let last = self.refs.entries.len() - 1;
+        let sel = (self.refs.selected as isize).saturating_add(delta).clamp(0, last as isize);
+        self.refs.selected = usize::try_from(sel).unwrap_or(0);
+        let h = self.refs.view_height.max(1);
+        if self.refs.selected < self.refs.scroll {
+            self.refs.scroll = self.refs.selected;
+        } else if self.refs.selected >= self.refs.scroll + h {
+            self.refs.scroll = self.refs.selected - (h - 1);
+        }
+    }
+
+    /// `Enter` in the refs view: re-root the log at the selected ref.
+    pub(crate) fn refs_activate_selected(&mut self) {
+        let Some(entry) = self.refs.entries.get(self.refs.selected) else {
+            return;
+        };
+        let target = entry.target;
+        self.branch_name = entry.name.to_string();
+        self.refs.open = false;
+        self.reload_with_root(Some(target));
     }
 
     /// `]` / `[`: jump the diff scroll to the next / previous file
@@ -1035,6 +1088,82 @@ mod tests {
         let doc = app.diff.document.as_ref().expect("doc");
         assert_eq!(doc.sections[0].body_start, 0, "sections before the anchor stay put");
         assert_eq!(doc.sections[1].body_start, 4, "sections after the anchor shift by the splice delta");
+    }
+
+    #[test]
+    fn refs_view_opens_requests_and_enter_reroots() {
+        use crate::model::RefEntry;
+        let (mut app, ends) = test_app();
+
+        app.handle_input(key(KeyCode::Char('r'), KeyModifiers::NONE));
+        assert!(app.refs.open && app.refs.loading);
+        assert!(
+            matches!(ends.req_rx.try_recv(), Ok(GitReq::Inspect(InspectReq::LoadRefs))),
+            "opening the refs view requests a fresh listing"
+        );
+
+        app.apply_inspect_msg(InspectMsg::RefsListLoaded(vec![
+            RefEntry {
+                name: "main".into(),
+                kind: RefKind::LocalBranch,
+                target: oid(1),
+                summary: "tip".into(),
+                authored_relative: "1d ago".into(),
+            },
+            RefEntry {
+                name: "v1.0".into(),
+                kind: RefKind::Tag,
+                target: oid(2),
+                summary: "release".into(),
+                authored_relative: "9d ago".into(),
+            },
+        ]));
+        assert!(!app.refs.loading);
+        assert_eq!(app.refs.entries.len(), 2);
+
+        // Navigate to the tag and activate it.
+        app.handle_input(key(KeyCode::Char('j'), KeyModifiers::NONE));
+        assert_eq!(app.refs.selected, 1);
+        let gen_before = app.walk_gen;
+        app.handle_input(key(KeyCode::Enter, KeyModifiers::NONE));
+
+        assert!(!app.refs.open, "enter closes the refs view");
+        assert_eq!(app.branch_name, "v1.0");
+        assert_eq!(app.walk_gen, gen_before + 1);
+        let mut saw_reroot = false;
+        while let Ok(req) = ends.req_rx.try_recv() {
+            if let GitReq::History(HistoryReq::Reload { generation, root }) = req {
+                assert_eq!(generation, app.walk_gen);
+                assert_eq!(root, Some(oid(2)), "reload is rooted at the selected ref's commit");
+                saw_reroot = true;
+            }
+        }
+        assert!(saw_reroot);
+    }
+
+    #[test]
+    fn refs_move_clamps_and_scrolls() {
+        use crate::model::RefEntry;
+        let (mut app, _ends) = test_app();
+        app.refs.entries = (0..10u8)
+            .map(|i| RefEntry {
+                name: format!("branch-{i}").into(),
+                kind: RefKind::LocalBranch,
+                target: oid(i),
+                summary: String::new(),
+                authored_relative: "".into(),
+            })
+            .collect();
+        app.refs.view_height = 3;
+
+        app.refs_move(-5);
+        assert_eq!(app.refs.selected, 0, "clamped at top");
+        app.refs_move(isize::MAX);
+        assert_eq!(app.refs.selected, 9, "G clamps to last entry");
+        assert_eq!(app.refs.scroll, 7, "selection kept visible in a 3-row pane");
+        app.refs_move(-9);
+        assert_eq!(app.refs.selected, 0);
+        assert_eq!(app.refs.scroll, 0);
     }
 
     #[test]

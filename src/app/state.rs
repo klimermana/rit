@@ -5,7 +5,7 @@
 
 use crate::{
     app::search::cycle,
-    model::{CommitRecord, DiffDocument, DiffTarget, StatusDocument},
+    model::{CommitRecord, DiffDocument, DiffTarget, RefEntry, StatusDocument},
 };
 use compact_str::CompactString;
 use std::time::Instant;
@@ -208,6 +208,31 @@ pub struct StatusState {
     pub document: Option<StatusDocument>,
     pub scroll: usize,
     pub loading: bool,
+}
+
+/// Full-screen refs browser (`r`). `Enter` re-roots the log at the
+/// selected ref.
+pub struct RefsState {
+    pub open: bool,
+    pub loading: bool,
+    pub entries: Vec<RefEntry>,
+    pub selected: usize,
+    pub scroll: usize,
+    /// Inner height of the refs pane, updated by the renderer each
+    /// frame — selection movement clamps against it at input time.
+    pub view_height: usize,
+}
+
+impl RefsState {
+    pub fn new() -> Self {
+        Self { open: false, loading: false, entries: Vec::new(), selected: 0, scroll: 0, view_height: 1 }
+    }
+}
+
+impl Default for RefsState {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 pub struct YankFeedback {

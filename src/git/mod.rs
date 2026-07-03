@@ -401,6 +401,10 @@ fn process_request<'r>(
             let document = status::compute_status(repo);
             _ = msg_tx.send(GitMsg::Inspect(InspectMsg::StatusLoaded(document)));
         }
+        GitReq::Inspect(InspectReq::LoadRefs) => {
+            let entries = meta::load_ref_entries(repo);
+            _ = msg_tx.send(GitMsg::Inspect(InspectMsg::RefsListLoaded(entries)));
+        }
         GitReq::Inspect(InspectReq::RefreshWorkingTreeMeta) => {
             // Mirror the startup path: hand the worktree scan off to a
             // side thread so a Reload doesn't re-introduce the same

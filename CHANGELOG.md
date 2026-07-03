@@ -83,6 +83,11 @@ Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- Refs view: `r` opens a full-screen browser of local branches,
+  remote branches, and tags (annotated tags peeled to their commit),
+  each with the target commit's summary and relative date. `Enter`
+  re-roots the log at the selected ref — `R` afterwards reloads from
+  that same root.
 - `]` / `[` jump to the next / previous file in the diff pane, so a
   many-file commit can be skimmed without scrolling through every
   hunk. `[` above the first file returns to the commit header.

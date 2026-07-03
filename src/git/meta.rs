@@ -3,7 +3,7 @@
 //! the ref-table loader, and the two time formatters used by the
 //! header / log row renderers.
 
-use crate::model::{RefKind, RefLabel, RepoInfo};
+use crate::model::{RefEntry, RefKind, RefLabel, RepoInfo};
 use chrono::{TimeZone, Utc};
 use compact_str::CompactString;
 use gix::{ObjectId, bstr::ByteSlice};
@@ -43,6 +43,57 @@ pub fn load_refs(repo: &gix::Repository) -> HashMap<ObjectId, Vec<RefLabel>> {
         }
     }
     map
+}
+
+/// Build the refs-view listing: every local branch, remote branch, and
+/// tag, peeled to a commit (annotated tags follow their target chain)
+/// and annotated with that commit's summary + relative author time.
+/// Sorted by kind (branches, remotes, tags), then name. Refs that
+/// don't peel to a commit (e.g. a tag of a blob) are skipped.
+pub fn load_ref_entries(repo: &gix::Repository) -> Vec<RefEntry> {
+    let mut entries: Vec<RefEntry> = Vec::new();
+    let Ok(platform) = repo.references() else {
+        return entries;
+    };
+    let Ok(all_refs) = platform.all() else { return entries };
+
+    for mut reference in all_refs.flatten() {
+        let full_name = reference.name().as_bstr().to_str_lossy().into_owned();
+        // The refs view lists real refs only — the HEAD pseudo-ref is
+        // already visible as the checked-out branch decoration.
+        let (name, kind): (CompactString, RefKind) = if let Some(b) = full_name.strip_prefix("refs/heads/") {
+            (b.into(), RefKind::LocalBranch)
+        } else if let Some(r) = full_name.strip_prefix("refs/remotes/") {
+            (r.into(), RefKind::RemoteBranch)
+        } else if let Some(t) = full_name.strip_prefix("refs/tags/") {
+            (t.into(), RefKind::Tag)
+        } else {
+            continue;
+        };
+
+        let Ok(target) = reference.peel_to_id() else {
+            continue;
+        };
+        let Ok(object) = target.object() else { continue };
+        let Ok(commit) = object.try_into_commit() else { continue };
+        let (summary, authored_relative) = match commit.decode() {
+            Ok(decoded) => {
+                let summary = decoded.message().title.to_str_lossy().trim_end().to_owned();
+                let when = decoded.author().ok().and_then(|a| a.time().ok()).map(|t| t.seconds).unwrap_or(0);
+                (summary, relative_time(when))
+            }
+            Err(_) => (String::new(), "".into()),
+        };
+        entries.push(RefEntry { name, kind, target: target.detach(), summary, authored_relative });
+    }
+
+    let kind_rank = |k: RefKind| match k {
+        RefKind::Head | RefKind::LocalBranch => 0u8,
+        RefKind::RemoteBranch => 1,
+        RefKind::Tag => 2,
+    };
+    entries.sort_by(|a, b| kind_rank(a.kind).cmp(&kind_rank(b.kind)).then_with(|| a.name.cmp(&b.name)));
+    entries
 }
 
 pub fn repo_info_for(repo: &gix::Repository) -> RepoInfo {
@@ -135,4 +186,36 @@ pub fn relative_time(unix_secs: i64) -> CompactString {
 
 pub fn format_timestamp(unix_secs: i64) -> String {
     Utc.timestamp_opt(unix_secs, 0).single().unwrap_or_else(Utc::now).format("%a %b %e %T %Y +0000").to_string()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::load_ref_entries;
+    use crate::{
+        model::RefKind,
+        test_support::{commit_all, make_fixture_repo, run_git, write_file},
+    };
+
+    #[test]
+    fn load_ref_entries_lists_branches_and_peeled_tags_sorted() {
+        let (td, repo) = make_fixture_repo();
+        let path = td.path();
+        write_file(path, "a.txt", "one\n");
+        commit_all(path, "first commit");
+        run_git(path, &["branch", "feature"]);
+        run_git(path, &["tag", "-a", "v1.0", "-m", "release"]); // annotated → needs peeling
+        run_git(path, &["tag", "lightweight"]);
+
+        let entries = load_ref_entries(&repo);
+        let names: Vec<&str> = entries.iter().map(|e| e.name.as_str()).collect();
+        assert_eq!(names, vec!["feature", "main", "lightweight", "v1.0"], "branches first, then tags, name order");
+
+        let head = repo.head_id().expect("head").detach();
+        for e in &entries {
+            assert_eq!(e.target, head, "every ref (incl. annotated tag) peels to the commit");
+            assert_eq!(e.summary, "first commit");
+        }
+        assert_eq!(entries[0].kind, RefKind::LocalBranch);
+        assert_eq!(entries[3].kind, RefKind::Tag);
+    }
 }

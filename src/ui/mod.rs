@@ -1,6 +1,7 @@
 pub mod diff_view;
 pub mod help;
 pub mod log_view;
+pub mod refs_view;
 
 use crate::{
     app::{App, SearchSnapshot},
@@ -39,6 +40,15 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
 
     if app.status.open {
         draw_status_view(frame, app, main_area);
+        draw_status_bar(frame, app, status_bar_area);
+        if app.show_help {
+            help::draw_help(frame, size);
+        }
+        return;
+    }
+
+    if app.refs.open {
+        refs_view::draw_refs_view(frame, app, main_area);
         draw_status_bar(frame, app, status_bar_area);
         if app.show_help {
             help::draw_help(frame, size);
@@ -124,6 +134,8 @@ fn draw_status_bar(frame: &mut Frame, app: &App, area: Rect) {
         Line::from(Span::styled(format!(" ✓ {}", y.text), Style::default().fg(Color::Green)))
     } else if app.status.open {
         Line::from(Span::raw(" q/Esc/s:close-status  j/k:scroll  g/G:top/bottom"))
+    } else if app.refs.open {
+        Line::from(Span::raw(" q/Esc/r:close-refs  j/k:nav  Enter:open-log-at-ref"))
     } else if app.diff.open {
         Line::from(Span::raw(
             " q/Esc:close-diff  j/k:nav  ]/[:file  Tab:switch  /:search-diff  v:hunks  y:yank  ?:help",
@@ -132,7 +144,7 @@ fn draw_status_bar(frame: &mut Frame, app: &App, area: Rect) {
         let count = app.commits_len();
         let count_str = if app.walk_done { format!("{}", count) } else { format!("{}+", count) };
         Line::from(Span::raw(format!(
-            " {} commits  q:quit  j/k:nav  Enter:diff  /:search  y:yank  s:status  ?:help  R:reload",
+            " {} commits  q:quit  j/k:nav  Enter:diff  /:search  y:yank  r:refs  s:status  ?:help  R:reload",
             count_str,
         )))
     };

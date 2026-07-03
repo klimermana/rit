@@ -70,7 +70,20 @@ pub struct RefLabel {
     pub kind: RefKind,
 }
 
-#[derive(Clone, Copy, PartialEq, Eq)]
+/// One row of the refs view: a branch or tag with the metadata of the
+/// commit it points at (annotated tags are peeled to their commit).
+#[derive(Clone)]
+pub struct RefEntry {
+    pub name: CompactString,
+    pub kind: RefKind,
+    /// The commit the ref (after peeling) points at — the walk root
+    /// when the user opens the log at this ref.
+    pub target: ObjectId,
+    pub summary: String,
+    pub authored_relative: CompactString,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum RefKind {
     Head,
     LocalBranch,

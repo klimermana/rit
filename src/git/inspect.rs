@@ -8,7 +8,7 @@
 //! Runtime is still a single worker thread shared with the history
 //! protocol; the split lives only in the type system today.
 
-use crate::model::{DiffDocument, DiffTarget, StatusDocument};
+use crate::model::{DiffDocument, DiffTarget, RefEntry, StatusDocument};
 
 /// Requests the inspect side answers.
 pub enum InspectReq {
@@ -24,6 +24,11 @@ pub enum InspectReq {
         seq: u64,
     },
     LoadStatus,
+    /// Build the refs-view listing: every branch and tag peeled to its
+    /// commit, with summary + relative date. Requested each time the
+    /// user opens the refs view so the listing reflects refs created
+    /// since startup.
+    LoadRefs,
     /// Re-read the configured author name (e.g. after the user changes
     /// `user.name` in another terminal). Currently triggered alongside
     /// `Reload` from the app.
@@ -41,6 +46,9 @@ pub enum InspectMsg {
         document: DiffDocument,
     },
     StatusLoaded(StatusDocument),
+    /// Reply to `LoadRefs`: sorted (branches, remotes, tags; name order
+    /// within kind) entries for the refs view.
+    RefsListLoaded(Vec<RefEntry>),
     WorkingTreeMeta {
         author: String,
         /// `None` when the dirty check failed (e.g. no worktree or status

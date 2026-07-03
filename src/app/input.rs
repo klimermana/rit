@@ -41,6 +41,10 @@ impl App {
             self.handle_status_key(key);
             return;
         }
+        if self.refs.open {
+            self.handle_refs_key(key);
+            return;
+        }
         self.handle_main_key(key);
     }
 
@@ -111,6 +115,27 @@ impl App {
         }
     }
 
+    fn handle_refs_key(&mut self, key: KeyEvent) {
+        use KeyCode::*;
+        use KeyModifiers as Mod;
+        match (key.code, key.modifiers) {
+            (Char('q') | Esc | Char('r'), Mod::NONE) => self.refs.open = false,
+            (Enter, Mod::NONE) => self.refs_activate_selected(),
+            (Char('j') | Down, Mod::NONE) => self.refs_move(1),
+            (Char('k') | Up, Mod::NONE) => self.refs_move(-1),
+            (Char('g'), Mod::NONE) => {
+                self.refs.selected = 0;
+                self.refs.scroll = 0;
+            }
+            (Char('G'), Mod::NONE | Mod::SHIFT) => self.refs_move(isize::MAX),
+            (Char('d'), Mod::CONTROL) => self.refs_move(HALF_PAGE as isize),
+            (Char('u'), Mod::CONTROL) => self.refs_move(-(HALF_PAGE as isize)),
+            (PageDown, _) => self.refs_move(self.refs.view_height.max(1) as isize),
+            (PageUp, _) => self.refs_move(-(self.refs.view_height.max(1) as isize)),
+            _ => {}
+        }
+    }
+
     fn handle_main_key(&mut self, key: KeyEvent) {
         use KeyCode::*;
         use KeyModifiers as Mod;
@@ -136,6 +161,7 @@ impl App {
             (Focus::Log, Char('N'), Mod::NONE | Mod::SHIFT) => self.jump_commit_match(-1),
             (Focus::Diff, Char('n'), Mod::NONE) => self.jump_diff_match(1),
             (Focus::Diff, Char('N'), Mod::NONE | Mod::SHIFT) => self.jump_diff_match(-1),
+            (Focus::Log, Char('r'), Mod::NONE) => self.open_refs_view(),
             (Focus::Log, Char('s'), Mod::NONE) => {
                 self.status.open = true;
                 self.status.scroll = 0;
