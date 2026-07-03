@@ -63,7 +63,7 @@ fn await_diff(rx: &crossbeam_channel::Receiver<GitMsg>) {
     let timeout = Duration::from_secs(30);
     loop {
         match rx.recv_timeout(timeout) {
-            Ok(GitMsg::Inspect(InspectMsg::DiffLoaded(_))) => return,
+            Ok(GitMsg::Inspect(InspectMsg::DiffLoaded { .. })) => return,
             Ok(_) => {}
             Err(_) => panic!("worker stalled before DiffLoaded"),
         }
@@ -102,7 +102,9 @@ fn bench_diff_generation(c: &mut Criterion) {
 
         group.bench_with_input(BenchmarkId::from_parameter(label), &head, |b, head| {
             b.iter(|| {
-                req_tx.send(GitReq::Inspect(InspectReq::LoadDiff(DiffTarget::Commit(*head)))).expect("send");
+                req_tx
+                    .send(GitReq::Inspect(InspectReq::LoadDiff { target: DiffTarget::Commit(*head), seq: 0 }))
+                    .expect("send");
                 await_diff(&msg_rx);
             });
         });
@@ -124,7 +126,9 @@ fn bench_diff_generation(c: &mut Criterion) {
 
         group.bench_with_input(BenchmarkId::from_parameter("many_files_200"), &head, |b, head| {
             b.iter(|| {
-                req_tx.send(GitReq::Inspect(InspectReq::LoadDiff(DiffTarget::Commit(*head)))).expect("send");
+                req_tx
+                    .send(GitReq::Inspect(InspectReq::LoadDiff { target: DiffTarget::Commit(*head), seq: 0 }))
+                    .expect("send");
                 await_diff(&msg_rx);
             });
         });
@@ -175,7 +179,9 @@ fn bench_working_tree_diff(c: &mut Criterion) {
                 let mut total = Duration::ZERO;
                 for _ in 0..iters {
                     let start = std::time::Instant::now();
-                    req_tx.send(GitReq::Inspect(InspectReq::LoadDiff(DiffTarget::WorkingTree))).expect("send");
+                    req_tx
+                        .send(GitReq::Inspect(InspectReq::LoadDiff { target: DiffTarget::WorkingTree, seq: 0 }))
+                        .expect("send");
                     await_diff(&msg_rx);
                     total += start.elapsed();
                     // Untimed: let the previous iter's side-thread
@@ -216,7 +222,9 @@ fn bench_working_tree_diff(c: &mut Criterion) {
                 let mut total = Duration::ZERO;
                 for _ in 0..iters {
                     let start = std::time::Instant::now();
-                    req_tx.send(GitReq::Inspect(InspectReq::LoadDiff(DiffTarget::WorkingTree))).expect("send");
+                    req_tx
+                        .send(GitReq::Inspect(InspectReq::LoadDiff { target: DiffTarget::WorkingTree, seq: 0 }))
+                        .expect("send");
                     await_diff(&msg_rx);
                     total += start.elapsed();
                     drain_untracked_update(&msg_rx);
@@ -272,7 +280,9 @@ fn bench_pathspec_walk_then_diff(c: &mut Criterion) {
             // Now request the diff for HEAD. Without the cache, this
             // re-runs gix::diff::tree from scratch; with the cache, it
             // reuses what the walker already computed.
-            req_tx.send(GitReq::Inspect(InspectReq::LoadDiff(DiffTarget::Commit(head)))).expect("send");
+            req_tx
+                .send(GitReq::Inspect(InspectReq::LoadDiff { target: DiffTarget::Commit(head), seq: 0 }))
+                .expect("send");
             await_diff(&msg_rx);
 
             drop(req_tx);
@@ -336,8 +346,10 @@ fn bench_cursor_scrub(c: &mut Criterion) {
 
     group.bench_function("scrub_40_commits_300_lines", |b| {
         b.iter(|| {
-            for id in &ids {
-                req_tx.send(GitReq::Inspect(InspectReq::LoadDiff(DiffTarget::Commit(*id)))).expect("send");
+            for (i, id) in ids.iter().enumerate() {
+                req_tx
+                    .send(GitReq::Inspect(InspectReq::LoadDiff { target: DiffTarget::Commit(*id), seq: i as u64 }))
+                    .expect("send");
             }
             // Wait for the *final* target's document; earlier DiffLoaded
             // replies (if any survive coalescing) drain along the way.
@@ -345,7 +357,9 @@ fn bench_cursor_scrub(c: &mut Criterion) {
             // is always the last message of the burst.
             loop {
                 match msg_rx.recv_timeout(Duration::from_secs(60)) {
-                    Ok(GitMsg::Inspect(InspectMsg::DiffLoaded(doc))) if doc.target == final_target => break,
+                    Ok(GitMsg::Inspect(InspectMsg::DiffLoaded { document, .. })) if document.target == final_target => {
+                        break;
+                    }
                     Ok(_) => {}
                     Err(_) => panic!("worker stalled before final DiffLoaded"),
                 }

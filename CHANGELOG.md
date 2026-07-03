@@ -9,6 +9,14 @@ Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- Reopening the working-tree diff while a previous untracked-files
+  scan was still running could resolve the "(scanning for untracked
+  files…)" placeholder with the *old* scan's results and silently drop
+  the fresh scan. Diff requests and their follow-ups now carry a
+  sequence number, so stale replies are discarded instead of racing
+  the current document.
+- `Ctrl+C` now quits from every mode — previously it was ignored while
+  a search prompt, the status view, or the help popup was open.
 - Opening a commit no longer waits for background indexing. The git
   worker's history walk is now preemptible: it polls for queued
   requests during a batch and yields immediately, so a diff (or

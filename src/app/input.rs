@@ -18,6 +18,13 @@ const HORIZONTAL_STEP: usize = 4;
 
 impl App {
     pub fn handle_input(&mut self, key: KeyEvent) {
+        // Ctrl+C quits from every mode — the per-mode handlers only
+        // match unmodified/shifted chars, so without this it would fall
+        // through to a no-op in search, status, and help modes.
+        if matches!((key.code, key.modifiers), (KeyCode::Char('c'), KeyModifiers::CONTROL)) {
+            self.should_quit = true;
+            return;
+        }
         if self.show_help {
             self.handle_help_key(key);
             return;
@@ -108,7 +115,6 @@ impl App {
         use KeyCode::*;
         use KeyModifiers as Mod;
         match (&self.focus, key.code, key.modifiers) {
-            (_, Char('c'), Mod::CONTROL) => self.should_quit = true,
             (_, Char('?'), Mod::NONE) => self.show_help = true,
             (_, Char('#'), Mod::NONE) => self.diff.show_line_numbers = !self.diff.show_line_numbers,
             (_, Char('v'), Mod::NONE) if self.diff.open => {

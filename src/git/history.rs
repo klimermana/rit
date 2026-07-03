@@ -15,9 +15,19 @@ use std::{collections::HashMap, sync::Arc};
 /// background until the walk is exhausted, so the app never has to
 /// prompt for more.
 pub enum HistoryReq {
-    /// Discard the current walk and start over from HEAD with a fresh
-    /// generation. Used after the user presses `R`.
-    Reload,
+    /// Discard the current walk and start over with a fresh generation.
+    /// Used after the user presses `R` (and, with `root: Some(..)`, to
+    /// re-root the log at another commit).
+    ///
+    /// `generation` is the app's `walk_gen` after bumping — carrying it
+    /// in the request makes the app the single authority instead of the
+    /// two sides bumping counters in lockstep by convention (which
+    /// silently breaks the moment a Reload is ever dropped, duplicated,
+    /// or triggered from a second place).
+    ///
+    /// `root: None` keeps the worker's current walk root (initially the
+    /// CLI-resolved revision or HEAD); `Some(id)` replaces it.
+    Reload { generation: u64, root: Option<ObjectId> },
 }
 
 /// Replies the history side emits. Each generation-tagged variant is

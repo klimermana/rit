@@ -50,10 +50,15 @@ pub struct App {
     pub branch_name: String,
     /// True once the worker has reported it walked the whole history.
     pub walk_done: bool,
-    /// Current walk generation. Bumped on reload; the worker tags
-    /// Commits/WalkDone with its own generation and stale messages are
-    /// dropped.
+    /// Current walk generation. Bumped on reload and carried in the
+    /// `Reload` request, so the worker tags Commits/WalkDone with the
+    /// app's own number and stale messages are dropped.
     pub walk_gen: u64,
+    /// Monotonically increasing diff-request counter. Carried on every
+    /// `LoadDiff` and echoed back on `DiffLoaded` /
+    /// `UntrackedFilesUpdate`; replies whose seq is not the latest
+    /// issued are stale and dropped.
+    pub diff_seq: u64,
     pub should_quit: bool,
     pub tx: Sender<GitReq>,
     pub rx: Receiver<GitMsg>,
@@ -89,6 +94,7 @@ impl App {
             branch_name: "HEAD".to_string(),
             walk_done: false,
             walk_gen: 0,
+            diff_seq: 0,
             should_quit: false,
             tx,
             rx,
@@ -242,8 +248,11 @@ impl App {
 
     fn apply_inspect_msg(&mut self, msg: InspectMsg) {
         match msg {
-            InspectMsg::DiffLoaded(document) => {
-                if self.diff.target == Some(document.target) {
+            InspectMsg::DiffLoaded { seq, document } => {
+                // Seq gate: only the reply to the newest LoadDiff counts.
+                // The target check stays as defense in depth (reload
+                // clears `target` without bumping the seq).
+                if seq == self.diff_seq && self.diff.target == Some(document.target) {
                     self.diff.loading = false;
                     self.diff.document = Some(document);
                     self.diff.scroll = 0;
@@ -270,8 +279,8 @@ impl App {
                     }
                 }
             }
-            InspectMsg::UntrackedFilesUpdate { target, paths } => {
-                self.apply_untracked_update(target, paths);
+            InspectMsg::UntrackedFilesUpdate { target, seq, paths } => {
+                self.apply_untracked_update(target, seq, paths);
             }
         }
     }
@@ -280,11 +289,17 @@ impl App {
     /// working-tree `DiffDocument`, in place of the placeholder line.
     ///
     /// Gate checks (any failure = silently drop, the update is stale):
+    /// - `seq` matches the latest LoadDiff issued — a scan spawned by an
+    ///   *earlier* working-tree request must not consume the anchor of a
+    ///   newer document (which would make the fresh scan's own result a
+    ///   no-op and leave the placeholder resolved with stale paths)
     /// - the diff pane is still showing this `target`
     /// - the document has an `untracked_anchor` (consuming it makes
-    ///   stale follow-ups no-ops, including after a future reload kicks
-    ///   off a second walk while the first is mid-flight)
-    fn apply_untracked_update(&mut self, target: DiffTarget, paths: Vec<String>) {
+    ///   repeat follow-ups no-ops)
+    fn apply_untracked_update(&mut self, target: DiffTarget, seq: u64, paths: Vec<String>) {
+        if seq != self.diff_seq {
+            return;
+        }
         if self.diff.target != Some(target) {
             return;
         }
@@ -341,7 +356,8 @@ impl App {
         self.error = None;
         // Reload restarts the worker's continuous walk; no explicit
         // LoadMore needed, the worker streams batches on its own.
-        self.send_history(HistoryReq::Reload);
+        // `root: None` keeps the worker's current walk root.
+        self.send_history(HistoryReq::Reload { generation: self.walk_gen, root: None });
         self.send_inspect(InspectReq::RefreshWorkingTreeMeta);
     }
 
@@ -415,7 +431,8 @@ impl App {
             self.diff.header_lower = None;
             self.diff.body_lower = None;
             self.diff.loading = true;
-            self.send_inspect(InspectReq::LoadDiff(target));
+            self.diff_seq = self.diff_seq.wrapping_add(1);
+            self.send_inspect(InspectReq::LoadDiff { target, seq: self.diff_seq });
         }
     }
 
@@ -643,5 +660,293 @@ impl App {
     pub(crate) fn diff_scroll_to_bottom(&mut self) {
         let total = self.diff.total_visible_lines();
         self.diff.scroll = total.saturating_sub(self.diff.view_height);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{
+        git::GitReq,
+        model::{CommitRecord, CommitSearchText, DiffDocument, DiffFlags, DiffStats, DiffTarget, RefKind, RefLabel},
+    };
+    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+    use std::{collections::HashMap, sync::Arc};
+
+    /// Counterparty channel ends for a test `App`. Tests assert on
+    /// `req_rx` (what the app sent to the worker); the two senders are
+    /// only held so the app's receivers stay connected.
+    struct WorkerEnds {
+        req_rx: Receiver<GitReq>,
+        _msg_tx: Sender<GitMsg>,
+        _input_tx: Sender<Event>,
+    }
+
+    /// App wired to loopback channels.
+    fn test_app() -> (App, WorkerEnds) {
+        let (req_tx, req_rx) = crossbeam_channel::unbounded();
+        let (msg_tx, msg_rx) = crossbeam_channel::unbounded();
+        let (input_tx, input_rx) = crossbeam_channel::unbounded();
+        (App::new(req_tx, msg_rx, input_rx), WorkerEnds { req_rx, _msg_tx: msg_tx, _input_tx: input_tx })
+    }
+
+    fn oid(n: u8) -> gix::ObjectId {
+        let mut raw = [0u8; 20];
+        raw[0] = n;
+        gix::ObjectId::from_bytes_or_panic(&raw)
+    }
+
+    fn commit_record(n: u8, summary: &str, author: &str) -> CommitRecord {
+        CommitRecord {
+            id: oid(n),
+            short_id: format!("{n:07x}").into(),
+            authored_unix_secs: 0,
+            authored_relative: "1d ago".into(),
+            author: author.into(),
+            summary: summary.to_string(),
+            refs: Vec::new(),
+            graph: "".into(),
+            search: CommitSearchText {
+                author_lower: author.to_lowercase().into(),
+                summary_lower: summary.to_lowercase(),
+                refs_lower: "".into(),
+            },
+        }
+    }
+
+    fn working_tree_doc_with_anchor() -> DiffDocument {
+        DiffDocument {
+            target: DiffTarget::WorkingTree,
+            header: vec![DiffLine::new(DiffLineKind::CommitHeader, "Working tree")],
+            body: vec![
+                DiffLine::new(DiffLineKind::SectionTitle, "Untracked files"),
+                DiffLine::new(DiffLineKind::Faint, "(scanning for untracked files…)"),
+            ],
+            files: Vec::new(),
+            stats: DiffStats { files: 0, insertions: 0, deletions: 0 },
+            flags: DiffFlags::default(),
+            untracked_anchor: Some(1),
+        }
+    }
+
+    fn key(code: KeyCode, mods: KeyModifiers) -> KeyEvent {
+        KeyEvent::new(code, mods)
+    }
+
+    // --- generation gating ---
+
+    #[test]
+    fn commits_with_stale_generation_are_dropped() {
+        let (mut app, _ends) = test_app();
+        assert_eq!(app.walk_gen, 0);
+        app.apply_history_msg(HistoryMsg::Commits { generation: 1, commits: vec![commit_record(1, "x", "a")] });
+        assert_eq!(app.log.rows.len(), 1, "stale batch must not append rows");
+
+        app.apply_history_msg(HistoryMsg::Commits { generation: 0, commits: vec![commit_record(1, "x", "a")] });
+        assert_eq!(app.log.rows.len(), 2, "current-generation batch appends");
+    }
+
+    #[test]
+    fn walk_done_with_stale_generation_is_dropped() {
+        let (mut app, _ends) = test_app();
+        app.apply_history_msg(HistoryMsg::WalkDone { generation: 3 });
+        assert!(!app.walk_done);
+        app.apply_history_msg(HistoryMsg::WalkDone { generation: 0 });
+        assert!(app.walk_done);
+    }
+
+    #[test]
+    fn reload_carries_bumped_generation_to_worker() {
+        let (mut app, ends) = test_app();
+        app.reload();
+        assert_eq!(app.walk_gen, 1);
+        let mut saw_reload = false;
+        while let Ok(req) = ends.req_rx.try_recv() {
+            if let GitReq::History(HistoryReq::Reload { generation, root }) = req {
+                assert_eq!(generation, app.walk_gen);
+                assert!(root.is_none(), "plain reload keeps the walk root");
+                saw_reload = true;
+            }
+        }
+        assert!(saw_reload);
+    }
+
+    // --- RefsLoaded backfill ---
+
+    #[test]
+    fn refs_loaded_backfills_only_the_first_batch_prefix() {
+        let (mut app, _ends) = test_app();
+        // Two commits: rows [WT, c1, c2]; only c1 predates refs.
+        app.apply_history_msg(HistoryMsg::Commits {
+            generation: 0,
+            commits: vec![commit_record(1, "first", "a"), commit_record(2, "second", "b")],
+        });
+
+        let mut map: HashMap<gix::ObjectId, Vec<RefLabel>> = HashMap::new();
+        map.insert(oid(1), vec![RefLabel { name: "v1.0".into(), kind: RefKind::Tag }]);
+        map.insert(oid(2), vec![RefLabel { name: "main".into(), kind: RefKind::LocalBranch }]);
+
+        app.apply_history_msg(HistoryMsg::RefsLoaded { generation: 0, refs_map: Arc::new(map), first_batch_rows: 1 });
+
+        let LogRow::Commit(c1) = &app.log.rows[1] else { panic!("row 1 should be a commit") };
+        assert_eq!(c1.refs.len(), 1, "prefix commit gets its labels backfilled");
+        assert!(c1.search.refs_lower.contains("v1.0"), "search projection refreshed with the labels");
+
+        let LogRow::Commit(c2) = &app.log.rows[2] else { panic!("row 2 should be a commit") };
+        assert!(c2.refs.is_empty(), "rows past first_batch_rows were built with refs live and are not touched");
+    }
+
+    #[test]
+    fn refs_loaded_with_stale_generation_is_dropped() {
+        let (mut app, _ends) = test_app();
+        app.apply_history_msg(HistoryMsg::Commits { generation: 0, commits: vec![commit_record(1, "first", "a")] });
+        let mut map: HashMap<gix::ObjectId, Vec<RefLabel>> = HashMap::new();
+        map.insert(oid(1), vec![RefLabel { name: "v1.0".into(), kind: RefKind::Tag }]);
+        app.apply_history_msg(HistoryMsg::RefsLoaded { generation: 7, refs_map: Arc::new(map), first_batch_rows: 1 });
+        let LogRow::Commit(c1) = &app.log.rows[1] else { panic!("row 1 should be a commit") };
+        assert!(c1.refs.is_empty());
+    }
+
+    // --- DiffLoaded / untracked splice sequencing ---
+
+    #[test]
+    fn diff_loaded_with_stale_seq_is_dropped() {
+        let (mut app, _ends) = test_app();
+        app.diff.open = true;
+        app.diff.target = Some(DiffTarget::WorkingTree);
+        app.diff_seq = 2;
+
+        app.apply_inspect_msg(InspectMsg::DiffLoaded { seq: 1, document: working_tree_doc_with_anchor() });
+        assert!(app.diff.document.is_none(), "stale-seq document dropped");
+
+        app.apply_inspect_msg(InspectMsg::DiffLoaded { seq: 2, document: working_tree_doc_with_anchor() });
+        assert!(app.diff.document.is_some(), "current-seq document applied");
+    }
+
+    #[test]
+    fn untracked_update_with_fresh_seq_splices_paths() {
+        let (mut app, _ends) = test_app();
+        app.diff.open = true;
+        app.diff.target = Some(DiffTarget::WorkingTree);
+        app.diff_seq = 3;
+        app.diff.document = Some(working_tree_doc_with_anchor());
+
+        app.apply_untracked_update(DiffTarget::WorkingTree, 3, vec!["new.txt".to_string()]);
+
+        let doc = app.diff.document.as_ref().expect("doc present");
+        assert!(doc.untracked_anchor.is_none(), "anchor consumed");
+        assert!(doc.body.iter().any(|l| l.text == "?? new.txt"), "untracked path spliced in");
+        assert!(!doc.body.iter().any(|l| l.text.contains("scanning")), "placeholder replaced");
+    }
+
+    #[test]
+    fn untracked_update_with_stale_seq_leaves_anchor_for_fresh_result() {
+        let (mut app, _ends) = test_app();
+        app.diff.open = true;
+        app.diff.target = Some(DiffTarget::WorkingTree);
+        // A newer LoadDiff (seq 4) is in flight; the scan spawned by the
+        // older seq-3 request reports late.
+        app.diff_seq = 4;
+        app.diff.document = Some(working_tree_doc_with_anchor());
+
+        app.apply_untracked_update(DiffTarget::WorkingTree, 3, vec!["stale.txt".to_string()]);
+
+        let doc = app.diff.document.as_ref().expect("doc present");
+        assert!(doc.untracked_anchor.is_some(), "stale scan must not consume the fresh document's anchor");
+        assert!(!doc.body.iter().any(|l| l.text.contains("stale.txt")));
+
+        // The fresh scan's result still lands.
+        app.apply_untracked_update(DiffTarget::WorkingTree, 4, vec!["fresh.txt".to_string()]);
+        let doc = app.diff.document.as_ref().expect("doc present");
+        assert!(doc.untracked_anchor.is_none());
+        assert!(doc.body.iter().any(|l| l.text == "?? fresh.txt"));
+    }
+
+    #[test]
+    fn untracked_update_clean_tree_emits_clean_line() {
+        let (mut app, _ends) = test_app();
+        app.diff.open = true;
+        app.diff.target = Some(DiffTarget::WorkingTree);
+        app.diff_seq = 1;
+        app.diff.document = Some(working_tree_doc_with_anchor());
+
+        app.apply_untracked_update(DiffTarget::WorkingTree, 1, Vec::new());
+
+        let doc = app.diff.document.as_ref().expect("doc present");
+        assert!(doc.body.iter().any(|l| l.text.contains("working tree clean")), "clean message emitted");
+    }
+
+    #[test]
+    fn fetch_diff_bumps_seq_and_sends_matching_request() {
+        let (mut app, ends) = test_app();
+        app.log.rows.push(LogRow::Commit(commit_record(1, "x", "a")));
+        app.log.selected = 1;
+        app.diff.open = true;
+
+        app.fetch_diff_for_selected();
+
+        assert_eq!(app.diff_seq, 1);
+        let req = ends.req_rx.try_recv().expect("request sent");
+        match req {
+            GitReq::Inspect(InspectReq::LoadDiff { target, seq }) => {
+                assert_eq!(seq, app.diff_seq);
+                assert_eq!(target, DiffTarget::Commit(oid(1)));
+            }
+            _ => panic!("expected LoadDiff"),
+        }
+    }
+
+    // --- input routing ---
+
+    #[test]
+    fn ctrl_c_quits_from_every_mode() {
+        let ctrl_c = key(KeyCode::Char('c'), KeyModifiers::CONTROL);
+        for setup in [
+            (|_a: &mut App| {}) as fn(&mut App),
+            |a| a.show_help = true,
+            |a| a.status.open = true,
+            |a| a.search.state.active = true,
+            |a| a.diff.search.active = true,
+        ] {
+            let (mut app, _ends) = test_app();
+            setup(&mut app);
+            app.handle_input(ctrl_c);
+            assert!(app.should_quit, "Ctrl+C must quit regardless of mode");
+        }
+    }
+
+    #[test]
+    fn search_mode_captures_chars_instead_of_navigating() {
+        let (mut app, _ends) = test_app();
+        app.log.rows.push(LogRow::Commit(commit_record(1, "fix things", "a")));
+        app.search.state.active = true;
+
+        app.handle_input(key(KeyCode::Char('j'), KeyModifiers::NONE));
+
+        assert_eq!(app.search.state.query, "j", "chars go into the query while search input is active");
+        assert_eq!(app.log.selected, 0, "no navigation happened");
+    }
+
+    #[test]
+    fn help_intercepts_keys_and_closes_on_q() {
+        let (mut app, _ends) = test_app();
+        app.log.rows.push(LogRow::Commit(commit_record(1, "x", "a")));
+        app.show_help = true;
+
+        app.handle_input(key(KeyCode::Char('j'), KeyModifiers::NONE));
+        assert_eq!(app.log.selected, 0, "keys don't leak through the help popup");
+
+        app.handle_input(key(KeyCode::Char('q'), KeyModifiers::NONE));
+        assert!(!app.show_help, "q closes help");
+        assert!(!app.should_quit, "q in help does not quit the app");
+    }
+
+    #[test]
+    fn status_mode_routes_keys_to_status_handler() {
+        let (mut app, _ends) = test_app();
+        app.status.open = true;
+        app.handle_input(key(KeyCode::Char('q'), KeyModifiers::NONE));
+        assert!(!app.status.open, "q closes the status view");
+        assert!(!app.should_quit);
     }
 }

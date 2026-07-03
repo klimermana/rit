@@ -210,7 +210,10 @@ fn run_git_thread_inner(
     // peel it to a commit. Hash-first matches the user's expectation
     // that `rit abc1234` walks from that commit even when a path with
     // the same name happens to exist.
+    // `walk_root` is the worker's current walk root; a Reload with
+    // `root: Some(..)` re-roots (refs-view navigation), `None` keeps it.
     let (start_id, path_filter) = resolve_positional(&repo, positional);
+    let mut walk_root = start_id;
 
     _ = msg_tx.send(GitMsg::History(HistoryMsg::RepoInfo(meta::repo_info_for(&repo))));
     // Send the working-tree author immediately so the UI can paint the
@@ -226,7 +229,7 @@ fn run_git_thread_inner(
         .send(GitMsg::Inspect(InspectMsg::WorkingTreeMeta { author: meta::working_tree_author(&repo), dirty: None }));
 
     let mut walker =
-        walk::Walker::new(&repo, path_filter.clone(), start_id, 0, graph_enabled, Arc::new(HashMap::new()))?;
+        walk::Walker::new(&repo, path_filter.clone(), walk_root, 0, graph_enabled, Arc::new(HashMap::new()))?;
     let mut refs_loaded = false;
     // Per-worker shared cache: the pathspec filter populates it during
     // walking; LoadDiff requests for the same commit reuse the records.
@@ -283,7 +286,7 @@ fn run_git_thread_inner(
                 req,
                 &repo,
                 &path_filter,
-                start_id,
+                &mut walk_root,
                 graph_enabled,
                 &mut walker,
                 &mut refs_loaded,
@@ -332,7 +335,7 @@ fn run_git_thread_inner(
 /// walk, whose preemption check sees a non-empty queue). All other
 /// requests keep their relative order.
 fn coalesce_requests(batch: &mut Vec<GitReq>) {
-    let is_load_diff = |req: &GitReq| matches!(req, GitReq::Inspect(InspectReq::LoadDiff(_)));
+    let is_load_diff = |req: &GitReq| matches!(req, GitReq::Inspect(InspectReq::LoadDiff { .. }));
     let Some(last) = batch.iter().rposition(is_load_diff) else { return };
     let mut i = 0;
     batch.retain(|req| {
@@ -353,7 +356,7 @@ fn process_request<'r>(
     req: GitReq,
     repo: &'r gix::Repository,
     path_filter: &Option<PathFilter>,
-    start_id: Option<ObjectId>,
+    walk_root: &mut Option<ObjectId>,
     graph_enabled: bool,
     walker: &mut walk::Walker<'r>,
     refs_loaded: &mut bool,
@@ -362,19 +365,22 @@ fn process_request<'r>(
     msg_tx: &Sender<GitMsg>,
 ) -> Result<bool> {
     match req {
-        GitReq::History(HistoryReq::Reload) => {
-            let next_gen = walker.generation.wrapping_add(1);
+        GitReq::History(HistoryReq::Reload { generation, root }) => {
+            if let Some(root) = root {
+                *walk_root = Some(root);
+            }
             let refs_map = Arc::new(meta::load_refs(repo));
             // The new Walker's `'r` lifetime ties to `repo`, same as
             // the caller's walker — overwriting in place is fine.
             // The tree-diff cache survives reload: oids are
             // content-addressed so entries from the prior generation
-            // are still valid. `start_id` is captured at CLI parse
-            // time, so reload keeps walking from the same pinned root.
-            *walker = walk::Walker::new(repo, path_filter.clone(), start_id, next_gen, graph_enabled, refs_map)?;
+            // are still valid. The generation comes from the app (the
+            // single authority) rather than a local counter kept in
+            // lockstep by convention.
+            *walker = walk::Walker::new(repo, path_filter.clone(), *walk_root, generation, graph_enabled, refs_map)?;
             *refs_loaded = true;
         }
-        GitReq::Inspect(InspectReq::LoadDiff(target)) => {
+        GitReq::Inspect(InspectReq::LoadDiff { target, seq }) => {
             use crate::model::DiffTarget;
             let document = match target {
                 DiffTarget::Commit(id) => diff::compute_commit_diff(repo, id, tree_diff_cache),
@@ -386,9 +392,9 @@ fn process_request<'r>(
             // the staged/unstaged content immediately and the
             // untracked rows fold in via `UntrackedFilesUpdate`.
             let needs_untracked_walk = matches!(target, DiffTarget::WorkingTree) && document.untracked_anchor.is_some();
-            _ = msg_tx.send(GitMsg::Inspect(InspectMsg::DiffLoaded(document)));
+            _ = msg_tx.send(GitMsg::Inspect(InspectMsg::DiffLoaded { seq, document }));
             if needs_untracked_walk {
-                dirty_handles.0.push(spawn_untracked_scan(repo, target, msg_tx.clone()));
+                dirty_handles.0.push(spawn_untracked_scan(repo, target, seq, msg_tx.clone()));
             }
         }
         GitReq::Inspect(InspectReq::LoadStatus) => {
@@ -456,12 +462,13 @@ fn spawn_dirty_check(repo: &gix::Repository, msg_tx: crossbeam_channel::Sender<G
 fn spawn_untracked_scan(
     repo: &gix::Repository,
     target: crate::model::DiffTarget,
+    seq: u64,
     msg_tx: crossbeam_channel::Sender<GitMsg>,
 ) -> std::thread::JoinHandle<()> {
     let repo = repo.clone();
     std::thread::spawn(move || {
         let paths = status::collect_untracked_paths(&repo);
-        _ = msg_tx.send(GitMsg::Inspect(InspectMsg::UntrackedFilesUpdate { target, paths }));
+        _ = msg_tx.send(GitMsg::Inspect(InspectMsg::UntrackedFilesUpdate { target, seq, paths }));
     })
 }
 
@@ -510,22 +517,27 @@ mod tests {
         let a = gix::ObjectId::empty_tree(gix::hash::Kind::Sha1);
         let b = gix::ObjectId::empty_blob(gix::hash::Kind::Sha1);
         let mut batch = vec![
-            GitReq::Inspect(InspectReq::LoadDiff(DiffTarget::WorkingTree)),
+            GitReq::Inspect(InspectReq::LoadDiff { target: DiffTarget::WorkingTree, seq: 1 }),
             GitReq::Inspect(InspectReq::LoadStatus),
-            GitReq::Inspect(InspectReq::LoadDiff(DiffTarget::Commit(a))),
-            GitReq::History(HistoryReq::Reload),
-            GitReq::Inspect(InspectReq::LoadDiff(DiffTarget::Commit(b))),
+            GitReq::Inspect(InspectReq::LoadDiff { target: DiffTarget::Commit(a), seq: 2 }),
+            GitReq::History(HistoryReq::Reload { generation: 1, root: None }),
+            GitReq::Inspect(InspectReq::LoadDiff { target: DiffTarget::Commit(b), seq: 3 }),
         ];
         coalesce_requests(&mut batch);
         assert_eq!(batch.len(), 3, "two superseded LoadDiffs dropped");
         assert!(matches!(batch[0], GitReq::Inspect(InspectReq::LoadStatus)));
-        assert!(matches!(batch[1], GitReq::History(HistoryReq::Reload)));
-        assert!(matches!(batch[2], GitReq::Inspect(InspectReq::LoadDiff(DiffTarget::Commit(id))) if id == b));
+        assert!(matches!(batch[1], GitReq::History(HistoryReq::Reload { .. })));
+        assert!(
+            matches!(batch[2], GitReq::Inspect(InspectReq::LoadDiff { target: DiffTarget::Commit(id), seq: 3 }) if id == b)
+        );
     }
 
     #[test]
     fn coalesce_no_load_diff_is_noop() {
-        let mut batch = vec![GitReq::History(HistoryReq::Reload), GitReq::Inspect(InspectReq::LoadStatus)];
+        let mut batch = vec![
+            GitReq::History(HistoryReq::Reload { generation: 1, root: None }),
+            GitReq::Inspect(InspectReq::LoadStatus),
+        ];
         coalesce_requests(&mut batch);
         assert_eq!(batch.len(), 2);
     }
