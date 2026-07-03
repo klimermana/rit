@@ -24,6 +24,13 @@ Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Changed
 
+- Indexing is 27–58% faster: the git worker now configures gix's
+  decoded-object cache (unset by default), sized for tree diffs
+  against the checkout with a 4 MiB floor. The history walk and its
+  pathspec filter revisit shared subtrees constantly, so the cache
+  removes most repeat object decoding — `indexing/with_pathspec/200`
+  drops from 24 ms to 9.9 ms (−58%), plain `indexing/200` from 7.3 ms
+  to 4.1 ms (−44%).
 - Scrubbing through commits with the diff pane open no longer computes
   a diff for every commit passed over. The git worker now coalesces
   queued diff requests to the newest one before doing any work (only

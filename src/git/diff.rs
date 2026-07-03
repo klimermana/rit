@@ -153,7 +153,7 @@ pub fn render_diff_records(
     };
 
     let outputs: Vec<FileDiffOutput> = if render_records.len() >= PARALLEL_FILE_THRESHOLD {
-        let sync_repo = repo.clone().into_sync();
+        let sync_repo = crate::git::sync_repo_without_object_cache(repo);
         render_records
             .par_iter()
             .map_init(|| sync_repo.to_thread_local(), |worker_repo, change| render_one(worker_repo, change))

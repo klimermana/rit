@@ -283,7 +283,7 @@ fn render_staged_section(
     };
 
     let outputs: Vec<FileDiffOutput> = if renderable.len() >= crate::git::PARALLEL_FILE_THRESHOLD {
-        let sync_repo = repo.clone().into_sync();
+        let sync_repo = crate::git::sync_repo_without_object_cache(repo);
         renderable
             .par_iter()
             .map_init(|| sync_repo.to_thread_local(), |worker_repo, item| render_one(worker_repo, item))
@@ -340,7 +340,7 @@ fn render_unstaged_section(repo: &gix::Repository, sink: &mut DiffSink<'_>, item
     };
 
     let outputs: Vec<FileDiffOutput> = if renderable.len() >= crate::git::PARALLEL_FILE_THRESHOLD {
-        let sync_repo = repo.clone().into_sync();
+        let sync_repo = crate::git::sync_repo_without_object_cache(repo);
         renderable
             .par_iter()
             .map_init(|| sync_repo.to_thread_local(), |worker_repo, item| render_one(worker_repo, item))

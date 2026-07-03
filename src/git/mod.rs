@@ -34,6 +34,27 @@ pub const MAX_INLINE_DIFF_BYTES: usize = 256 * 1024;
 pub const MAX_INLINE_DIFF_LINES: usize = 20_000;
 pub const MAX_INLINE_DIFF_FILES: usize = 200;
 
+/// Floor for the worker repo's decoded-object cache. gix leaves the
+/// cache **unset by default**, which makes every tree/commit lookup
+/// re-decode from scratch — the history walk and its pathspec filter
+/// revisit shared subtrees constantly, so a few MB here pays for
+/// itself quickly.
+pub const OBJECT_CACHE_BYTES: usize = 4 * 1024 * 1024;
+
+/// Clone `repo` for rayon fan-out with the object cache stripped.
+/// `gix_odb::Cache`'s Clone impl carries the cache *factory* and
+/// eagerly instantiates a fresh cache per clone — so without this,
+/// every `to_thread_local()` in a `map_init` builds a cache per
+/// worker per render call. The per-file render paths read each blob
+/// exactly once, so those caches never hit; they only add
+/// construction and copy-on-miss overhead (`many_files_200`
+/// regressed ~16% when the workers inherited the cache).
+pub(crate) fn sync_repo_without_object_cache(repo: &gix::Repository) -> gix::ThreadSafeRepository {
+    let mut clone = repo.clone();
+    clone.object_cache_size(0usize);
+    clone.into_sync()
+}
+
 /// Below this many changed files, the per-file diff renderers stay
 /// serial. The rayon `par_iter().map_init` setup (work-stealing
 /// scheduler hookup + the gix `ThreadSafeRepository` clone for each
@@ -165,13 +186,24 @@ fn run_git_thread_inner(
     positional: Option<String>,
     graph_enabled: bool,
 ) -> Result<()> {
-    let repo = match gix::discover(".") {
+    let mut repo = match gix::discover(".") {
         Ok(r) => r,
         Err(e) => {
             _ = msg_tx.send(GitMsg::History(HistoryMsg::Error(format!("Failed to open repo: {e}"))));
             return Ok(());
         }
     };
+    // Size the decoded-object cache for tree diffs against this
+    // checkout (gix's heuristic: ~10 MB per 10k tracked files), floored
+    // at OBJECT_CACHE_BYTES so small checkouts of deep histories still
+    // get useful commit/tree caching during the walk.
+    let cache_bytes = repo
+        .index_or_empty()
+        .map(|index| repo.compute_object_cache_size_for_tree_diffs(&index))
+        .unwrap_or(0)
+        .max(OBJECT_CACHE_BYTES);
+    repo.object_cache_size_if_unset(cache_bytes);
+    let repo = repo;
 
     // Try the positional as a revision (full or short hash, branch, tag,
     // `HEAD~3`, etc.); fall back to pathspec only when rev-parse can't
