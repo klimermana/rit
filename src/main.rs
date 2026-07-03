@@ -1,6 +1,6 @@
 use anyhow::Result;
 use clap::Parser;
-use crossbeam_channel::{Sender, bounded};
+use crossbeam_channel::{Sender, bounded, unbounded};
 use crossterm::{
     event::{self, Event},
     execute,
@@ -53,7 +53,10 @@ fn main() -> Result<()> {
     let backend = CrosstermBackend::new(BufWriter::new(stdout));
     let mut terminal = Terminal::new(backend)?;
 
-    let (req_tx, req_rx) = bounded::<git::GitReq>(64);
+    // Unbounded so the UI thread's request sends can never block. The
+    // queue stays tiny in practice: requests are user-generated and the
+    // worker coalesces superseded LoadDiffs on every drain.
+    let (req_tx, req_rx) = unbounded::<git::GitReq>();
     let (msg_tx, msg_rx) = bounded::<git::GitMsg>(256);
     let (input_tx, input_rx) = bounded::<Event>(64);
 

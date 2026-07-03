@@ -24,6 +24,14 @@ Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Changed
 
+- Scrubbing through commits with the diff pane open no longer computes
+  a diff for every commit passed over. The git worker now coalesces
+  queued diff requests to the newest one before doing any work (only
+  the newest result would ever be shown), so the diff you land on
+  appears immediately instead of waiting behind every intermediate
+  one — and background indexing is no longer starved while the queue
+  drains. The request channel is also unbounded now, so the UI thread
+  can never block on a send mid-keystroke.
 - Single-file / literal-path history now decides whether each commit
   touches the path by comparing the tree-entry oid at that path against
   the first parent, instead of running a full per-commit tree-diff and

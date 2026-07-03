@@ -219,27 +219,47 @@ fn run_git_thread_inner(
     const PAGE_BATCH: usize = 256;
 
     loop {
-        // Drain any queued requests first.
+        // Collect the whole pending burst before doing any work, so
+        // superseded LoadDiffs can be coalesced away instead of each
+        // being fully rendered only for the app to drop the result.
+        // Non-blocking drain while indexing; once the walk is done and
+        // nothing is queued, block for the next request (and pull in
+        // the rest of any burst that arrived while blocked).
+        let mut batch: Vec<GitReq> = Vec::new();
         loop {
             match req_rx.try_recv() {
-                Ok(req) => {
-                    if !process_request(
-                        req,
-                        &repo,
-                        &path_filter,
-                        start_id,
-                        graph_enabled,
-                        &mut walker,
-                        &mut refs_loaded,
-                        &mut tree_diff_cache,
-                        &mut dirty_handles,
-                        &msg_tx,
-                    )? {
-                        return Ok(());
-                    }
-                }
+                Ok(req) => batch.push(req),
                 Err(crossbeam_channel::TryRecvError::Empty) => break,
                 Err(crossbeam_channel::TryRecvError::Disconnected) => return Ok(()),
+            }
+        }
+        if batch.is_empty() && walker.done {
+            match req_rx.recv() {
+                Ok(first) => {
+                    batch.push(first);
+                    while let Ok(req) = req_rx.try_recv() {
+                        batch.push(req);
+                    }
+                }
+                Err(_) => return Ok(()),
+            }
+        }
+
+        coalesce_requests(&mut batch);
+        for req in batch {
+            if !process_request(
+                req,
+                &repo,
+                &path_filter,
+                start_id,
+                graph_enabled,
+                &mut walker,
+                &mut refs_loaded,
+                &mut tree_diff_cache,
+                &mut dirty_handles,
+                &msg_tx,
+            )? {
+                return Ok(());
             }
         }
 
@@ -269,28 +289,25 @@ fn run_git_thread_inner(
             }
             continue;
         }
-
-        // Indexing finished — block for the next request.
-        match req_rx.recv() {
-            Ok(req) => {
-                if !process_request(
-                    req,
-                    &repo,
-                    &path_filter,
-                    start_id,
-                    graph_enabled,
-                    &mut walker,
-                    &mut refs_loaded,
-                    &mut tree_diff_cache,
-                    &mut dirty_handles,
-                    &msg_tx,
-                )? {
-                    return Ok(());
-                }
-            }
-            Err(_) => return Ok(()),
-        }
     }
+}
+
+/// Drop every queued `LoadDiff` except the newest one. A later LoadDiff
+/// strictly supersedes an earlier one: the app's `diff.target` already
+/// reflects the newest request, so documents produced for earlier
+/// targets would be dropped on arrival anyway — computing them only
+/// delays the diff the user is actually waiting for (and starves the
+/// walk, whose preemption check sees a non-empty queue). All other
+/// requests keep their relative order.
+fn coalesce_requests(batch: &mut Vec<GitReq>) {
+    let is_load_diff = |req: &GitReq| matches!(req, GitReq::Inspect(InspectReq::LoadDiff(_)));
+    let Some(last) = batch.iter().rposition(is_load_diff) else { return };
+    let mut i = 0;
+    batch.retain(|req| {
+        let keep = !is_load_diff(req) || i == last;
+        i += 1;
+        keep
+    });
 }
 
 /// Process one request. Returns `Ok(false)` if the loop should exit,
@@ -447,10 +464,39 @@ impl Drop for DirtyJoin {
 #[cfg(test)]
 mod tests {
     use super::{
+        GitReq, HistoryReq, InspectReq, coalesce_requests,
         meta::{quick_is_dirty, relative_time},
         resolve_positional,
     };
-    use crate::test_support::{commit_all, make_fixture_repo, write_file};
+    use crate::{
+        model::DiffTarget,
+        test_support::{commit_all, make_fixture_repo, write_file},
+    };
+
+    #[test]
+    fn coalesce_keeps_only_newest_load_diff() {
+        let a = gix::ObjectId::empty_tree(gix::hash::Kind::Sha1);
+        let b = gix::ObjectId::empty_blob(gix::hash::Kind::Sha1);
+        let mut batch = vec![
+            GitReq::Inspect(InspectReq::LoadDiff(DiffTarget::WorkingTree)),
+            GitReq::Inspect(InspectReq::LoadStatus),
+            GitReq::Inspect(InspectReq::LoadDiff(DiffTarget::Commit(a))),
+            GitReq::History(HistoryReq::Reload),
+            GitReq::Inspect(InspectReq::LoadDiff(DiffTarget::Commit(b))),
+        ];
+        coalesce_requests(&mut batch);
+        assert_eq!(batch.len(), 3, "two superseded LoadDiffs dropped");
+        assert!(matches!(batch[0], GitReq::Inspect(InspectReq::LoadStatus)));
+        assert!(matches!(batch[1], GitReq::History(HistoryReq::Reload)));
+        assert!(matches!(batch[2], GitReq::Inspect(InspectReq::LoadDiff(DiffTarget::Commit(id))) if id == b));
+    }
+
+    #[test]
+    fn coalesce_no_load_diff_is_noop() {
+        let mut batch = vec![GitReq::History(HistoryReq::Reload), GitReq::Inspect(InspectReq::LoadStatus)];
+        coalesce_requests(&mut batch);
+        assert_eq!(batch.len(), 2);
+    }
 
     #[test]
     fn relative_time_clamps_future_dated_to_now() {

@@ -283,5 +283,86 @@ fn bench_pathspec_walk_then_diff(c: &mut Criterion) {
     group.finish();
 }
 
-criterion_group!(benches, bench_diff_generation, bench_working_tree_diff, bench_pathspec_walk_then_diff);
+/// Cursor-scrub scenario: the user holds `j` with the diff pane open,
+/// emitting one LoadDiff per row traversed. Only the final target's
+/// document is ever shown — the app drops the rest by target mismatch —
+/// so the metric that matters is time until the *last* requested diff
+/// arrives. This is the bench that motivates (and validates) worker-side
+/// coalescing of superseded LoadDiff requests: without coalescing the
+/// worker fully renders all N intermediate diffs first.
+fn bench_cursor_scrub(c: &mut Criterion) {
+    let mut group = c.benchmark_group("cursor_scrub");
+    group.sample_size(10);
+
+    const COMMITS: usize = 40;
+    const LINES: usize = 300;
+
+    let fix = common::FixtureRepo::new();
+    // Each commit rewrites the same file with shifted content so every
+    // per-commit diff is a real ~300-line modification, not a trivial
+    // one-liner.
+    for i in 0..COMMITS {
+        let mut content = String::with_capacity(LINES * 24);
+        for l in 0..LINES {
+            content.push_str(&format!("line {} of revision {i}\n", l + i));
+        }
+        std::fs::write(fix.path().join("payload.txt"), content).expect("write payload");
+        common::run_git(fix.path(), &["add", "-A"]);
+        common::run_git(fix.path(), &["commit", "-q", "-m", &format!("revision {i}")]);
+    }
+    let repo_path = fix.path_buf();
+
+    // Boot a worker and collect every commit id (newest first).
+    std::env::set_current_dir(&repo_path).expect("cd into fixture");
+    let (req_tx, req_rx) = bounded::<GitReq>(64);
+    let (msg_tx, msg_rx) = bounded::<GitMsg>(2048);
+    let handle = std::thread::spawn(move || {
+        git::run_git_thread(req_rx, msg_tx, None, false);
+    });
+    let mut ids: Vec<gix::ObjectId> = Vec::new();
+    let timeout = Duration::from_secs(10);
+    loop {
+        match msg_rx.recv_timeout(timeout) {
+            Ok(GitMsg::History(HistoryMsg::Commits { commits, .. })) => {
+                ids.extend(commits.iter().map(|c| c.id));
+            }
+            Ok(GitMsg::History(HistoryMsg::WalkDone { .. })) => break,
+            Ok(_) => {}
+            Err(_) => panic!("worker stalled before WalkDone"),
+        }
+    }
+    assert_eq!(ids.len(), COMMITS, "walker should emit every seeded commit");
+    let final_target = DiffTarget::Commit(*ids.last().expect("ids nonempty"));
+
+    group.bench_function("scrub_40_commits_300_lines", |b| {
+        b.iter(|| {
+            for id in &ids {
+                req_tx.send(GitReq::Inspect(InspectReq::LoadDiff(DiffTarget::Commit(*id)))).expect("send");
+            }
+            // Wait for the *final* target's document; earlier DiffLoaded
+            // replies (if any survive coalescing) drain along the way.
+            // The worker processes in order, so the final target's reply
+            // is always the last message of the burst.
+            loop {
+                match msg_rx.recv_timeout(Duration::from_secs(60)) {
+                    Ok(GitMsg::Inspect(InspectMsg::DiffLoaded(doc))) if doc.target == final_target => break,
+                    Ok(_) => {}
+                    Err(_) => panic!("worker stalled before final DiffLoaded"),
+                }
+            }
+        });
+    });
+
+    drop(req_tx);
+    _ = handle.join();
+    group.finish();
+}
+
+criterion_group!(
+    benches,
+    bench_diff_generation,
+    bench_working_tree_diff,
+    bench_pathspec_walk_then_diff,
+    bench_cursor_scrub
+);
 criterion_main!(benches);
