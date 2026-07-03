@@ -18,6 +18,12 @@ pub struct WorkingTreeRow {
     pub dirty: Option<bool>,
 }
 
+#[expect(
+    clippy::large_enum_variant,
+    reason = "the WorkingTree variant occurs exactly once (index 0, see commits_len) so no per-row \
+              memory is wasted, and boxing CommitRecord would add a pointer chase to every commit \
+              row on the per-frame render and search hot paths"
+)]
 pub enum LogRow {
     WorkingTree(WorkingTreeRow),
     Commit(CommitRecord),

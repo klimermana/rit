@@ -65,7 +65,7 @@ can be evaluated against real data instead of intuition.
 ## Other useful commands
 
 - `cargo build` — debug build (fast)
-- `cargo test --tests` — run the 28 unit + integration tests
+- `cargo test --tests` — run the unit + integration tests
 - `cargo build --benches` — verify bench code compiles without running benches
 
 ## Lints
