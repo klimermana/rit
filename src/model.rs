@@ -36,15 +36,13 @@ impl PathFilter {
 pub struct CommitRecord {
     pub id: ObjectId,
     pub short_id: CompactString,
-    /// Raw author-time epoch seconds. Currently unused by rendering but
-    /// stored so callers don't have to re-decode the commit. Kept as a
-    /// `pub` field so future consumers don't have to re-add it.
+    /// Raw author-time epoch seconds. Rendered by the log view's
+    /// absolute date mode (`D`) without re-decoding the commit.
     pub authored_unix_secs: i64,
     /// Pre-formatted relative timestamp ("2d ago").
     pub authored_relative: CompactString,
-    /// Author name as displayed. Currently truncated by the history worker
-    /// at AUTHOR_DISPLAY_CHARS; a later commit moves the truncation into
-    /// the UI layer so search can use the full name.
+    /// Full author name; the UI truncates to the active column width at
+    /// render time so search can match substrings past the display cap.
     pub author: CompactString,
     pub summary: String,
     pub refs: Vec<RefLabel>,

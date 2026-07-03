@@ -214,3 +214,77 @@ pub struct YankFeedback {
     pub text: String,
     pub shown_at: Instant,
 }
+
+/// How the log view renders the date column. Cycled with `D`.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum DateMode {
+    /// "2d ago" — the default.
+    Relative,
+    /// "2026-07-03 14:05", rendered from `authored_unix_secs` in the
+    /// local timezone.
+    Absolute,
+    Off,
+}
+
+impl DateMode {
+    pub fn next(self) -> Self {
+        match self {
+            Self::Relative => Self::Absolute,
+            Self::Absolute => Self::Off,
+            Self::Off => Self::Relative,
+        }
+    }
+
+    /// Column width including the trailing separator space; 0 = hidden.
+    pub fn col_width(self) -> usize {
+        match self {
+            Self::Relative => 8,
+            Self::Absolute => 16,
+            Self::Off => 0,
+        }
+    }
+}
+
+/// How the log view renders the author column. Cycled with `A`.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum AuthorMode {
+    /// 20-char column — the default.
+    Full,
+    /// 10-char column.
+    Abbrev,
+    Off,
+}
+
+impl AuthorMode {
+    pub fn next(self) -> Self {
+        match self {
+            Self::Full => Self::Abbrev,
+            Self::Abbrev => Self::Off,
+            Self::Off => Self::Full,
+        }
+    }
+
+    pub fn col_width(self) -> usize {
+        match self {
+            Self::Full => 20,
+            Self::Abbrev => 10,
+            Self::Off => 0,
+        }
+    }
+}
+
+/// Render-time display toggles for the log view (tig's `D` / `A` / `X`).
+/// Pure UI state — the underlying `CommitRecord` always stores the full
+/// data, so cycling a mode is just a redraw.
+pub struct DisplayOptions {
+    pub date: DateMode,
+    pub author: AuthorMode,
+    /// `X`: render the full 40-char commit id instead of the short one.
+    pub full_hash: bool,
+}
+
+impl Default for DisplayOptions {
+    fn default() -> Self {
+        Self { date: DateMode::Relative, author: AuthorMode::Full, full_hash: false }
+    }
+}

@@ -14,8 +14,8 @@ pub mod search;
 pub mod state;
 
 pub use state::{
-    CommitSearchState, DiffSearchState, DiffState, Focus, LogRow, LogState, SearchSnapshot, StatusState,
-    WorkingTreeRow, YankFeedback,
+    AuthorMode, CommitSearchState, DateMode, DiffSearchState, DiffState, DisplayOptions, Focus, LogRow, LogState,
+    SearchSnapshot, StatusState, WorkingTreeRow, YankFeedback,
 };
 
 use crate::{
@@ -34,8 +34,6 @@ use ratatui::{Terminal, backend::Backend};
 use std::time::{Duration, Instant};
 
 const YANK_FEEDBACK_DURATION: Duration = Duration::from_secs(2);
-const AUTHOR_COL_WIDTH: usize = 20;
-const DATE_COL_WIDTH: usize = 8;
 
 pub struct App {
     pub log: LogState,
@@ -43,6 +41,8 @@ pub struct App {
     pub diff: DiffState,
     pub status: StatusState,
     pub focus: Focus,
+    /// Render-time display toggles (`D` date, `A` author, `X` hash).
+    pub display: DisplayOptions,
     pub show_help: bool,
     pub yank_message: Option<YankFeedback>,
     pub error: Option<String>,
@@ -87,6 +87,7 @@ impl App {
             },
             status: StatusState { open: false, document: None, scroll: 0, loading: false },
             focus: Focus::Log,
+            display: DisplayOptions::default(),
             show_help: false,
             yank_message: None,
             error: None,
@@ -637,10 +638,10 @@ impl App {
     }
 
     pub fn author_col_width(&self) -> usize {
-        AUTHOR_COL_WIDTH
+        self.display.author.col_width()
     }
     pub fn date_col_width(&self) -> usize {
-        DATE_COL_WIDTH
+        self.display.date.col_width()
     }
 
     /// Number of real commits in the log (excludes the pseudo "Not Committed
@@ -939,6 +940,25 @@ mod tests {
         app.handle_input(key(KeyCode::Char('q'), KeyModifiers::NONE));
         assert!(!app.show_help, "q closes help");
         assert!(!app.should_quit, "q in help does not quit the app");
+    }
+
+    #[test]
+    fn display_toggles_cycle_modes() {
+        let (mut app, _ends) = test_app();
+        app.handle_input(key(KeyCode::Char('D'), KeyModifiers::SHIFT));
+        assert!(matches!(app.display.date, DateMode::Absolute));
+        app.handle_input(key(KeyCode::Char('D'), KeyModifiers::SHIFT));
+        assert!(matches!(app.display.date, DateMode::Off));
+        app.handle_input(key(KeyCode::Char('D'), KeyModifiers::SHIFT));
+        assert!(matches!(app.display.date, DateMode::Relative));
+
+        app.handle_input(key(KeyCode::Char('A'), KeyModifiers::SHIFT));
+        assert!(matches!(app.display.author, AuthorMode::Abbrev));
+
+        app.handle_input(key(KeyCode::Char('X'), KeyModifiers::SHIFT));
+        assert!(app.display.full_hash);
+        app.handle_input(key(KeyCode::Char('X'), KeyModifiers::SHIFT));
+        assert!(!app.display.full_hash);
     }
 
     #[test]

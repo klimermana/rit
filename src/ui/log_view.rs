@@ -79,27 +79,26 @@ fn commit_spans(commit: &CommitRecord, app: &App, search_query: &str, highlight_
     if !commit.graph.is_empty() {
         spans.push(Span::styled(format!("{} ", commit.graph), Style::default().fg(Color::DarkGray)));
     }
-    spans.push(Span::styled(
-        commit.short_id.to_string(),
-        Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD),
-    ));
+    let hash = if app.display.full_hash { commit.id.to_string() } else { commit.short_id.to_string() };
+    spans.push(Span::styled(hash, Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)));
     spans.push(Span::raw(" "));
-    spans.push(Span::styled(
-        format!("{:<width$}", commit.authored_relative, width = app.date_col_width()),
-        Style::default().fg(Color::Blue),
-    ));
-    spans.push(Span::raw(" "));
+    if let Some(date) = date_cell(app, commit.authored_unix_secs, &commit.authored_relative) {
+        spans.push(Span::styled(date, Style::default().fg(Color::Blue)));
+        spans.push(Span::raw(" "));
+    }
 
     // Truncate the full author name to the column width here at render
     // time; the underlying CommitRecord stores the full name so search
-    // can find substrings past the 20-char display cap.
-    let author_truncated = truncate_chars(&commit.author, app.author_col_width());
-    let author_span = Span::styled(
-        format!("{:<width$}", author_truncated, width = app.author_col_width()),
-        Style::default().fg(Color::Green),
-    );
-    highlight_matches_in_span(&mut spans, author_span, search_query, highlight_style);
-    spans.push(Span::raw(" "));
+    // can find substrings past the display cap.
+    if app.author_col_width() > 0 {
+        let author_truncated = truncate_chars(&commit.author, app.author_col_width());
+        let author_span = Span::styled(
+            format!("{:<width$}", author_truncated, width = app.author_col_width()),
+            Style::default().fg(Color::Green),
+        );
+        highlight_matches_in_span(&mut spans, author_span, search_query, highlight_style);
+        spans.push(Span::raw(" "));
+    }
 
     for label in &commit.refs {
         let (fg, modifier) = match label.kind {
@@ -123,21 +122,48 @@ fn truncate_chars(s: &str, max_chars: usize) -> String {
     s.char_indices().nth(max_chars).and_then(|(boundary, _)| s.get(..boundary)).unwrap_or(s).to_string()
 }
 
+/// Render the date column per the active `DateMode`: pre-formatted
+/// relative text, absolute local time from the stored epoch seconds, or
+/// `None` when the column is hidden. Padded to the mode's column width.
+fn date_cell(app: &App, unix_secs: i64, relative: &str) -> Option<String> {
+    use crate::app::DateMode;
+    use chrono::{Local, TimeZone};
+    let width = app.date_col_width();
+    match app.display.date {
+        DateMode::Relative => Some(format!("{relative:<width$}")),
+        DateMode::Absolute => {
+            let text = Local
+                .timestamp_opt(unix_secs, 0)
+                .single()
+                .map(|t| t.format("%Y-%m-%d %H:%M").to_string())
+                .unwrap_or_else(|| "?".to_string());
+            Some(format!("{text:<width$}"))
+        }
+        DateMode::Off => None,
+    }
+}
+
 fn working_tree_spans(row: &WorkingTreeRow, app: &App) -> Vec<Span<'static>> {
     let mut spans: Vec<Span<'static>> = Vec::new();
     let dim = Style::default().fg(Color::DarkGray);
-    spans.push(Span::styled("0000000", dim));
+    let hash = if app.display.full_hash { "0".repeat(40) } else { "0000000".to_string() };
+    spans.push(Span::styled(hash, dim));
     spans.push(Span::raw(" "));
-    spans.push(Span::styled(
-        format!("{:<width$}", "now", width = app.date_col_width()),
-        Style::default().fg(Color::Blue),
-    ));
-    spans.push(Span::raw(" "));
-    spans.push(Span::styled(
-        format!("{:<width$}", row.author, width = app.author_col_width()),
-        Style::default().fg(Color::Green),
-    ));
-    spans.push(Span::raw(" "));
+    if app.date_col_width() > 0 {
+        spans.push(Span::styled(
+            format!("{:<width$}", "now", width = app.date_col_width()),
+            Style::default().fg(Color::Blue),
+        ));
+        spans.push(Span::raw(" "));
+    }
+    if app.author_col_width() > 0 {
+        let author = truncate_chars(&row.author, app.author_col_width());
+        spans.push(Span::styled(
+            format!("{:<width$}", author, width = app.author_col_width()),
+            Style::default().fg(Color::Green),
+        ));
+        spans.push(Span::raw(" "));
+    }
     let (text, style) = match row.dirty {
         Some(true) => ("Uncommitted changes", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
         Some(false) => ("Working tree clean", Style::default().fg(Color::Green)),

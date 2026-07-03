@@ -145,6 +145,11 @@ impl App {
                 }
             }
             (_, Char('R'), Mod::NONE) => self.reload(),
+            // Display toggles (tig-style). Uppercase letters typically
+            // arrive with Mod::SHIFT; accept both, like `G`/`N` above.
+            (_, Char('D'), Mod::NONE | Mod::SHIFT) => self.display.date = self.display.date.next(),
+            (_, Char('A'), Mod::NONE | Mod::SHIFT) => self.display.author = self.display.author.next(),
+            (_, Char('X'), Mod::NONE | Mod::SHIFT) => self.display.full_hash = !self.display.full_hash,
             (_, Tab, Mod::NONE) if self.diff.open => self.cycle_focus(),
             (Focus::Log, Enter, Mod::NONE) => {
                 self.diff.open = true;

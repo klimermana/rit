@@ -83,6 +83,10 @@ Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- Display toggles in the log view, tig-style: `D` cycles the date
+  column (relative → absolute local time → hidden), `A` cycles the
+  author column (full → abbreviated → hidden), and `X` switches
+  between the short and full 40-char commit hash.
 - Horizontal scroll in the diff pane. `h` / `l` (or `←` / `→`) shift
   the view 4 columns at a time so truncated long lines can be read in
   full; `0` snaps back to column 0. Reset automatically when a new
