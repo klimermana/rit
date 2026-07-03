@@ -106,6 +106,19 @@ pub struct DiffDocument {
     /// updates from a prior LoadDiff become no-ops) and `None` for
     /// commit diffs, which have no untracked section.
     pub untracked_anchor: Option<usize>,
+    /// Per-file section starts into `body`, in render order. Drives
+    /// `[` / `]` file navigation in the diff pane (and gives `b` blame
+    /// the path under the viewport). Files summarised by the
+    /// file-count guardrail emit no body lines and so have no section.
+    pub sections: Vec<FileSection>,
+}
+
+/// One file's slice of a `DiffDocument::body`.
+#[derive(Clone)]
+pub struct FileSection {
+    pub path: String,
+    /// Index into `body` of this file's first header line.
+    pub body_start: usize,
 }
 
 /// Out-of-band info about how the diff was produced — the binary /

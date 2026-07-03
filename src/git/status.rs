@@ -19,7 +19,9 @@ use crate::{
         DiffSink, FileDiffOutput, file_addition_output, file_deletion_output, file_modification_output,
         merge_file_output_into_sink,
     },
-    model::{DiffDocument, DiffFlags, DiffLine, DiffLineKind, DiffStats, DiffTarget, FileStat, StatusDocument},
+    model::{
+        DiffDocument, DiffFlags, DiffLine, DiffLineKind, DiffStats, DiffTarget, FileSection, FileStat, StatusDocument,
+    },
 };
 use anyhow::Result;
 use gix::{ObjectId, status::UntrackedFiles};
@@ -33,7 +35,8 @@ use rayon::prelude::*;
 /// renderers `compute_working_tree_diff` uses, so the staged/unstaged
 /// rendering stays in lockstep across the two entry points.
 pub fn compute_status(repo: &gix::Repository) -> StatusDocument {
-    let (body, _, _, _, _) = assemble_working_tree_body(repo, UntrackedFiles::Collapsed, /* placeholder */ false);
+    let (body, _, _, _, _, _) =
+        assemble_working_tree_body(repo, UntrackedFiles::Collapsed, /* placeholder */ false);
     StatusDocument { lines: body }
 }
 
@@ -393,11 +396,12 @@ fn assemble_working_tree_body(
     repo: &gix::Repository,
     untracked_files: UntrackedFiles,
     reserve_untracked_anchor: bool,
-) -> (Vec<DiffLine>, Vec<FileStat>, DiffStats, DiffFlags, Option<usize>) {
+) -> (Vec<DiffLine>, Vec<FileStat>, DiffStats, DiffFlags, Option<usize>, Vec<FileSection>) {
     let mut body: Vec<DiffLine> = Vec::new();
     let mut files: Vec<FileStat> = Vec::new();
     let mut stats = DiffStats { files: 0, insertions: 0, deletions: 0 };
     let mut flags = DiffFlags::default();
+    let mut sections: Vec<FileSection> = Vec::new();
 
     body.push(DiffLine::new(DiffLineKind::SectionTitle, "Working Tree Status"));
     body.push(DiffLine::new(DiffLineKind::Blank, ""));
@@ -431,7 +435,13 @@ fn assemble_working_tree_body(
     };
 
     {
-        let mut sink = DiffSink { lines: &mut body, stats: &mut stats, files: &mut files, flags: &mut flags };
+        let mut sink = DiffSink {
+            lines: &mut body,
+            stats: &mut stats,
+            files: &mut files,
+            flags: &mut flags,
+            sections: &mut sections,
+        };
         if render_staged_section(repo, &mut sink, staged) == 0 {
             sink.lines.push(DiffLine::new(DiffLineKind::Faint, "(no staged changes)"));
         }
@@ -441,13 +451,19 @@ fn assemble_working_tree_body(
     body.push(DiffLine::new(DiffLineKind::SectionUnstaged, "── Unstaged ────────────────────────────────────────────"));
     body.push(DiffLine::new(DiffLineKind::Blank, ""));
     {
-        let mut sink = DiffSink { lines: &mut body, stats: &mut stats, files: &mut files, flags: &mut flags };
+        let mut sink = DiffSink {
+            lines: &mut body,
+            stats: &mut stats,
+            files: &mut files,
+            flags: &mut flags,
+            sections: &mut sections,
+        };
         if render_unstaged_section(repo, &mut sink, unstaged) == 0 {
             sink.lines.push(DiffLine::new(DiffLineKind::Faint, "(no unstaged changes)"));
         }
     }
 
-    (body, files, stats, flags, untracked_anchor)
+    (body, files, stats, flags, untracked_anchor, sections)
 }
 
 /// Assemble the working-tree diff document with the untracked walk
@@ -458,9 +474,9 @@ fn assemble_working_tree_body(
 /// the walk finishes. On a wide-checkout monorepo, skipping the dir
 /// walk here is what closes the gap with `git diff`'s wall clock.
 pub fn compute_working_tree_diff(repo: &gix::Repository, target: DiffTarget) -> DiffDocument {
-    let (body, files, stats, flags, untracked_anchor) =
+    let (body, files, stats, flags, untracked_anchor, sections) =
         assemble_working_tree_body(repo, UntrackedFiles::None, /* placeholder */ true);
-    DiffDocument { target, header: Vec::new(), body, files, stats, flags, untracked_anchor }
+    DiffDocument { target, header: Vec::new(), body, files, stats, flags, untracked_anchor, sections }
 }
 
 /// Walk just the untracked-files dimension of `gix::status`, returning

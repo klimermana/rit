@@ -49,6 +49,7 @@ pub fn draw_help(frame: &mut Frame, area: Rect) {
         row!("  Tab            ", "Switch focus: log ↔ diff"),
         row!("  h / l / ← / →  ", "Scroll left / right (4 cols)"),
         row!("  0              ", "Reset horizontal scroll"),
+        row!("  ] / [          ", "Jump to next / previous file in diff"),
         row!("  q / Esc        ", "Close diff pane (or quit from log)"),
         Line::from(""),
         Line::from(Span::styled("Search", h)),

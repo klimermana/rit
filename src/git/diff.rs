@@ -7,7 +7,7 @@ use crate::{
         MAX_INLINE_DIFF_BYTES, MAX_INLINE_DIFF_FILES, MAX_INLINE_DIFF_LINES, PARALLEL_FILE_THRESHOLD, TreeDiffCache,
         compute_tree_diff_records, meta::format_timestamp,
     },
-    model::{DiffDocument, DiffFlags, DiffLine, DiffLineKind, DiffStats, DiffTarget, FileStat},
+    model::{DiffDocument, DiffFlags, DiffLine, DiffLineKind, DiffStats, DiffTarget, FileSection, FileStat},
 };
 use anyhow::Result;
 use gix::{ObjectId, bstr::ByteSlice};
@@ -30,6 +30,7 @@ pub fn empty_error_document(target: DiffTarget, e: anyhow::Error) -> DiffDocumen
         stats: DiffStats { files: 0, insertions: 0, deletions: 0 },
         flags: DiffFlags::default(),
         untracked_anchor: None,
+        sections: Vec::new(),
     }
 }
 
@@ -85,12 +86,19 @@ fn compute_commit_diff_inner(
     let records = compute_tree_diff_records(repo, parent_ids.first().copied(), id, cache)?.to_vec();
 
     let mut flags = DiffFlags::default();
+    let mut sections: Vec<FileSection> = Vec::new();
     {
-        let mut sink = DiffSink { lines: &mut body, stats: &mut stats, files: &mut files, flags: &mut flags };
+        let mut sink = DiffSink {
+            lines: &mut body,
+            stats: &mut stats,
+            files: &mut files,
+            flags: &mut flags,
+            sections: &mut sections,
+        };
         render_diff_records(repo, &records, &mut sink);
     }
 
-    Ok(DiffDocument { target, header, body, files, stats, flags, untracked_anchor: None })
+    Ok(DiffDocument { target, header, body, files, stats, flags, untracked_anchor: None, sections })
 }
 
 /// Render previously-computed tree-diff records into the sink. Split
@@ -190,6 +198,9 @@ pub struct DiffSink<'a> {
     pub stats: &'a mut DiffStats,
     pub files: &'a mut Vec<FileStat>,
     pub flags: &'a mut DiffFlags,
+    /// Per-file section starts, recorded as each file's lines are
+    /// merged. Ends up on `DiffDocument::sections`.
+    pub sections: &'a mut Vec<FileSection>,
 }
 
 impl DiffSink<'_> {
@@ -321,6 +332,7 @@ pub fn merge_file_output_into_sink(sink: &mut DiffSink<'_>, output: FileDiffOutp
     }
     sink.stats.insertions += output.additions;
     sink.stats.deletions += output.deletions;
+    sink.sections.push(FileSection { path: output.path.clone(), body_start: sink.lines.len() });
     sink.lines.extend(output.lines);
     sink.record_file(output.path, output.additions, output.deletions);
 }
@@ -542,8 +554,15 @@ mod tests {
         let mut stats = DiffStats { files: 0, insertions: 0, deletions: 0 };
         let mut files: Vec<FileStat> = Vec::new();
         let mut flags = DiffFlags::default();
+        let mut sections = Vec::new();
         {
-            let mut sink = DiffSink { lines: &mut lines, stats: &mut stats, files: &mut files, flags: &mut flags };
+            let mut sink = DiffSink {
+                lines: &mut lines,
+                stats: &mut stats,
+                files: &mut files,
+                flags: &mut flags,
+                sections: &mut sections,
+            };
             render_file_modification(&mut sink, "x.txt", old, new);
         }
         lines
@@ -593,10 +612,20 @@ mod tests {
         let mut stats = DiffStats { files: 0, insertions: 0, deletions: 0 };
         let mut files: Vec<FileStat> = Vec::new();
         let mut flags = DiffFlags::default();
+        let mut sections = Vec::new();
         {
-            let mut sink = DiffSink { lines: &mut lines, stats: &mut stats, files: &mut files, flags: &mut flags };
+            let mut sink = DiffSink {
+                lines: &mut lines,
+                stats: &mut stats,
+                files: &mut files,
+                flags: &mut flags,
+                sections: &mut sections,
+            };
             render_file_modification(&mut sink, "x.txt", b"a\nb\nc\n", b"a\nB\nc\n");
         }
+        assert_eq!(sections.len(), 1);
+        assert_eq!(sections[0].path, "x.txt");
+        assert_eq!(sections[0].body_start, 0);
         let adds: Vec<&str> = lines
             .iter()
             .filter_map(|l| if matches!(l.kind, DiffLineKind::Add) { Some(l.text.as_str()) } else { None })

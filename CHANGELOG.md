@@ -83,6 +83,9 @@ Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- `]` / `[` jump to the next / previous file in the diff pane, so a
+  many-file commit can be skimmed without scrolling through every
+  hunk. `[` above the first file returns to the commit header.
 - Display toggles in the log view, tig-style: `D` cycles the date
   column (relative → absolute local time → hidden), `A` cycles the
   author column (full → abbreviated → hidden), and `X` switches

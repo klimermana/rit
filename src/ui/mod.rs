@@ -125,7 +125,9 @@ fn draw_status_bar(frame: &mut Frame, app: &App, area: Rect) {
     } else if app.status.open {
         Line::from(Span::raw(" q/Esc/s:close-status  j/k:scroll  g/G:top/bottom"))
     } else if app.diff.open {
-        Line::from(Span::raw(" q/Esc:close-diff  j/k:nav  Tab:switch  /:search-diff  v:hunks  y:yank  ?:help"))
+        Line::from(Span::raw(
+            " q/Esc:close-diff  j/k:nav  ]/[:file  Tab:switch  /:search-diff  v:hunks  y:yank  ?:help",
+        ))
     } else {
         let count = app.commits_len();
         let count_str = if app.walk_done { format!("{}", count) } else { format!("{}+", count) };

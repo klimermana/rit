@@ -324,7 +324,16 @@ impl App {
             Vec::new()
         };
 
+        let delta = replacement.len() as isize - 1;
         doc.body.splice(anchor..anchor + 1, replacement);
+
+        // The splice sits before the staged/unstaged sections, so every
+        // file-section start past the anchor shifted by `delta`.
+        for section in doc.sections.iter_mut() {
+            if section.body_start > anchor {
+                section.body_start = section.body_start.saturating_add_signed(delta);
+            }
+        }
 
         // Body indices shifted, so the lowercased mirrors and any
         // active diff-search match set are stale. Mirror the
@@ -662,6 +671,31 @@ impl App {
         let total = self.diff.total_visible_lines();
         self.diff.scroll = total.saturating_sub(self.diff.view_height);
     }
+
+    /// `]` / `[`: jump the diff scroll to the next / previous file
+    /// section start. Section starts are body indices; convert to
+    /// virtual lines by adding the header + diffstat extent. No-op in
+    /// summary mode (`v`), where the body isn't rendered.
+    pub(crate) fn diff_jump_file(&mut self, dir: isize) {
+        if !self.diff.show_hunks {
+            return;
+        }
+        let Some(doc) = self.diff.document.as_ref() else { return };
+        let offset = doc.header.len() + self.diff.diffstat_line_count();
+        let cur = self.diff.scroll;
+        let target = if dir > 0 {
+            doc.sections.iter().map(|s| offset + s.body_start).find(|&v| v > cur)
+        } else {
+            doc.sections.iter().map(|s| offset + s.body_start).rev().find(|&v| v < cur)
+        };
+        if let Some(pos) = target {
+            let max = self.diff.total_visible_lines().saturating_sub(self.diff.view_height);
+            self.diff.scroll = pos.min(max);
+        } else if dir < 0 {
+            // No section above the cursor — go to the top (commit header).
+            self.diff.scroll = 0;
+        }
+    }
 }
 
 #[cfg(test)]
@@ -727,6 +761,7 @@ mod tests {
             stats: DiffStats { files: 0, insertions: 0, deletions: 0 },
             flags: DiffFlags::default(),
             untracked_anchor: Some(1),
+            sections: Vec::new(),
         }
     }
 
@@ -940,6 +975,66 @@ mod tests {
         app.handle_input(key(KeyCode::Char('q'), KeyModifiers::NONE));
         assert!(!app.show_help, "q closes help");
         assert!(!app.should_quit, "q in help does not quit the app");
+    }
+
+    #[test]
+    fn diff_jump_file_moves_between_section_starts() {
+        use crate::model::FileSection;
+        let (mut app, _ends) = test_app();
+        app.diff.open = true;
+        app.focus = Focus::Diff;
+        app.diff.view_height = 5;
+        let mut doc = working_tree_doc_with_anchor();
+        doc.untracked_anchor = None;
+        // header has 1 line, no diffstat (files empty) → offset = 1.
+        doc.body = (0..40).map(|i| DiffLine::new(DiffLineKind::Context, format!("line {i}"))).collect();
+        doc.sections = vec![
+            FileSection { path: "a.txt".into(), body_start: 0 },
+            FileSection { path: "b.txt".into(), body_start: 10 },
+            FileSection { path: "c.txt".into(), body_start: 30 },
+        ];
+        app.diff.document = Some(doc);
+
+        app.diff_jump_file(1);
+        assert_eq!(app.diff.scroll, 1, "] from top lands on the first section (offset by header)");
+        app.diff_jump_file(1);
+        assert_eq!(app.diff.scroll, 11);
+        app.diff_jump_file(-1);
+        assert_eq!(app.diff.scroll, 1);
+        app.diff_jump_file(-1);
+        assert_eq!(app.diff.scroll, 0, "[ above the first section goes to the top");
+
+        // Jump past the end clamps to max scroll.
+        app.diff.scroll = 12;
+        app.diff_jump_file(1);
+        let max = app.diff.total_visible_lines() - app.diff.view_height;
+        assert_eq!(app.diff.scroll, 31.min(max));
+    }
+
+    #[test]
+    fn untracked_splice_shifts_later_section_starts() {
+        use crate::model::FileSection;
+        let (mut app, _ends) = test_app();
+        app.diff.open = true;
+        app.diff.target = Some(DiffTarget::WorkingTree);
+        app.diff_seq = 1;
+        let mut doc = working_tree_doc_with_anchor(); // anchor at body index 1
+        doc.sections = vec![
+            FileSection { path: "before.txt".into(), body_start: 0 },
+            FileSection { path: "after.txt".into(), body_start: 2 },
+        ];
+        app.diff.document = Some(doc);
+
+        // Three untracked paths replace the 1-line placeholder: delta +2.
+        app.apply_untracked_update(
+            DiffTarget::WorkingTree,
+            1,
+            vec!["u1".to_string(), "u2".to_string(), "u3".to_string()],
+        );
+
+        let doc = app.diff.document.as_ref().expect("doc");
+        assert_eq!(doc.sections[0].body_start, 0, "sections before the anchor stay put");
+        assert_eq!(doc.sections[1].body_start, 4, "sections after the anchor shift by the splice delta");
     }
 
     #[test]

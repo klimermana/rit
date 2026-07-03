@@ -202,6 +202,8 @@ impl App {
                 self.diff.horizontal_scroll = self.diff.horizontal_scroll.saturating_add(HORIZONTAL_STEP);
             }
             (Focus::Diff, Char('0'), Mod::NONE) => self.diff.horizontal_scroll = 0,
+            (Focus::Diff, Char(']'), Mod::NONE) => self.diff_jump_file(1),
+            (Focus::Diff, Char('['), Mod::NONE) => self.diff_jump_file(-1),
             _ => {}
         }
     }
