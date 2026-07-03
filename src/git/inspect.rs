@@ -8,7 +8,7 @@
 //! Runtime is still a single worker thread shared with the history
 //! protocol; the split lives only in the type system today.
 
-use crate::model::{DiffDocument, DiffTarget, RefEntry, StatusDocument};
+use crate::model::{BlameDocument, DiffDocument, DiffTarget, RefEntry, StatusDocument};
 
 /// Requests the inspect side answers.
 pub enum InspectReq {
@@ -33,6 +33,26 @@ pub enum InspectReq {
     /// `user.name` in another terminal). Currently triggered alongside
     /// `Reload` from the app.
     RefreshWorkingTreeMeta,
+    /// Annotate `path` with gix-blame. Runs on a worker side thread
+    /// (blame walks history and can take seconds on long-lived files)
+    /// so the walk and diff requests stay live; `seq` gates stale
+    /// replies exactly like `LoadDiff`.
+    LoadBlame {
+        path: String,
+        at: BlameAt,
+        seq: u64,
+    },
+}
+
+/// Which revision a blame runs against. The worker resolves `Head` and
+/// `ParentOfCommit` so the app never needs its own rev-parse access.
+#[derive(Clone, Copy, Debug)]
+pub enum BlameAt {
+    Head,
+    Commit(gix::ObjectId),
+    /// Re-blame at the first parent of this commit (`,` on a blame
+    /// line). Errors if the commit has no parent.
+    ParentOfCommit(gix::ObjectId),
 }
 
 /// Replies the inspect side emits. (An `Error` variant will land with the
@@ -49,6 +69,12 @@ pub enum InspectMsg {
     /// Reply to `LoadRefs`: sorted (branches, remotes, tags; name order
     /// within kind) entries for the refs view.
     RefsListLoaded(Vec<RefEntry>),
+    /// Reply to `LoadBlame`. `Err` carries a display-ready message
+    /// (file not found at that revision, commit has no parent, …).
+    BlameLoaded {
+        seq: u64,
+        result: Result<BlameDocument, String>,
+    },
     WorkingTreeMeta {
         author: String,
         /// `None` when the dirty check failed (e.g. no worktree or status

@@ -1,5 +1,5 @@
 use anyhow::Result;
-use clap::Parser;
+use clap::{Parser, Subcommand};
 use crossbeam_channel::{Sender, bounded, unbounded};
 use crossterm::{
     event::{self, Event},
@@ -29,6 +29,20 @@ struct Cli {
     /// per-commit lane bookkeeping is non-trivial on deep monorepos.
     #[arg(short = 'g', long = "graph")]
     graph: bool,
+
+    #[command(subcommand)]
+    command: Option<Command>,
+}
+
+#[derive(Subcommand, Debug)]
+enum Command {
+    /// Launch straight into the blame view for a file (annotated at
+    /// HEAD). Inside the view: Enter opens the line's commit, `,`
+    /// re-blames at its parent, Backspace goes back.
+    Blame {
+        /// Repo-relative path of the file to annotate.
+        path: String,
+    },
 }
 
 fn main() -> Result<()> {
@@ -70,6 +84,9 @@ fn main() -> Result<()> {
     });
 
     let mut app = App::new(req_tx, msg_rx, input_rx);
+    if let Some(Command::Blame { path }) = cli.command {
+        app.open_blame(path, git::BlameAt::Head);
+    }
     let result = app.run(&mut terminal);
 
     disable_raw_mode()?;

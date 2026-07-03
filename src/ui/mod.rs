@@ -1,3 +1,4 @@
+pub mod blame_view;
 pub mod diff_view;
 pub mod help;
 pub mod log_view;
@@ -49,6 +50,15 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
 
     if app.refs.open {
         refs_view::draw_refs_view(frame, app, main_area);
+        draw_status_bar(frame, app, status_bar_area);
+        if app.show_help {
+            help::draw_help(frame, size);
+        }
+        return;
+    }
+
+    if app.blame.open {
+        blame_view::draw_blame_view(frame, app, main_area);
         draw_status_bar(frame, app, status_bar_area);
         if app.show_help {
             help::draw_help(frame, size);
@@ -136,6 +146,10 @@ fn draw_status_bar(frame: &mut Frame, app: &App, area: Rect) {
         Line::from(Span::raw(" q/Esc/s:close-status  j/k:scroll  g/G:top/bottom"))
     } else if app.refs.open {
         Line::from(Span::raw(" q/Esc/r:close-refs  j/k:nav  Enter:open-log-at-ref"))
+    } else if app.blame.open {
+        Line::from(Span::raw(
+            " q/Esc:close-blame  j/k:nav  Enter:open-commit  ,:reblame-parent  Backspace:back  y:yank",
+        ))
     } else if app.diff.open {
         Line::from(Span::raw(
             " q/Esc:close-diff  j/k:nav  ]/[:file  Tab:switch  /:search-diff  v:hunks  y:yank  ?:help",

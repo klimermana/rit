@@ -83,6 +83,14 @@ Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- Blame view. `b` in the diff pane annotates the file at the top of
+  the viewport (at that commit, or HEAD for the working-tree diff);
+  `rit blame <path>` launches straight into it. Every line shows the
+  commit, author, and age that introduced it (gix-native blame — no
+  git binary needed, runs off-thread with a loading indicator).
+  `Enter` opens the selected line's commit diff, `,` re-blames at that
+  commit's parent (following renames), Backspace walks back, `y`
+  yanks the line's commit hash.
 - Refs view: `r` opens a full-screen browser of local branches,
   remote branches, and tags (annotated tags peeled to their commit),
   each with the target commit's summary and relative date. `Enter`

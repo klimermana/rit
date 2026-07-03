@@ -5,7 +5,7 @@
 
 use crate::{
     app::search::cycle,
-    model::{CommitRecord, DiffDocument, DiffTarget, RefEntry, StatusDocument},
+    model::{BlameDocument, CommitRecord, DiffDocument, DiffTarget, RefEntry, StatusDocument},
 };
 use compact_str::CompactString;
 use std::time::Instant;
@@ -208,6 +208,52 @@ pub struct StatusState {
     pub document: Option<StatusDocument>,
     pub scroll: usize,
     pub loading: bool,
+}
+
+/// Full-screen blame view (`b` from the diff pane, or `rit blame
+/// <path>`). Line-cursor based: `Enter` opens the selected line's
+/// commit, `,` re-blames at its parent, Backspace pops `history`.
+pub struct BlameState {
+    pub open: bool,
+    pub loading: bool,
+    pub document: Option<BlameDocument>,
+    pub selected: usize,
+    pub scroll: usize,
+    /// Inner height of the blame pane, updated by the renderer each
+    /// frame — cursor movement clamps against it at input time.
+    pub view_height: usize,
+    /// Display-ready error from the last blame attempt (file not in
+    /// that revision, commit has no parent, …). Cleared on request.
+    pub error: Option<String>,
+    /// Re-blame trail: (suspect, path) pairs pushed by `,` so
+    /// Backspace can walk back to where the user came from.
+    pub history: Vec<(gix::ObjectId, String)>,
+    /// Staged history entry for an in-flight `,` re-blame: committed
+    /// to `history` only when the request succeeds, so a failed
+    /// re-blame (root commit) doesn't leave a bogus Backspace target.
+    pub pending_return: Option<(gix::ObjectId, String)>,
+}
+
+impl BlameState {
+    pub fn new() -> Self {
+        Self {
+            open: false,
+            loading: false,
+            document: None,
+            selected: 0,
+            scroll: 0,
+            view_height: 1,
+            error: None,
+            history: Vec::new(),
+            pending_return: None,
+        }
+    }
+}
+
+impl Default for BlameState {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 /// Full-screen refs browser (`r`). `Enter` re-roots the log at the

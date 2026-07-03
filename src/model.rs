@@ -70,6 +70,34 @@ pub struct RefLabel {
     pub kind: RefKind,
 }
 
+/// A fully annotated file, as produced by the worker's gix-blame run.
+#[derive(Clone)]
+pub struct BlameDocument {
+    /// Repo-relative path of the blamed file (at `at`).
+    pub path: String,
+    /// The commit the blame ran against (suspect). Re-blame history
+    /// entries push this so Backspace can return.
+    pub at: ObjectId,
+    pub lines: Vec<BlameLine>,
+}
+
+/// One annotated line of a blamed file.
+#[derive(Clone)]
+pub struct BlameLine {
+    /// The commit that introduced this line.
+    pub commit_id: ObjectId,
+    pub commit_short: CompactString,
+    pub author: CompactString,
+    pub authored_relative: CompactString,
+    /// 1-based line number in the blamed file.
+    pub line_no: u32,
+    pub text: String,
+    /// The file's name at `commit_id` when it differs from
+    /// `BlameDocument::path` (rename tracking) — used by re-blame so
+    /// `,` follows the file across renames.
+    pub source_path: Option<String>,
+}
+
 /// One row of the refs view: a branch or tag with the metadata of the
 /// commit it points at (annotated tags are peeled to their commit).
 #[derive(Clone)]

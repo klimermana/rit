@@ -14,8 +14,8 @@ pub mod search;
 pub mod state;
 
 pub use state::{
-    AuthorMode, CommitSearchState, DateMode, DiffSearchState, DiffState, DisplayOptions, Focus, LogRow, LogState,
-    RefsState, SearchSnapshot, StatusState, WorkingTreeRow, YankFeedback,
+    AuthorMode, BlameState, CommitSearchState, DateMode, DiffSearchState, DiffState, DisplayOptions, Focus, LogRow,
+    LogState, RefsState, SearchSnapshot, StatusState, WorkingTreeRow, YankFeedback,
 };
 
 use crate::{
@@ -23,7 +23,7 @@ use crate::{
         clipboard::yank_to_clipboard,
         search::{commit_matches, jump_first_at_or_after, should_narrow},
     },
-    git::{GitMsg, GitReq, HistoryMsg, HistoryReq, InspectMsg, InspectReq, walk::refs_lower_from_refs},
+    git::{BlameAt, GitMsg, GitReq, HistoryMsg, HistoryReq, InspectMsg, InspectReq, walk::refs_lower_from_refs},
     model::{DiffLine, DiffLineKind, DiffTarget, RepoInfo},
     ui,
 };
@@ -41,6 +41,7 @@ pub struct App {
     pub diff: DiffState,
     pub status: StatusState,
     pub refs: RefsState,
+    pub blame: BlameState,
     pub focus: Focus,
     /// Render-time display toggles (`D` date, `A` author, `X` hash).
     pub display: DisplayOptions,
@@ -60,6 +61,9 @@ pub struct App {
     /// `UntrackedFilesUpdate`; replies whose seq is not the latest
     /// issued are stale and dropped.
     pub diff_seq: u64,
+    /// Same discipline for `LoadBlame` / `BlameLoaded` — rapid `,`
+    /// re-blames supersede each other.
+    pub blame_seq: u64,
     pub should_quit: bool,
     pub tx: Sender<GitReq>,
     pub rx: Receiver<GitMsg>,
@@ -88,6 +92,7 @@ impl App {
             },
             status: StatusState { open: false, document: None, scroll: 0, loading: false },
             refs: RefsState::new(),
+            blame: BlameState::new(),
             focus: Focus::Log,
             display: DisplayOptions::default(),
             show_help: false,
@@ -98,6 +103,7 @@ impl App {
             walk_done: false,
             walk_gen: 0,
             diff_seq: 0,
+            blame_seq: 0,
             should_quit: false,
             tx,
             rx,
@@ -276,6 +282,32 @@ impl App {
                 self.refs.entries = entries;
                 self.refs.selected = self.refs.selected.min(self.refs.entries.len().saturating_sub(1));
             }
+            InspectMsg::BlameLoaded { seq, result } => {
+                if seq != self.blame_seq {
+                    return;
+                }
+                self.blame.loading = false;
+                match result {
+                    Ok(document) => {
+                        // A successful `,` re-blame commits its staged
+                        // return point to the Backspace trail.
+                        if let Some(entry) = self.blame.pending_return.take() {
+                            self.blame.history.push(entry);
+                        }
+                        self.blame.document = Some(document);
+                        self.blame.error = None;
+                        self.blame.selected = 0;
+                        self.blame.scroll = 0;
+                    }
+                    Err(message) => {
+                        // Keep the previous document visible under the
+                        // error so a failed re-blame doesn't blank the
+                        // view; discard the staged return point.
+                        self.blame.pending_return = None;
+                        self.blame.error = Some(message);
+                    }
+                }
+            }
             InspectMsg::WorkingTreeMeta { author, dirty } => {
                 if let Some(LogRow::WorkingTree(w)) = self.log.rows.first_mut() {
                     w.author = author.into();
@@ -449,6 +481,13 @@ impl App {
             LogRow::Commit(c) => DiffTarget::Commit(c.id),
             LogRow::WorkingTree(_) => DiffTarget::WorkingTree,
         };
+        self.request_diff(target);
+    }
+
+    /// Point the diff pane at `target` and request its document (no-op
+    /// when the pane already shows that target). Shared by log
+    /// navigation and the blame view's `Enter`.
+    pub(crate) fn request_diff(&mut self, target: DiffTarget) {
         if self.diff.target != Some(target) {
             self.diff.target = Some(target);
             self.diff.document = None;
@@ -660,6 +699,17 @@ impl App {
         self.yank_message = Some(YankFeedback { text: format!("Copied: {preview}"), shown_at: Instant::now() });
     }
 
+    /// `y` in the blame view: yank the selected line's commit hash.
+    pub(crate) fn yank_blame_hash(&mut self) {
+        let Some(line) = self.blame.document.as_ref().and_then(|d| d.lines.get(self.blame.selected)) else {
+            return;
+        };
+        let hash = line.commit_id.to_string();
+        yank_to_clipboard(&hash);
+        let preview = hash.get(..12).unwrap_or(hash.as_str());
+        self.yank_message = Some(YankFeedback { text: format!("Copied: {preview}"), shown_at: Instant::now() });
+    }
+
     pub fn author_col_width(&self) -> usize {
         self.display.author.col_width()
     }
@@ -723,6 +773,100 @@ impl App {
         self.branch_name = entry.name.to_string();
         self.refs.open = false;
         self.reload_with_root(Some(target));
+    }
+
+    /// Open the blame view for `path` at `at`, requesting the
+    /// annotation from the worker. Used by the diff pane's `b`, the
+    /// CLI's `rit blame <path>` (hence `pub`), and the re-blame/back
+    /// keys.
+    pub fn open_blame(&mut self, path: String, at: BlameAt) {
+        self.blame.open = true;
+        self.blame.loading = true;
+        self.blame.error = None;
+        self.blame_seq = self.blame_seq.wrapping_add(1);
+        self.send_inspect(InspectReq::LoadBlame { path, at, seq: self.blame_seq });
+    }
+
+    /// `b` in the diff pane: blame the file whose section is at (or
+    /// above) the top of the viewport. Commit diffs blame at that
+    /// commit; the working-tree diff blames at HEAD.
+    pub(crate) fn blame_from_diff_pane(&mut self) {
+        let Some(doc) = self.diff.document.as_ref() else { return };
+        if doc.sections.is_empty() {
+            return;
+        }
+        let offset = doc.header.len() + self.diff.diffstat_line_count();
+        let body_pos = self.diff.scroll.saturating_sub(offset);
+        // Last section starting at-or-before the viewport top; before
+        // the first section (header/diffstat) falls back to the first.
+        let section = doc.sections.iter().rev().find(|s| s.body_start <= body_pos).or_else(|| doc.sections.first());
+        let Some(section) = section else { return };
+        let path = section.path.clone();
+        let at = match doc.target {
+            DiffTarget::Commit(id) => BlameAt::Commit(id),
+            DiffTarget::WorkingTree => BlameAt::Head,
+        };
+        self.blame.history.clear();
+        self.blame.pending_return = None;
+        self.open_blame(path, at);
+    }
+
+    /// Move the blame line cursor by `delta`, clamped, keeping it
+    /// visible (input-time clamping against the renderer-reported
+    /// pane height).
+    pub(crate) fn blame_move(&mut self, delta: isize) {
+        let total = self.blame.document.as_ref().map(|d| d.lines.len()).unwrap_or(0);
+        if total == 0 {
+            return;
+        }
+        let sel = (self.blame.selected as isize).saturating_add(delta).clamp(0, (total - 1) as isize);
+        self.blame.selected = usize::try_from(sel).unwrap_or(0);
+        let h = self.blame.view_height.max(1);
+        if self.blame.selected < self.blame.scroll {
+            self.blame.scroll = self.blame.selected;
+        } else if self.blame.selected >= self.blame.scroll + h {
+            self.blame.scroll = self.blame.selected - (h - 1);
+        }
+    }
+
+    /// `Enter` on a blame line: leave the blame view and open that
+    /// commit's diff, selecting it in the log when it's indexed there.
+    pub(crate) fn blame_open_commit(&mut self) {
+        let Some(id) = self.blame.document.as_ref().and_then(|d| d.lines.get(self.blame.selected)).map(|l| l.commit_id)
+        else {
+            return;
+        };
+        self.blame.open = false;
+        if let Some(idx) = self.log.rows.iter().position(|r| matches!(r, LogRow::Commit(c) if c.id == id)) {
+            self.log.selected = idx;
+            self.ensure_selected_visible();
+        }
+        self.diff.open = true;
+        self.focus = Focus::Diff;
+        self.diff.scroll = 0;
+        self.request_diff(DiffTarget::Commit(id));
+    }
+
+    /// `,` on a blame line: re-blame the file at the parent of the
+    /// commit that introduced the line — "who touched this before".
+    /// Follows renames via the line's `source_path`. The current
+    /// position is staged for the Backspace trail and committed when
+    /// the request succeeds.
+    pub(crate) fn blame_reblame_at_parent(&mut self) {
+        let Some(doc) = self.blame.document.as_ref() else { return };
+        let Some(line) = doc.lines.get(self.blame.selected) else { return };
+        let path = line.source_path.clone().unwrap_or_else(|| doc.path.clone());
+        let commit = line.commit_id;
+        self.blame.pending_return = Some((doc.at, doc.path.clone()));
+        self.open_blame(path, BlameAt::ParentOfCommit(commit));
+    }
+
+    /// Backspace in the blame view: return to the most recent re-blame
+    /// origin.
+    pub(crate) fn blame_back(&mut self) {
+        let Some((at, path)) = self.blame.history.pop() else { return };
+        self.blame.pending_return = None;
+        self.open_blame(path, BlameAt::Commit(at));
     }
 
     /// `]` / `[`: jump the diff scroll to the next / previous file
@@ -1164,6 +1308,135 @@ mod tests {
         app.refs_move(-9);
         assert_eq!(app.refs.selected, 0);
         assert_eq!(app.refs.scroll, 0);
+    }
+
+    fn blame_doc(path: &str, at: gix::ObjectId, commits: &[u8]) -> crate::model::BlameDocument {
+        crate::model::BlameDocument {
+            path: path.to_string(),
+            at,
+            lines: commits
+                .iter()
+                .enumerate()
+                .map(|(i, &c)| crate::model::BlameLine {
+                    commit_id: oid(c),
+                    commit_short: format!("{c:07x}").into(),
+                    author: "a".into(),
+                    authored_relative: "1d ago".into(),
+                    line_no: i as u32 + 1,
+                    text: format!("line {i}"),
+                    source_path: None,
+                })
+                .collect(),
+        }
+    }
+
+    #[test]
+    fn blame_loaded_gates_on_seq_and_resets_cursor() {
+        let (mut app, _ends) = test_app();
+        app.blame.open = true;
+        app.blame.loading = true;
+        app.blame_seq = 2;
+
+        app.apply_inspect_msg(InspectMsg::BlameLoaded { seq: 1, result: Ok(blame_doc("f", oid(9), &[1])) });
+        assert!(app.blame.document.is_none(), "stale-seq blame dropped");
+        assert!(app.blame.loading, "still waiting for the current request");
+
+        app.apply_inspect_msg(InspectMsg::BlameLoaded { seq: 2, result: Ok(blame_doc("f", oid(9), &[1, 2])) });
+        assert!(!app.blame.loading);
+        assert_eq!(app.blame.document.as_ref().map(|d| d.lines.len()), Some(2));
+    }
+
+    #[test]
+    fn blame_enter_opens_the_lines_commit_diff() {
+        let (mut app, ends) = test_app();
+        app.log.rows.push(LogRow::Commit(commit_record(5, "target", "a")));
+        app.blame.open = true;
+        app.blame.document = Some(blame_doc("f", oid(9), &[4, 5]));
+        app.blame.selected = 1;
+
+        app.blame_open_commit();
+
+        assert!(!app.blame.open, "enter leaves the blame view");
+        assert_eq!(app.log.selected, 1, "the commit is selected in the log when indexed");
+        assert!(app.diff.open);
+        assert_eq!(app.diff.target, Some(DiffTarget::Commit(oid(5))));
+        assert!(matches!(
+            ends.req_rx.try_recv(),
+            Ok(GitReq::Inspect(InspectReq::LoadDiff { target: DiffTarget::Commit(id), .. })) if id == oid(5)
+        ));
+    }
+
+    #[test]
+    fn reblame_history_commits_only_on_success() {
+        use crate::git::BlameAt;
+        let (mut app, ends) = test_app();
+        app.blame.open = true;
+        app.blame.document = Some(blame_doc("f.txt", oid(9), &[4]));
+
+        app.blame_reblame_at_parent();
+        assert!(app.blame.history.is_empty(), "push is staged, not committed");
+        assert!(matches!(
+            ends.req_rx.try_recv(),
+            Ok(GitReq::Inspect(InspectReq::LoadBlame { at: BlameAt::ParentOfCommit(id), .. })) if id == oid(4)
+        ));
+
+        // Failure (e.g. root commit): staged entry discarded.
+        app.apply_inspect_msg(InspectMsg::BlameLoaded { seq: app.blame_seq, result: Err("no parent".into()) });
+        assert!(app.blame.history.is_empty());
+        assert!(app.blame.error.is_some());
+        assert!(app.blame.document.is_some(), "previous document stays visible under the error");
+
+        // Success: staged entry lands on the Backspace trail.
+        app.blame_reblame_at_parent();
+        app.apply_inspect_msg(InspectMsg::BlameLoaded {
+            seq: app.blame_seq,
+            result: Ok(blame_doc("f.txt", oid(3), &[3])),
+        });
+        assert_eq!(app.blame.history.len(), 1);
+        assert_eq!(app.blame.history[0], (oid(9), "f.txt".to_string()));
+
+        // Backspace requests the recorded origin.
+        app.blame_back();
+        let mut saw = false;
+        while let Ok(req) = ends.req_rx.try_recv() {
+            if let GitReq::Inspect(InspectReq::LoadBlame { at: BlameAt::Commit(id), path, .. }) = req {
+                assert_eq!(id, oid(9));
+                assert_eq!(path, "f.txt");
+                saw = true;
+            }
+        }
+        assert!(saw);
+        assert!(app.blame.history.is_empty());
+    }
+
+    #[test]
+    fn blame_from_diff_pane_picks_section_under_viewport() {
+        use crate::model::FileSection;
+        let (mut app, ends) = test_app();
+        app.diff.open = true;
+        app.focus = Focus::Diff;
+        let mut doc = working_tree_doc_with_anchor();
+        doc.target = DiffTarget::Commit(oid(7));
+        doc.untracked_anchor = None;
+        doc.body = (0..30).map(|i| DiffLine::new(DiffLineKind::Context, format!("l{i}"))).collect();
+        doc.sections = vec![
+            FileSection { path: "first.rs".into(), body_start: 0 },
+            FileSection { path: "second.rs".into(), body_start: 15 },
+        ];
+        app.diff.target = Some(DiffTarget::Commit(oid(7)));
+        app.diff.document = Some(doc);
+        // header len 1, no diffstat → viewport top at virtual line 20 =
+        // body index 19 → inside second.rs's section.
+        app.diff.scroll = 20;
+
+        app.blame_from_diff_pane();
+
+        assert!(app.blame.open);
+        assert!(matches!(
+            ends.req_rx.try_recv(),
+            Ok(GitReq::Inspect(InspectReq::LoadBlame { at: crate::git::BlameAt::Commit(id), path, .. }))
+                if id == oid(7) && path == "second.rs"
+        ));
     }
 
     #[test]

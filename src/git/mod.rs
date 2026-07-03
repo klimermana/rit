@@ -9,6 +9,7 @@
 //!     `quick_is_dirty`, ref enumeration, time formatters
 //!   - `graph`  — ASCII commit-graph state (when `--graph` is on)
 
+pub mod blame;
 pub mod diff;
 pub mod graph;
 pub mod history;
@@ -18,7 +19,7 @@ pub mod status;
 pub mod walk;
 
 pub use history::{HistoryMsg, HistoryReq};
-pub use inspect::{InspectMsg, InspectReq};
+pub use inspect::{BlameAt, InspectMsg, InspectReq};
 
 use crate::model::PathFilter;
 use anyhow::Result;
@@ -405,6 +406,13 @@ fn process_request<'r>(
             let entries = meta::load_ref_entries(repo);
             _ = msg_tx.send(GitMsg::Inspect(InspectMsg::RefsListLoaded(entries)));
         }
+        GitReq::Inspect(InspectReq::LoadBlame { path, at, seq }) => {
+            // Blame walks history — potentially seconds on long-lived
+            // files — so it runs on a side thread and the worker stays
+            // free for walk batches and diff requests. Stale replies
+            // are dropped by the app's seq gate.
+            dirty_handles.0.push(spawn_blame(repo, path, at, seq, msg_tx.clone()));
+        }
         GitReq::Inspect(InspectReq::RefreshWorkingTreeMeta) => {
             // Mirror the startup path: hand the worktree scan off to a
             // side thread so a Reload doesn't re-introduce the same
@@ -473,6 +481,25 @@ fn spawn_untracked_scan(
     std::thread::spawn(move || {
         let paths = status::collect_untracked_paths(&repo);
         _ = msg_tx.send(GitMsg::Inspect(InspectMsg::UntrackedFilesUpdate { target, seq, paths }));
+    })
+}
+
+/// Off-thread gix-blame run for a `LoadBlame`. Same shutdown
+/// discipline as the other side threads — the handle goes into the
+/// `DirtyJoin` guard. The cloned repo re-instantiates the worker's
+/// object cache (the factory travels with the clone), which blame's
+/// repeated history traversal benefits from.
+fn spawn_blame(
+    repo: &gix::Repository,
+    path: String,
+    at: BlameAt,
+    seq: u64,
+    msg_tx: crossbeam_channel::Sender<GitMsg>,
+) -> std::thread::JoinHandle<()> {
+    let repo = repo.clone();
+    std::thread::spawn(move || {
+        let result = blame::compute_blame(&repo, &path, at);
+        _ = msg_tx.send(GitMsg::Inspect(InspectMsg::BlameLoaded { seq, result }));
     })
 }
 

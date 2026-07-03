@@ -45,6 +45,10 @@ impl App {
             self.handle_refs_key(key);
             return;
         }
+        if self.blame.open {
+            self.handle_blame_key(key);
+            return;
+        }
         self.handle_main_key(key);
     }
 
@@ -132,6 +136,30 @@ impl App {
             (Char('u'), Mod::CONTROL) => self.refs_move(-(HALF_PAGE as isize)),
             (PageDown, _) => self.refs_move(self.refs.view_height.max(1) as isize),
             (PageUp, _) => self.refs_move(-(self.refs.view_height.max(1) as isize)),
+            _ => {}
+        }
+    }
+
+    fn handle_blame_key(&mut self, key: KeyEvent) {
+        use KeyCode::*;
+        use KeyModifiers as Mod;
+        match (key.code, key.modifiers) {
+            (Char('q') | Esc, Mod::NONE) => self.blame.open = false,
+            (Enter, Mod::NONE) => self.blame_open_commit(),
+            (Char(','), Mod::NONE) => self.blame_reblame_at_parent(),
+            (Backspace, Mod::NONE) => self.blame_back(),
+            (Char('j') | Down, Mod::NONE) => self.blame_move(1),
+            (Char('k') | Up, Mod::NONE) => self.blame_move(-1),
+            (Char('g'), Mod::NONE) => {
+                self.blame.selected = 0;
+                self.blame.scroll = 0;
+            }
+            (Char('G'), Mod::NONE | Mod::SHIFT) => self.blame_move(isize::MAX),
+            (Char('d'), Mod::CONTROL) => self.blame_move(HALF_PAGE as isize),
+            (Char('u'), Mod::CONTROL) => self.blame_move(-(HALF_PAGE as isize)),
+            (PageDown, _) => self.blame_move(self.blame.view_height.max(1) as isize),
+            (PageUp, _) => self.blame_move(-(self.blame.view_height.max(1) as isize)),
+            (Char('y'), Mod::NONE) => self.yank_blame_hash(),
             _ => {}
         }
     }
@@ -230,6 +258,7 @@ impl App {
             (Focus::Diff, Char('0'), Mod::NONE) => self.diff.horizontal_scroll = 0,
             (Focus::Diff, Char(']'), Mod::NONE) => self.diff_jump_file(1),
             (Focus::Diff, Char('['), Mod::NONE) => self.diff_jump_file(-1),
+            (Focus::Diff, Char('b'), Mod::NONE) => self.blame_from_diff_pane(),
             _ => {}
         }
     }
