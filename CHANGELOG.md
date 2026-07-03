@@ -24,6 +24,16 @@ Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Changed
 
+- Single-file / literal-path history now decides whether each commit
+  touches the path by comparing the tree-entry oid at that path against
+  the first parent, instead of running a full per-commit tree-diff and
+  pathspec match. A directory's tree oid changes iff anything under it
+  changed, so this is exact for files and directories alike, and it
+  skips the tree-diff record allocation, the bounded-LRU cache churn,
+  and the pathspec match loop the old path paid per commit. Glob/magic
+  pathspecs (`*.rs`, `:!target`, …) still use the full pathspec matcher.
+  On the flat-file `indexing/with_literal_path` bench this is ~3.7–3.9%
+  faster; the gain is larger on commits that touch many files.
 - Working-tree diff: the untracked-files walk now runs on a side
   thread instead of the diff critical path. The diff pane shows
   staged/unstaged content as soon as the index walk finishes and the

@@ -10,7 +10,11 @@ use anyhow::Result;
 use compact_str::CompactString;
 use crossbeam_channel::Sender;
 use gix::{ObjectId, bstr::ByteSlice, prelude::ObjectIdExt};
-use std::{collections::HashMap, sync::Arc};
+use std::{
+    collections::HashMap,
+    path::{Component, Path, PathBuf},
+    sync::Arc,
+};
 
 pub struct Walker<'r> {
     repo: &'r gix::Repository,
@@ -20,10 +24,11 @@ pub struct Walker<'r> {
     graph_state: Option<graph::GraphState>,
     iter: Option<gix::revision::Walk<'r>>,
     pub done: bool,
-    /// Parsed once at construction; held in `&mut` form per call because
-    /// `gix::pathspec::Search::pattern_matching_relative_path` mutates
-    /// internal counters as it matches.
-    pathspec: Option<gix::pathspec::Search>,
+    /// Path filter, `None` when no path was given on the CLI. A literal
+    /// path uses the tree-entry-oid fast-path; a glob/magic pathspec
+    /// falls back to the full per-commit tree-diff. Held in `&mut` form
+    /// per call because the spec matcher mutates internal counters.
+    path_matcher: Option<PathMatcher>,
     pub generation: u64,
 }
 
@@ -44,8 +49,8 @@ impl<'r> Walker<'r> {
             Some(oid) => (Some(oid.attach(repo).ancestors().all()?), false),
             None => (None, true),
         };
-        let pathspec = match path_filter {
-            Some(pf) => Some(build_pathspec_search(&pf)?),
+        let path_matcher = match path_filter {
+            Some(pf) => Some(PathMatcher::from_filter(&pf)?),
             None => None,
         };
         Ok(Self {
@@ -54,7 +59,7 @@ impl<'r> Walker<'r> {
             graph_state: graph_enabled.then(graph::GraphState::default),
             iter,
             done,
-            pathspec,
+            path_matcher,
             generation,
         })
     }
@@ -132,8 +137,8 @@ impl<'r> Walker<'r> {
 
             let parent_ids: Vec<ObjectId> = info.parent_ids.iter().copied().collect();
 
-            if let Some(search) = self.pathspec.as_mut()
-                && !commit_touches_pathspec(self.repo, info.id, &parent_ids, search, cache)
+            if let Some(matcher) = self.path_matcher.as_mut()
+                && !matcher.commit_touches(self.repo, info.id, &parent_ids, cache)
             {
                 continue;
             }
@@ -212,6 +217,91 @@ pub fn refs_lower_from_refs(refs: &[RefLabel]) -> CompactString {
         out.extend(r.name.chars().flat_map(|c| c.to_lowercase()));
     }
     out.into()
+}
+
+/// How a path argument is matched against each walked commit.
+enum PathMatcher {
+    /// A literal file or directory path (no glob and no magic pathspec
+    /// signature). Matched by comparing the tree-entry oid at the path
+    /// between a commit and its first parent — O(path depth) object loads
+    /// instead of a full recursive tree-diff, and with no dependence on a
+    /// commit-graph. A directory's tree oid changes iff anything under it
+    /// changed, so this is exact for both files and directories.
+    Literal(PathBuf),
+    /// A glob or magic pathspec (`*.rs`, `:!target`, …). Needs the real
+    /// pathspec matcher, which means tree-diffing each commit to get the
+    /// changed paths to test.
+    Spec(gix::pathspec::Search),
+}
+
+impl PathMatcher {
+    fn from_filter(filter: &PathFilter) -> Result<Self> {
+        match literal_path(filter.as_str()) {
+            Some(path) => Ok(PathMatcher::Literal(path)),
+            None => Ok(PathMatcher::Spec(build_pathspec_search(filter)?)),
+        }
+    }
+
+    /// Does `commit_id` change anything under the filtered path relative
+    /// to its first parent? Root commits (no parent) compare against the
+    /// empty tree, matching `git log`'s treatment of the initial commit.
+    fn commit_touches(
+        &mut self,
+        repo: &gix::Repository,
+        commit_id: ObjectId,
+        parent_ids: &[ObjectId],
+        cache: &mut TreeDiffCache,
+    ) -> bool {
+        match self {
+            PathMatcher::Literal(path) => {
+                literal_commit_touches(repo, commit_id, parent_ids.first().copied(), path).unwrap_or(false)
+            }
+            PathMatcher::Spec(search) => commit_touches_pathspec(repo, commit_id, parent_ids, search, cache),
+        }
+    }
+}
+
+/// Interpret the raw path argument as a literal path when it carries no
+/// glob metacharacters, no magic `:` signature, and no `!` negation, and
+/// resolves to plain normal components (no `..`, absolute root, or `.`).
+/// Anything fancier returns `None` and falls back to the full pathspec
+/// matcher so semantics stay identical to `git log -- <spec>`.
+fn literal_path(raw: &str) -> Option<PathBuf> {
+    let trimmed = raw.trim_end_matches('/');
+    if trimmed.is_empty()
+        || trimmed.starts_with(':')
+        || trimmed.starts_with('!')
+        || trimmed.bytes().any(|b| matches!(b, b'*' | b'?' | b'[' | b']'))
+    {
+        return None;
+    }
+    let path = PathBuf::from(trimmed);
+    path.components().all(|c| matches!(c, Component::Normal(_))).then_some(path)
+}
+
+/// Fast-path touch test: a commit changes `path` iff the tree entry at
+/// that path differs between the commit and its parent. Missing on one
+/// side (add / delete) is a change; missing on both (path absent from
+/// this line of history) is not.
+fn literal_commit_touches(
+    repo: &gix::Repository,
+    commit_id: ObjectId,
+    parent_id: Option<ObjectId>,
+    path: &Path,
+) -> Result<bool> {
+    let here = entry_oid_at(repo, commit_id, path)?;
+    let parent = match parent_id {
+        Some(p) => entry_oid_at(repo, p, path)?,
+        None => None,
+    };
+    Ok(here != parent)
+}
+
+/// The oid of the tree entry at `path` within `commit_id`'s tree, or
+/// `None` when the path doesn't exist in that tree.
+fn entry_oid_at(repo: &gix::Repository, commit_id: ObjectId, path: &Path) -> Result<Option<ObjectId>> {
+    let tree = repo.find_object(commit_id)?.try_into_commit()?.tree()?;
+    Ok(tree.lookup_entry_by_path(path)?.map(|e| e.object_id()))
 }
 
 /// Parse the CLI path argument into a `gix::pathspec::Search`. Treats the
@@ -341,6 +431,90 @@ mod tests {
             !summaries.iter().any(|s| s == "modify cli/bar"),
             "cli commit leaked through src/api spec: {summaries:?}",
         );
+    }
+
+    #[test]
+    fn literal_path_classification() {
+        use super::literal_path;
+        // Plain files and directories are literal; a trailing slash is trimmed.
+        assert!(literal_path("src/foo.rs").is_some());
+        assert!(literal_path("src").is_some());
+        assert!(literal_path("src/").is_some());
+        // Globs, magic signatures, negation, and non-normal components fall back.
+        assert!(literal_path("*.rs").is_none());
+        assert!(literal_path("src/*.rs").is_none());
+        assert!(literal_path("a[bc].rs").is_none());
+        assert!(literal_path(":!target").is_none());
+        assert!(literal_path("!foo").is_none());
+        assert!(literal_path("../up").is_none());
+        assert!(literal_path("").is_none());
+    }
+
+    #[test]
+    fn walker_literal_file_filters_to_touching_commits() {
+        let (td, repo) = make_fixture_repo();
+        let path = td.path();
+
+        write_file(path, "src/foo.rs", "fn a() {}\n");
+        commit_all(path, "add foo");
+        write_file(path, "src/bar.rs", "fn b() {}\n");
+        commit_all(path, "add bar"); // sibling under src/ — must NOT match foo.rs
+        write_file(path, "src/foo.rs", "fn a() { x }\n");
+        commit_all(path, "edit foo");
+
+        let pf = PathFilter::new("src/foo.rs");
+        let mut walker = Walker::new(&repo, Some(pf), None, 0, false, Arc::new(HashMap::new())).expect("walker");
+        let (tx, rx) = crossbeam_channel::bounded::<GitMsg>(256);
+        walker.load_more(100, &mut TreeDiffCache::new(), &tx, || false).expect("load_more");
+
+        let summaries: Vec<String> = drain_commits(&rx).into_iter().map(|c| c.summary).collect();
+        assert_eq!(summaries, vec!["edit foo".to_string(), "add foo".to_string()]);
+    }
+
+    #[test]
+    fn walker_literal_file_catches_add_and_delete() {
+        let (td, repo) = make_fixture_repo();
+        let path = td.path();
+
+        write_file(path, "keep.txt", "x\n");
+        commit_all(path, "unrelated"); // does not touch gone.txt
+        write_file(path, "gone.txt", "here\n");
+        commit_all(path, "add gone");
+        std::fs::remove_file(path.join("gone.txt")).expect("rm gone.txt");
+        commit_all(path, "delete gone");
+
+        // Both the addition (None -> Some) and deletion (Some -> None)
+        // register as a change under the entry-oid comparison.
+        let pf = PathFilter::new("gone.txt");
+        let mut walker = Walker::new(&repo, Some(pf), None, 0, false, Arc::new(HashMap::new())).expect("walker");
+        let (tx, rx) = crossbeam_channel::bounded::<GitMsg>(256);
+        walker.load_more(100, &mut TreeDiffCache::new(), &tx, || false).expect("load_more");
+
+        let summaries: Vec<String> = drain_commits(&rx).into_iter().map(|c| c.summary).collect();
+        assert_eq!(summaries, vec!["delete gone".to_string(), "add gone".to_string()]);
+    }
+
+    #[test]
+    fn walker_glob_pathspec_falls_back_and_filters() {
+        let (td, repo) = make_fixture_repo();
+        let path = td.path();
+
+        write_file(path, "a.rs", "fn a() {}\n");
+        commit_all(path, "rust file");
+        write_file(path, "b.md", "hello\n");
+        commit_all(path, "md file");
+        write_file(path, "c.rs", "fn c() {}\n");
+        commit_all(path, "another rust");
+
+        // `*.md` carries a glob metachar, so this drives the Spec
+        // (tree-diff) fallback rather than the literal fast-path.
+        let pf = PathFilter::new("*.md");
+        let mut walker = Walker::new(&repo, Some(pf), None, 0, false, Arc::new(HashMap::new())).expect("walker");
+        let (tx, rx) = crossbeam_channel::bounded::<GitMsg>(256);
+        walker.load_more(100, &mut TreeDiffCache::new(), &tx, || false).expect("load_more");
+
+        let summaries: Vec<String> = drain_commits(&rx).into_iter().map(|c| c.summary).collect();
+        assert_eq!(summaries, vec!["md file".to_string()]);
     }
 
     #[test]
