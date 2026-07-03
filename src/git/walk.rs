@@ -62,7 +62,21 @@ impl<'r> Walker<'r> {
     /// Pull and emit one batch. Returns the count of commits emitted —
     /// the worker uses this to tell `RefsLoaded` how far the
     /// refs-less prefix extends so the app can bound its backfill loop.
-    pub fn load_more(&mut self, requested: usize, cache: &mut TreeDiffCache, msg_tx: &Sender<GitMsg>) -> Result<usize> {
+    ///
+    /// `preempt` is polled once per examined commit; when it returns true
+    /// the sweep stops early, emits whatever it has gathered so far, and
+    /// returns. The iterator state persists on `self`, so the next call
+    /// resumes where this one left off. The worker wires this to "is a
+    /// request queued?" so opening a commit (or a reload) is serviced
+    /// promptly instead of waiting for the whole batch — which, for a
+    /// selective pathspec, can mean thousands of tree-diffs.
+    pub fn load_more(
+        &mut self,
+        requested: usize,
+        cache: &mut TreeDiffCache,
+        msg_tx: &Sender<GitMsg>,
+        preempt: impl Fn() -> bool,
+    ) -> Result<usize> {
         if self.done {
             _ = msg_tx.send(GitMsg::History(HistoryMsg::WalkDone { generation: self.generation }));
             return Ok(0);
@@ -75,13 +89,38 @@ impl<'r> Walker<'r> {
 
         let target = requested.max(1);
         let mut batch: Vec<CommitRecord> = Vec::with_capacity(target.min(256));
-        // Cap iterator pulls so a path filter that rejects everything can't pin the
-        // worker.
-        let pull_cap = target.saturating_mul(64);
-        let mut pulls = 0usize;
+        // Bound the number of commits *examined* per call to `target`,
+        // not just the number emitted. For a pathspec walk this is the
+        // key to responsiveness: instead of tree-diffing up to `target *
+        // 64` commits to fill a single batch (a long, un-preemptible
+        // stall), each call sweeps a bounded window, streams whatever
+        // matched, and returns so the worker can drain pending requests
+        // and resume. For the common no-pathspec case every examined
+        // commit is emitted, so this is one full batch per call exactly
+        // as before.
+        let mut scanned = 0usize;
 
-        while batch.len() < target && pulls < pull_cap {
-            pulls += 1;
+        // Poll for a queued request every `PREEMPT_POLL` commits rather
+        // than on every one — the check is a cheap atomic load, but at one
+        // per commit it's measurable against the tiny per-commit work on a
+        // warm repo. A window of 32 bounds yield latency to a handful of
+        // tree-diffs (sub-millisecond), which is imperceptible for the
+        // open-commit case this exists to unblock. A decrementing counter
+        // keeps the hot path to a compare-and-branch instead of a modulo.
+        const PREEMPT_POLL: usize = 32;
+        let mut until_poll = 0usize;
+
+        while scanned < target {
+            // Yield to a queued request (open-commit diff, reload) rather
+            // than finishing the sweep first.
+            if until_poll == 0 {
+                if preempt() {
+                    break;
+                }
+                until_poll = PREEMPT_POLL;
+            }
+            until_poll -= 1;
+            scanned += 1;
             let info = match iter.next() {
                 None => {
                     self.done = true;
@@ -272,7 +311,7 @@ mod tests {
         let pf = PathFilter::new("src");
         let mut walker = Walker::new(&repo, Some(pf), None, 0, false, Arc::new(HashMap::new())).expect("walker");
         let (tx, rx) = crossbeam_channel::bounded::<GitMsg>(256);
-        walker.load_more(100, &mut TreeDiffCache::new(), &tx).expect("load_more");
+        walker.load_more(100, &mut TreeDiffCache::new(), &tx, || false).expect("load_more");
 
         let summaries: Vec<String> = drain_commits(&rx).into_iter().map(|c| c.summary).collect();
         assert_eq!(summaries, vec!["modify bar".to_string(), "modify foo".to_string()]);
@@ -293,7 +332,7 @@ mod tests {
         let pf = PathFilter::new("src/api");
         let mut walker = Walker::new(&repo, Some(pf), None, 0, false, Arc::new(HashMap::new())).expect("walker");
         let (tx, rx) = crossbeam_channel::bounded::<GitMsg>(256);
-        walker.load_more(100, &mut TreeDiffCache::new(), &tx).expect("load_more");
+        walker.load_more(100, &mut TreeDiffCache::new(), &tx, || false).expect("load_more");
 
         let summaries: Vec<String> = drain_commits(&rx).into_iter().map(|c| c.summary).collect();
         assert!(summaries.iter().any(|s| s == "modify api/foo"));
@@ -320,7 +359,7 @@ mod tests {
 
         let mut walker = Walker::new(&repo, None, Some(middle), 0, false, Arc::new(HashMap::new())).expect("walker");
         let (tx, rx) = crossbeam_channel::bounded::<GitMsg>(256);
-        walker.load_more(100, &mut TreeDiffCache::new(), &tx).expect("load_more");
+        walker.load_more(100, &mut TreeDiffCache::new(), &tx, || false).expect("load_more");
 
         let summaries: Vec<String> = drain_commits(&rx).into_iter().map(|c| c.summary).collect();
         // Walking from `second` should include `second` and `first` (its

@@ -245,7 +245,7 @@ fn run_git_thread_inner(
 
         if !walker.done {
             let n = if refs_loaded { PAGE_BATCH } else { INITIAL_BATCH };
-            let emitted = walker.load_more(n, &mut tree_diff_cache, &msg_tx)?;
+            let emitted = walker.load_more(n, &mut tree_diff_cache, &msg_tx, || !req_rx.is_empty())?;
             // After the first batch, load refs and backfill so branch/tag
             // decorations appear without blocking startup. The dirty
             // check goes here too — running it on a side thread *before*

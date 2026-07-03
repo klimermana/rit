@@ -7,6 +7,21 @@ Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Fixed
+
+- Opening a commit no longer waits for background indexing. The git
+  worker's history walk is now preemptible: it polls for queued
+  requests during a batch and yields immediately, so a diff (or
+  reload) request is serviced right away instead of blocking behind
+  the in-flight sweep. Back-to-back `indexing` benches show this is
+  performance-neutral (indexing/50 −5.5%, indexing/200 −1.9%, pathspec
+  cases within noise).
+- Single-file / pathspec history streams in as it's found. Each walk
+  batch now examines a bounded window of commits and emits whatever
+  matched instead of tree-diffing up to thousands of commits to fill a
+  full batch first, so the first matching commits appear right away
+  rather than after a long up-front scan.
+
 ### Changed
 
 - Working-tree diff: the untracked-files walk now runs on a side
