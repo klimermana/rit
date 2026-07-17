@@ -156,6 +156,10 @@ pub struct DiffState {
     pub loading: bool,
     pub show_line_numbers: bool,
     pub show_hunks: bool,
+    /// `f`: limit commit diffs to the CLI pathspec. On by default so
+    /// `rit <path>` opens diffs already scoped; meaningless (and the
+    /// key is a no-op) when no pathspec was given.
+    pub scoped: bool,
     /// Inner height of the diff pane, updated by the renderer each frame.
     pub view_height: usize,
     /// In-diff search state (`/` while the diff pane is focused). Matches are

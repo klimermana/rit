@@ -9,6 +9,10 @@ use gix::ObjectId;
 pub struct RepoInfo {
     pub name: String,
     pub branch: String,
+    /// The raw CLI pathspec when the positional argument resolved to one
+    /// (rather than a revision). The app uses it to know that diff
+    /// scoping (`f`) is available and to label the diff pane.
+    pub path_filter: Option<String>,
 }
 
 /// Wraps the path/pathspec passed on the command line. Currently kept as a

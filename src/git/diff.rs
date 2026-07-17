@@ -34,9 +34,19 @@ pub fn empty_error_document(target: DiffTarget, e: anyhow::Error) -> DiffDocumen
     }
 }
 
-pub fn compute_commit_diff(repo: &gix::Repository, id: ObjectId, cache: &mut TreeDiffCache) -> DiffDocument {
+/// `scope` restricts the rendered diff to files matching the CLI
+/// pathspec (`rit <path>` + the diff pane's `f` toggle). `None` renders
+/// the commit's full diff. Filtering happens on the tree-diff records —
+/// before any blob is fetched — so a scoped diff of a wide commit only
+/// pays for the files it shows.
+pub fn compute_commit_diff(
+    repo: &gix::Repository,
+    id: ObjectId,
+    cache: &mut TreeDiffCache,
+    scope: Option<&mut gix::pathspec::Search>,
+) -> DiffDocument {
     let target = DiffTarget::Commit(id);
-    compute_commit_diff_inner(repo, id, target, cache).unwrap_or_else(|e| empty_error_document(target, e))
+    compute_commit_diff_inner(repo, id, target, cache, scope).unwrap_or_else(|e| empty_error_document(target, e))
 }
 
 fn compute_commit_diff_inner(
@@ -44,6 +54,7 @@ fn compute_commit_diff_inner(
     id: ObjectId,
     target: DiffTarget,
     cache: &mut TreeDiffCache,
+    scope: Option<&mut gix::pathspec::Search>,
 ) -> Result<DiffDocument> {
     let commit_obj = repo.find_object(id)?.try_into_commit()?;
     let decoded = commit_obj.decode()?;
@@ -83,7 +94,26 @@ fn compute_commit_diff_inner(
     // Cached tree-diff records. The pathspec filter populated this
     // during walking for every commit it considered; on a pathspec
     // walk this is a cache hit.
-    let records = compute_tree_diff_records(repo, parent_ids.first().copied(), id, cache)?.to_vec();
+    let mut records = compute_tree_diff_records(repo, parent_ids.first().copied(), id, cache)?.to_vec();
+
+    // The recorder emits records for intermediate trees as well as
+    // blobs; only blob records become rendered file diffs, so the
+    // hidden-file count must ignore the tree entries or it would
+    // overstate what scoping removed.
+    let blob_count =
+        |records: &[gix::diff::tree::recorder::Change]| records.iter().filter(|c| change_is_blob(c)).count();
+    let mut scoped_out = 0usize;
+    if let Some(search) = scope {
+        // Attribute-driven pathspec magic is unsupported, same as the
+        // walker's matcher — the stub satisfies the signature.
+        let mut attrs = |_: &_, _: _, _: _, _: &mut _| true;
+        let before = blob_count(&records);
+        records.retain(|change| {
+            let path = change_path_bstr(change);
+            search.pattern_matching_relative_path(path, Some(false), &mut attrs).is_some()
+        });
+        scoped_out = before - blob_count(&records);
+    }
 
     let mut flags = DiffFlags::default();
     let mut sections: Vec<FileSection> = Vec::new();
@@ -96,6 +126,16 @@ fn compute_commit_diff_inner(
             sections: &mut sections,
         };
         render_diff_records(repo, &records, &mut sink);
+    }
+
+    if scoped_out > 0 {
+        body.push(DiffLine::new(
+            DiffLineKind::Faint,
+            format!(
+                "… {scoped_out} changed file{} outside the path filter hidden (f shows the full diff)",
+                if scoped_out == 1 { "" } else { "s" },
+            ),
+        ));
     }
 
     Ok(DiffDocument { target, header, body, files, stats, flags, untracked_anchor: None, sections })
@@ -533,17 +573,37 @@ fn push_file_headers(lines: &mut Vec<DiffLine>, path: &str, mode_meta: Option<&s
 }
 
 fn change_path(change: &gix::diff::tree::recorder::Change) -> String {
+    change_path_bstr(change).to_str_lossy().into_owned()
+}
+
+fn change_is_blob(change: &gix::diff::tree::recorder::Change) -> bool {
     use gix::diff::tree::recorder::Change;
-    let path = match change {
-        Change::Addition { path, .. } | Change::Deletion { path, .. } | Change::Modification { path, .. } => path,
-    };
-    path.to_str_lossy().into_owned()
+    match change {
+        Change::Addition { entry_mode, .. }
+        | Change::Deletion { entry_mode, .. }
+        | Change::Modification { entry_mode, .. } => entry_mode.is_blob(),
+    }
+}
+
+fn change_path_bstr(change: &gix::diff::tree::recorder::Change) -> &gix::bstr::BStr {
+    use gix::diff::tree::recorder::Change;
+    match change {
+        Change::Addition { path, .. } | Change::Deletion { path, .. } | Change::Modification { path, .. } => {
+            path.as_ref()
+        }
+    }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{DiffSink, MAX_INLINE_DIFF_BYTES, SkipReason, classify_skip, render_file_modification};
-    use crate::model::{DiffFlags, DiffLine, DiffLineKind, DiffStats, FileStat};
+    use super::{
+        DiffSink, MAX_INLINE_DIFF_BYTES, SkipReason, classify_skip, compute_commit_diff, render_file_modification,
+    };
+    use crate::{
+        git::{TreeDiffCache, walk::build_pathspec_search},
+        model::{DiffFlags, DiffLine, DiffLineKind, DiffStats, FileStat, PathFilter},
+        test_support::{commit_all, make_fixture_repo, write_file},
+    };
 
     /// Drive `render_file_modification` and pull out the hunk-header
     /// strings it emitted. The header math is most robustly checked
@@ -639,6 +699,46 @@ mod tests {
         assert_eq!(stats.insertions, 1);
         assert_eq!(stats.deletions, 1);
         assert_eq!(files.len(), 1);
+    }
+
+    #[test]
+    fn scoped_commit_diff_renders_only_matching_files() {
+        let (td, repo) = make_fixture_repo();
+        let path = td.path();
+        write_file(path, "src/a.rs", "fn a() {}\n");
+        write_file(path, "docs/b.md", "hello\n");
+        commit_all(path, "both");
+        let head = repo.head_id().expect("head").detach();
+        let mut cache = TreeDiffCache::new();
+
+        let full = compute_commit_diff(&repo, head, &mut cache, None);
+        assert_eq!(full.stats.files, 2, "unscoped diff renders every file");
+        assert!(!full.body.iter().any(|l| l.text.contains("outside the path filter")));
+
+        let mut search = build_pathspec_search(&PathFilter::new("src")).expect("spec");
+        let scoped = compute_commit_diff(&repo, head, &mut cache, Some(&mut search));
+        assert_eq!(scoped.stats.files, 1);
+        assert_eq!(scoped.files[0].path, "src/a.rs");
+        assert_eq!(scoped.sections.len(), 1, "hidden files must not leave sections behind");
+        assert!(
+            scoped.body.iter().any(|l| l.text.contains("1 changed file outside the path filter")),
+            "scoped diff should note the hidden file",
+        );
+    }
+
+    #[test]
+    fn scoped_commit_diff_with_all_files_matching_adds_no_note() {
+        let (td, repo) = make_fixture_repo();
+        let path = td.path();
+        write_file(path, "src/a.rs", "fn a() {}\n");
+        commit_all(path, "only src");
+        let head = repo.head_id().expect("head").detach();
+        let mut cache = TreeDiffCache::new();
+
+        let mut search = build_pathspec_search(&PathFilter::new("src")).expect("spec");
+        let scoped = compute_commit_diff(&repo, head, &mut cache, Some(&mut search));
+        assert_eq!(scoped.stats.files, 1);
+        assert!(!scoped.body.iter().any(|l| l.text.contains("outside the path filter")));
     }
 
     #[test]

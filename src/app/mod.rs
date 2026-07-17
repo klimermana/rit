@@ -50,6 +50,10 @@ pub struct App {
     pub error: Option<String>,
     pub repo_name: String,
     pub branch_name: String,
+    /// The CLI pathspec, when the positional argument resolved to one.
+    /// Reported by the worker via `RepoInfo`; gates the diff pane's
+    /// `f` scope toggle and feeds its title tag.
+    pub path_filter: Option<String>,
     /// True once the worker has reported it walked the whole history.
     pub walk_done: bool,
     /// Current walk generation. Bumped on reload and carried in the
@@ -85,6 +89,7 @@ impl App {
                 loading: false,
                 show_line_numbers: true,
                 show_hunks: true,
+                scoped: true,
                 view_height: 1,
                 search: DiffSearchState::new(),
                 header_lower: None,
@@ -100,6 +105,7 @@ impl App {
             error: None,
             repo_name: "unknown".to_string(),
             branch_name: "HEAD".to_string(),
+            path_filter: None,
             walk_done: false,
             walk_gen: 0,
             diff_seq: 0,
@@ -208,9 +214,10 @@ impl App {
 
     fn apply_history_msg(&mut self, msg: HistoryMsg) {
         match msg {
-            HistoryMsg::RepoInfo(RepoInfo { name, branch }) => {
+            HistoryMsg::RepoInfo(RepoInfo { name, branch, path_filter }) => {
                 self.repo_name = name;
                 self.branch_name = branch;
+                self.path_filter = path_filter;
             }
             HistoryMsg::Commits { generation, commits } => {
                 if generation != self.walk_gen {
@@ -495,8 +502,25 @@ impl App {
             self.diff.body_lower = None;
             self.diff.loading = true;
             self.diff_seq = self.diff_seq.wrapping_add(1);
-            self.send_inspect(InspectReq::LoadDiff { target, seq: self.diff_seq });
+            self.send_inspect(InspectReq::LoadDiff { target, seq: self.diff_seq, scoped: self.diff.scoped });
         }
+    }
+
+    /// `f`: flip pathspec scoping for commit diffs and re-request the
+    /// current target. No-op unless a CLI pathspec is active — with no
+    /// filter there is nothing to scope to. Bypasses `request_diff`'s
+    /// same-target short-circuit and keeps the current document on
+    /// screen until the re-rendered one arrives (the seq gate swaps it
+    /// in atomically).
+    pub(crate) fn toggle_diff_scope(&mut self) {
+        if self.path_filter.is_none() {
+            return;
+        }
+        self.diff.scoped = !self.diff.scoped;
+        let Some(target) = self.diff.target else { return };
+        self.diff.loading = true;
+        self.diff_seq = self.diff_seq.wrapping_add(1);
+        self.send_inspect(InspectReq::LoadDiff { target, seq: self.diff_seq, scoped: self.diff.scoped });
     }
 
     pub(crate) fn update_commit_matches(&mut self) {
@@ -1121,12 +1145,49 @@ mod tests {
         assert_eq!(app.diff_seq, 1);
         let req = ends.req_rx.try_recv().expect("request sent");
         match req {
-            GitReq::Inspect(InspectReq::LoadDiff { target, seq }) => {
+            GitReq::Inspect(InspectReq::LoadDiff { target, seq, scoped }) => {
                 assert_eq!(seq, app.diff_seq);
                 assert_eq!(target, DiffTarget::Commit(oid(1)));
+                assert!(scoped, "diffs are scoped by default");
             }
             _ => panic!("expected LoadDiff"),
         }
+    }
+
+    #[test]
+    fn f_toggles_diff_scope_and_rerequests() {
+        let (mut app, ends) = test_app();
+        app.path_filter = Some("src".to_string());
+        app.log.rows.push(LogRow::Commit(commit_record(1, "one", "alice")));
+        app.log.selected = 1;
+        app.diff.open = true;
+        app.fetch_diff_for_selected();
+        _ = ends.req_rx.try_recv().expect("initial LoadDiff");
+
+        app.handle_input(key(KeyCode::Char('f'), KeyModifiers::NONE));
+        assert!(!app.diff.scoped, "f flips scoping off");
+        match ends.req_rx.try_recv().expect("toggle re-requests the same target") {
+            GitReq::Inspect(InspectReq::LoadDiff { target, seq, scoped }) => {
+                assert_eq!(target, DiffTarget::Commit(oid(1)));
+                assert_eq!(seq, app.diff_seq, "toggle must bump the seq so the old document is superseded");
+                assert!(!scoped);
+            }
+            _ => panic!("expected LoadDiff"),
+        }
+    }
+
+    #[test]
+    fn f_is_noop_without_path_filter() {
+        let (mut app, ends) = test_app();
+        app.log.rows.push(LogRow::Commit(commit_record(1, "one", "alice")));
+        app.log.selected = 1;
+        app.diff.open = true;
+        app.fetch_diff_for_selected();
+        _ = ends.req_rx.try_recv().expect("initial LoadDiff");
+
+        app.handle_input(key(KeyCode::Char('f'), KeyModifiers::NONE));
+        assert!(app.diff.scoped, "no pathspec, nothing to toggle");
+        assert!(ends.req_rx.try_recv().is_err(), "no re-request without a pathspec");
     }
 
     // --- input routing ---

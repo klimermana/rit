@@ -112,6 +112,12 @@ pub fn draw_diff(frame: &mut Frame, app: &App, area: Rect, focused: bool) {
 
 fn diff_title(app: &App) -> String {
     let mode_tag = if app.diff.show_hunks { "" } else { "  [summary]" };
+    // Scope tag only applies to commit diffs — the worker never filters
+    // the working-tree document.
+    let scope_tag = match (&app.diff.target, &app.path_filter) {
+        (Some(DiffTarget::Commit(_)), Some(spec)) if app.diff.scoped => format!("  [only {spec}]"),
+        _ => String::new(),
+    };
     let label = match app.diff.target {
         Some(DiffTarget::WorkingTree) => "Working Tree".to_string(),
         Some(DiffTarget::Commit(_)) => match app.log.rows.get(app.log.selected) {
@@ -121,18 +127,19 @@ fn diff_title(app: &App) -> String {
         None => return " Diff ".to_string(),
     };
     let Some(doc) = app.diff.document.as_ref() else {
-        return format!(" Diff: {}{} ", label, mode_tag);
+        return format!(" Diff: {}{}{} ", label, mode_tag, scope_tag);
     };
     let stats = &doc.stats;
     let trunc_tag = truncation_tag(&doc.flags);
     format!(
-        " Diff: {}  {} file{} changed  +{}  -{}{}{} ",
+        " Diff: {}  {} file{} changed  +{}  -{}{}{}{} ",
         label,
         stats.files,
         if stats.files == 1 { "" } else { "s" },
         stats.insertions,
         stats.deletions,
         mode_tag,
+        scope_tag,
         trunc_tag,
     )
 }

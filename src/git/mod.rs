@@ -215,8 +215,15 @@ fn run_git_thread_inner(
     // `root: Some(..)` re-roots (refs-view navigation), `None` keeps it.
     let (start_id, path_filter) = resolve_positional(&repo, positional);
     let mut walk_root = start_id;
+    // Pathspec matcher for scoping commit diffs to the CLI path (the
+    // diff pane's `f` toggle). Separate from the Walker's matcher: that
+    // one decides which commits appear at all, this one filters which
+    // files of an opened commit get rendered.
+    let mut diff_scope = path_filter.as_ref().and_then(|pf| walk::build_pathspec_search(pf).ok());
 
-    _ = msg_tx.send(GitMsg::History(HistoryMsg::RepoInfo(meta::repo_info_for(&repo))));
+    let mut repo_info = meta::repo_info_for(&repo);
+    repo_info.path_filter = path_filter.as_ref().map(|pf| pf.as_str().to_string());
+    _ = msg_tx.send(GitMsg::History(HistoryMsg::RepoInfo(repo_info)));
     // Send the working-tree author immediately so the UI can paint the
     // "Not Committed Yet" row, but defer the dirty flag — `quick_is_dirty`
     // walks the full worktree, which on a wide checkout (10k+ tracked
@@ -287,6 +294,7 @@ fn run_git_thread_inner(
                 req,
                 &repo,
                 &path_filter,
+                &mut diff_scope,
                 &mut walk_root,
                 graph_enabled,
                 &mut walker,
@@ -357,6 +365,7 @@ fn process_request<'r>(
     req: GitReq,
     repo: &'r gix::Repository,
     path_filter: &Option<PathFilter>,
+    diff_scope: &mut Option<gix::pathspec::Search>,
     walk_root: &mut Option<ObjectId>,
     graph_enabled: bool,
     walker: &mut walk::Walker<'r>,
@@ -381,10 +390,13 @@ fn process_request<'r>(
             *walker = walk::Walker::new(repo, path_filter.clone(), *walk_root, generation, graph_enabled, refs_map)?;
             *refs_loaded = true;
         }
-        GitReq::Inspect(InspectReq::LoadDiff { target, seq }) => {
+        GitReq::Inspect(InspectReq::LoadDiff { target, seq, scoped }) => {
             use crate::model::DiffTarget;
             let document = match target {
-                DiffTarget::Commit(id) => diff::compute_commit_diff(repo, id, tree_diff_cache),
+                DiffTarget::Commit(id) => {
+                    let scope = if scoped { diff_scope.as_mut() } else { None };
+                    diff::compute_commit_diff(repo, id, tree_diff_cache, scope)
+                }
                 DiffTarget::WorkingTree => status::compute_working_tree_diff(repo, target),
             };
             // For working-tree diffs the document carries an
@@ -548,18 +560,18 @@ mod tests {
         let a = gix::ObjectId::empty_tree(gix::hash::Kind::Sha1);
         let b = gix::ObjectId::empty_blob(gix::hash::Kind::Sha1);
         let mut batch = vec![
-            GitReq::Inspect(InspectReq::LoadDiff { target: DiffTarget::WorkingTree, seq: 1 }),
+            GitReq::Inspect(InspectReq::LoadDiff { target: DiffTarget::WorkingTree, seq: 1, scoped: false }),
             GitReq::Inspect(InspectReq::LoadStatus),
-            GitReq::Inspect(InspectReq::LoadDiff { target: DiffTarget::Commit(a), seq: 2 }),
+            GitReq::Inspect(InspectReq::LoadDiff { target: DiffTarget::Commit(a), seq: 2, scoped: false }),
             GitReq::History(HistoryReq::Reload { generation: 1, root: None }),
-            GitReq::Inspect(InspectReq::LoadDiff { target: DiffTarget::Commit(b), seq: 3 }),
+            GitReq::Inspect(InspectReq::LoadDiff { target: DiffTarget::Commit(b), seq: 3, scoped: false }),
         ];
         coalesce_requests(&mut batch);
         assert_eq!(batch.len(), 3, "two superseded LoadDiffs dropped");
         assert!(matches!(batch[0], GitReq::Inspect(InspectReq::LoadStatus)));
         assert!(matches!(batch[1], GitReq::History(HistoryReq::Reload { .. })));
         assert!(
-            matches!(batch[2], GitReq::Inspect(InspectReq::LoadDiff { target: DiffTarget::Commit(id), seq: 3 }) if id == b)
+            matches!(batch[2], GitReq::Inspect(InspectReq::LoadDiff { target: DiffTarget::Commit(id), seq: 3, .. }) if id == b)
         );
     }
 

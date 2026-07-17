@@ -22,6 +22,11 @@ pub enum InspectReq {
     LoadDiff {
         target: DiffTarget,
         seq: u64,
+        /// When true and a CLI pathspec is active, the worker restricts
+        /// a commit diff to files matching that pathspec (`f` toggle in
+        /// the diff pane). Ignored for working-tree targets and when no
+        /// pathspec was given.
+        scoped: bool,
     },
     LoadStatus,
     /// Build the refs-view listing: every branch and tag peeled to its

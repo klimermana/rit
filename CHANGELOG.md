@@ -7,6 +7,18 @@ Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added
+
+- Pathspec-scoped diffs: when `rit` is launched with a path/pathspec
+  (`rit src/ui`), the diff pane now shows only the hunks for files
+  matching that pathspec, with a faint note counting the hidden files.
+  `f` toggles between the scoped and full diff, and the pane title
+  shows `[only <pathspec>]` while scoping is active. Filtering happens
+  before any blob is loaded, so scoped diffs of wide commits skip the
+  render cost of unrelated files entirely (`diff_generation` benches
+  for the unscoped path are unchanged — all cases "no change
+  detected").
+
 ### Fixed
 
 - Reopening the working-tree diff while a previous untracked-files

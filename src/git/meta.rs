@@ -117,7 +117,7 @@ pub fn repo_info_for(repo: &gix::Repository) -> RepoInfo {
         })
         .unwrap_or_else(|| "unknown".to_string());
     let branch = repo.head_name().ok().flatten().map(|n| n.shorten().to_string()).unwrap_or_else(|| "HEAD".to_string());
-    RepoInfo { name, branch }
+    RepoInfo { name, branch, path_filter: None }
 }
 
 pub fn working_tree_author(repo: &gix::Repository) -> String {

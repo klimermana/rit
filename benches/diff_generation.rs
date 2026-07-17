@@ -103,7 +103,11 @@ fn bench_diff_generation(c: &mut Criterion) {
         group.bench_with_input(BenchmarkId::from_parameter(label), &head, |b, head| {
             b.iter(|| {
                 req_tx
-                    .send(GitReq::Inspect(InspectReq::LoadDiff { target: DiffTarget::Commit(*head), seq: 0 }))
+                    .send(GitReq::Inspect(InspectReq::LoadDiff {
+                        target: DiffTarget::Commit(*head),
+                        seq: 0,
+                        scoped: false,
+                    }))
                     .expect("send");
                 await_diff(&msg_rx);
             });
@@ -127,7 +131,11 @@ fn bench_diff_generation(c: &mut Criterion) {
         group.bench_with_input(BenchmarkId::from_parameter("many_files_200"), &head, |b, head| {
             b.iter(|| {
                 req_tx
-                    .send(GitReq::Inspect(InspectReq::LoadDiff { target: DiffTarget::Commit(*head), seq: 0 }))
+                    .send(GitReq::Inspect(InspectReq::LoadDiff {
+                        target: DiffTarget::Commit(*head),
+                        seq: 0,
+                        scoped: false,
+                    }))
                     .expect("send");
                 await_diff(&msg_rx);
             });
@@ -180,7 +188,11 @@ fn bench_working_tree_diff(c: &mut Criterion) {
                 for _ in 0..iters {
                     let start = std::time::Instant::now();
                     req_tx
-                        .send(GitReq::Inspect(InspectReq::LoadDiff { target: DiffTarget::WorkingTree, seq: 0 }))
+                        .send(GitReq::Inspect(InspectReq::LoadDiff {
+                            target: DiffTarget::WorkingTree,
+                            seq: 0,
+                            scoped: false,
+                        }))
                         .expect("send");
                     await_diff(&msg_rx);
                     total += start.elapsed();
@@ -223,7 +235,11 @@ fn bench_working_tree_diff(c: &mut Criterion) {
                 for _ in 0..iters {
                     let start = std::time::Instant::now();
                     req_tx
-                        .send(GitReq::Inspect(InspectReq::LoadDiff { target: DiffTarget::WorkingTree, seq: 0 }))
+                        .send(GitReq::Inspect(InspectReq::LoadDiff {
+                            target: DiffTarget::WorkingTree,
+                            seq: 0,
+                            scoped: false,
+                        }))
                         .expect("send");
                     await_diff(&msg_rx);
                     total += start.elapsed();
@@ -281,7 +297,7 @@ fn bench_pathspec_walk_then_diff(c: &mut Criterion) {
             // re-runs gix::diff::tree from scratch; with the cache, it
             // reuses what the walker already computed.
             req_tx
-                .send(GitReq::Inspect(InspectReq::LoadDiff { target: DiffTarget::Commit(head), seq: 0 }))
+                .send(GitReq::Inspect(InspectReq::LoadDiff { target: DiffTarget::Commit(head), seq: 0, scoped: false }))
                 .expect("send");
             await_diff(&msg_rx);
 
@@ -348,7 +364,11 @@ fn bench_cursor_scrub(c: &mut Criterion) {
         b.iter(|| {
             for (i, id) in ids.iter().enumerate() {
                 req_tx
-                    .send(GitReq::Inspect(InspectReq::LoadDiff { target: DiffTarget::Commit(*id), seq: i as u64 }))
+                    .send(GitReq::Inspect(InspectReq::LoadDiff {
+                        target: DiffTarget::Commit(*id),
+                        seq: i as u64,
+                        scoped: false,
+                    }))
                     .expect("send");
             }
             // Wait for the *final* target's document; earlier DiffLoaded

@@ -174,6 +174,7 @@ impl App {
                 self.diff.show_hunks = !self.diff.show_hunks;
                 self.diff.scroll = 0;
             }
+            (_, Char('f'), Mod::NONE) if self.diff.open => self.toggle_diff_scope(),
             (_, Char('y'), Mod::NONE) => self.yank_selected_hash(),
             (Focus::Log, Char('/'), Mod::NONE) => {
                 self.search.clear();
