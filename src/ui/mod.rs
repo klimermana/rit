@@ -110,10 +110,8 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
 }
 
 fn draw_status_view(frame: &mut Frame, app: &App, area: Rect) {
-    let block = Block::default()
-        .title(if app.status.loading { " Status [loading...] " } else { " Status " })
-        .borders(Borders::ALL)
-        .border_style(Style::default().fg(Color::Yellow));
+    let title = if app.status.loading { " Status [loading...] " } else { " Status " };
+    let block = pane_block(title.to_string(), true, mode_accent(app));
 
     let inner = block.inner(area);
     frame.render_widget(block, area);
@@ -130,17 +128,15 @@ fn draw_status_view(frame: &mut Frame, app: &App, area: Rect) {
     frame.render_widget(Paragraph::new(visible), inner);
 }
 
-/// Bordered block for the log/diff panes with the focus treatment:
-/// thick cyan border and bold title when focused, plain dark gray
-/// otherwise — so which pane receives keys is legible from the frame
-/// itself, not just a border tint.
-pub(crate) fn pane_block(title: String, focused: bool) -> Block<'static> {
+/// Bordered block for the panes with the focus treatment: thick border
+/// and bold title in the mode's accent color when focused, plain dark
+/// gray otherwise — so which pane receives keys is legible from the
+/// frame itself, not just a border tint. `accent` is the mode chip's
+/// color (`mode_label`), making one color mean one mode everywhere it
+/// appears: chip, border, and title.
+pub(crate) fn pane_block(title: String, focused: bool, accent: Color) -> Block<'static> {
     let (border_style, border_type, title_style) = if focused {
-        (
-            Style::default().fg(Color::Cyan),
-            BorderType::Thick,
-            Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
-        )
+        (Style::default().fg(accent), BorderType::Thick, Style::default().fg(accent).add_modifier(Modifier::BOLD))
     } else {
         (Style::default().fg(Color::DarkGray), BorderType::Plain, Style::default().fg(Color::DarkGray))
     };
@@ -151,9 +147,10 @@ pub(crate) fn pane_block(title: String, focused: bool) -> Block<'static> {
         .border_type(border_type)
 }
 
-/// The status bar's mode label and its chip color. Branch order mirrors
-/// `App::handle_input`'s dispatch exactly, so the chip always names the
-/// mode whose keymap is live.
+/// The status bar's mode label and its chip color — which doubles as
+/// the accent color for the focused pane's border and title. Branch
+/// order mirrors `App::handle_input`'s dispatch exactly, so the chip
+/// always names the mode whose keymap is live.
 fn mode_label(app: &App) -> (&'static str, Color) {
     if app.show_help {
         ("HELP", Color::White)
@@ -170,6 +167,12 @@ fn mode_label(app: &App) -> (&'static str, Color) {
     } else {
         ("LOG", Color::Blue)
     }
+}
+
+/// The active mode's accent color — shared by the status-bar chip and
+/// every focused border so the same color always means the same mode.
+pub(crate) fn mode_accent(app: &App) -> Color {
+    mode_label(app).1
 }
 
 fn draw_status_bar(frame: &mut Frame, app: &App, area: Rect) {

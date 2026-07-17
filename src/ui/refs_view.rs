@@ -7,7 +7,7 @@ use ratatui::{
     layout::Rect,
     style::{Color, Modifier, Style},
     text::{Line, Span},
-    widgets::{Block, Borders, Paragraph},
+    widgets::Paragraph,
 };
 
 /// Width of the ref-name column; long names are char-truncated.
@@ -15,10 +15,8 @@ const NAME_COL_WIDTH: usize = 32;
 const DATE_COL_WIDTH: usize = 8;
 
 pub fn draw_refs_view(frame: &mut Frame, app: &mut App, area: Rect) {
-    let block = Block::default()
-        .title(if app.refs.loading { " Refs [loading...] " } else { " Refs " })
-        .borders(Borders::ALL)
-        .border_style(Style::default().fg(Color::Cyan));
+    let title = if app.refs.loading { " Refs [loading...] " } else { " Refs " };
+    let block = crate::ui::pane_block(title.to_string(), true, crate::ui::mode_accent(app));
 
     let inner = block.inner(area);
     frame.render_widget(block, area);

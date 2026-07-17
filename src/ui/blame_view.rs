@@ -9,7 +9,7 @@ use ratatui::{
     layout::Rect,
     style::{Color, Modifier, Style},
     text::{Line, Span},
-    widgets::{Block, Borders, Paragraph},
+    widgets::Paragraph,
 };
 
 const AUTHOR_COL_WIDTH: usize = 12;
@@ -27,7 +27,7 @@ pub fn draw_blame_view(frame: &mut Frame, app: &mut App, area: Rect) {
         }
         None => " Blame [loading...] ".to_string(),
     };
-    let block = Block::default().title(title).borders(Borders::ALL).border_style(Style::default().fg(Color::Cyan));
+    let block = crate::ui::pane_block(title, true, crate::ui::mode_accent(app));
 
     let inner = block.inner(area);
     frame.render_widget(block, area);

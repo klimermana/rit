@@ -12,7 +12,7 @@ use ratatui::{
 };
 
 pub fn draw_diff(frame: &mut Frame, app: &App, area: Rect, focused: bool) {
-    let block = crate::ui::pane_block(diff_title(app), focused);
+    let block = crate::ui::pane_block(diff_title(app), focused, crate::ui::mode_accent(app));
 
     let inner = block.inner(area);
     frame.render_widget(block, area);

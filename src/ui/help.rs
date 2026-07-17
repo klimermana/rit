@@ -18,10 +18,12 @@ pub fn draw_help(frame: &mut Frame, area: Rect) {
 
     frame.render_widget(Clear, popup_area);
 
+    // White matches the HELP mode chip — the popup and the chip carry
+    // the same accent, like every other mode.
     let block = Block::default()
-        .title(" Help ")
+        .title(Span::styled(" Help ", Style::default().fg(Color::White).add_modifier(Modifier::BOLD)))
         .borders(Borders::ALL)
-        .border_style(Style::default().fg(Color::Cyan))
+        .border_style(Style::default().fg(Color::White))
         .style(Style::default().bg(Color::Black));
 
     let inner = block.inner(popup_area);

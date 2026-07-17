@@ -55,6 +55,11 @@ Versioning](https://semver.org/spec/v2.0.0.html).
   selection bar follows focus — when the diff pane is driving, the
   log's cursor row fades to a faint bar so only one pane shows the
   active highlight.
+- The mode chip's color now doubles as the focused border's accent:
+  the active pane (and the full-screen status/refs/blame views and
+  help popup) borders in the same color as the chip, so one color
+  consistently means one mode — blue LOG, cyan DIFF, magenta BLAME,
+  green REFS, yellow SEARCH, white HELP.
 - Indexing is 27–58% faster: the git worker now configures gix's
   decoded-object cache (unset by default), sized for tree diffs
   against the checkout with a 4 MiB floor. The history walk and its
