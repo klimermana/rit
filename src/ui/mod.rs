@@ -13,7 +13,7 @@ use ratatui::{
     layout::{Alignment, Constraint, Direction, Layout, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span},
-    widgets::{Block, Borders, Paragraph},
+    widgets::{Block, BorderType, Borders, Paragraph},
 };
 
 /// Mirrors tig: prefer side-by-side panes when the aspect ratio is wide
@@ -130,6 +130,48 @@ fn draw_status_view(frame: &mut Frame, app: &App, area: Rect) {
     frame.render_widget(Paragraph::new(visible), inner);
 }
 
+/// Bordered block for the log/diff panes with the focus treatment:
+/// thick cyan border and bold title when focused, plain dark gray
+/// otherwise — so which pane receives keys is legible from the frame
+/// itself, not just a border tint.
+pub(crate) fn pane_block(title: String, focused: bool) -> Block<'static> {
+    let (border_style, border_type, title_style) = if focused {
+        (
+            Style::default().fg(Color::Cyan),
+            BorderType::Thick,
+            Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+        )
+    } else {
+        (Style::default().fg(Color::DarkGray), BorderType::Plain, Style::default().fg(Color::DarkGray))
+    };
+    Block::default()
+        .title(Span::styled(title, title_style))
+        .borders(Borders::ALL)
+        .border_style(border_style)
+        .border_type(border_type)
+}
+
+/// The status bar's mode label and its chip color. Branch order mirrors
+/// `App::handle_input`'s dispatch exactly, so the chip always names the
+/// mode whose keymap is live.
+fn mode_label(app: &App) -> (&'static str, Color) {
+    if app.show_help {
+        ("HELP", Color::White)
+    } else if app.diff.search.active || app.search.state.active {
+        ("SEARCH", Color::Yellow)
+    } else if app.status.open {
+        ("STATUS", Color::Gray)
+    } else if app.refs.open {
+        ("REFS", Color::Green)
+    } else if app.blame.open {
+        ("BLAME", Color::Magenta)
+    } else if matches!(app.focus, crate::app::Focus::Diff) {
+        ("DIFF", Color::Cyan)
+    } else {
+        ("LOG", Color::Blue)
+    }
+}
+
 fn draw_status_bar(frame: &mut Frame, app: &App, area: Rect) {
     // Diff search takes precedence over log search when both have a query —
     // the diff pane is the foreground context whenever it's open.
@@ -163,7 +205,18 @@ fn draw_status_bar(frame: &mut Frame, app: &App, area: Rect) {
         )))
     };
 
-    frame.render_widget(Paragraph::new(text).style(Style::default().bg(Color::DarkGray).fg(Color::Gray)), area);
+    // Prepend the mode chip — one fixed spot that names the active
+    // keymap, vim-style.
+    let (label, color) = mode_label(app);
+    let chip =
+        Span::styled(format!(" {label} "), Style::default().bg(color).fg(Color::Black).add_modifier(Modifier::BOLD));
+    let mut spans = vec![chip];
+    spans.extend(text.spans);
+
+    frame.render_widget(
+        Paragraph::new(Line::from(spans)).style(Style::default().bg(Color::DarkGray).fg(Color::Gray)),
+        area,
+    );
 }
 
 /// Renders the status-bar line for an active or pending search.
@@ -335,6 +388,32 @@ mod tests {
         assert_eq!(parts.iter().filter(|(_, bg)| bg.is_some()).count(), 0);
         let recombined: String = parts.iter().map(|(s, _)| s.clone()).collect();
         assert_eq!(recombined, "Renée");
+    }
+
+    /// The chip must always name the mode whose keymap is live, so its
+    /// precedence has to match `App::handle_input`'s dispatch order —
+    /// stack the modes up and peel them back down.
+    #[test]
+    fn mode_label_mirrors_input_dispatch_order() {
+        let (req_tx, _req_rx) = crossbeam_channel::unbounded();
+        let (_msg_tx, msg_rx) = crossbeam_channel::unbounded();
+        let (_input_tx, input_rx) = crossbeam_channel::unbounded();
+        let mut app = App::new(req_tx, msg_rx, input_rx);
+
+        assert_eq!(mode_label(&app).0, "LOG");
+        app.diff.open = true;
+        app.focus = crate::app::Focus::Diff;
+        assert_eq!(mode_label(&app).0, "DIFF");
+        app.blame.open = true;
+        assert_eq!(mode_label(&app).0, "BLAME");
+        app.refs.open = true;
+        assert_eq!(mode_label(&app).0, "REFS");
+        app.status.open = true;
+        assert_eq!(mode_label(&app).0, "STATUS");
+        app.search.state.active = true;
+        assert_eq!(mode_label(&app).0, "SEARCH");
+        app.show_help = true;
+        assert_eq!(mode_label(&app).0, "HELP");
     }
 
     #[test]

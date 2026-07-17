@@ -19,6 +19,11 @@ Versioning](https://semver.org/spec/v2.0.0.html).
   for the unscoped path are unchanged — all cases "no change
   detected").
 
+- Mode indicator: the status bar now starts with a colored, bold chip
+  naming the active keymap — `LOG`, `DIFF`, `SEARCH`, `STATUS`,
+  `REFS`, `BLAME`, or `HELP` — so it's always clear which mode you're
+  in. The chip's precedence mirrors the input dispatcher exactly.
+
 ### Fixed
 
 - Reopening the working-tree diff while a previous untracked-files
@@ -44,6 +49,12 @@ Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Changed
 
+- Which pane is focused is now much more legible: the focused pane
+  gets a thick cyan border and a bold title (unfocused panes drop to a
+  plain dark-gray border and dim title), and the log's bright
+  selection bar follows focus — when the diff pane is driving, the
+  log's cursor row fades to a faint bar so only one pane shows the
+  active highlight.
 - Indexing is 27–58% faster: the git worker now configures gix's
   decoded-object cache (unset by default), sized for tree diffs
   against the checkout with a 4 MiB floor. The history walk and its

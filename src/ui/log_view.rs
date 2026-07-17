@@ -8,13 +8,11 @@ use ratatui::{
     layout::Rect,
     style::{Color, Modifier, Style},
     text::{Line, Span},
-    widgets::{Block, Borders, Paragraph},
+    widgets::Paragraph,
 };
 
 pub fn draw_log(frame: &mut Frame, app: &App, area: Rect, focused: bool) {
-    let border_style = if focused { Style::default().fg(Color::Cyan) } else { Style::default().fg(Color::DarkGray) };
-
-    let block = Block::default().title(" Log ").borders(Borders::ALL).border_style(border_style);
+    let block = crate::ui::pane_block(" Log ".to_string(), focused);
 
     let inner = block.inner(area);
     frame.render_widget(block, area);
@@ -62,8 +60,15 @@ pub fn draw_log(frame: &mut Frame, app: &App, area: Rect, focused: bool) {
             LogRow::Commit(c) => commit_spans(c, app, row_query, highlight),
         };
 
+        // The bright selection bar follows focus: when the diff pane is
+        // driving, the log's cursor drops to a faint bar so exactly one
+        // pane shows the "active" highlight at a time.
         let row_style = if is_selected {
-            Style::default().bg(Color::DarkGray).fg(Color::White).add_modifier(Modifier::BOLD)
+            if focused {
+                Style::default().bg(Color::DarkGray).fg(Color::White).add_modifier(Modifier::BOLD)
+            } else {
+                Style::default().bg(Color::Rgb(45, 45, 45))
+            }
         } else {
             Style::default()
         };

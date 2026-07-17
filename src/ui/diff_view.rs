@@ -8,15 +8,11 @@ use ratatui::{
     layout::Rect,
     style::{Color, Style},
     text::{Line, Span},
-    widgets::{Block, Borders, Paragraph},
+    widgets::Paragraph,
 };
 
 pub fn draw_diff(frame: &mut Frame, app: &App, area: Rect, focused: bool) {
-    let border_style = if focused { Style::default().fg(Color::Cyan) } else { Style::default().fg(Color::DarkGray) };
-
-    let title = diff_title(app);
-
-    let block = Block::default().title(title).borders(Borders::ALL).border_style(border_style);
+    let block = crate::ui::pane_block(diff_title(app), focused);
 
     let inner = block.inner(area);
     frame.render_widget(block, area);
