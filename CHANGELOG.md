@@ -47,6 +47,14 @@ Versioning](https://semver.org/spec/v2.0.0.html).
   `REFS`, `BLAME`, or `HELP` — so it's always clear which mode you're
   in. The chip's precedence mirrors the input dispatcher exactly.
 
+### Changed
+
+- Release builds now use fat LTO (was thin). Working-tree diffs on a
+  wide checkout (5000 tracked files) run ~4-7× faster — the
+  `gix::status` sweep benefits from cross-crate inlining — with every
+  other benchmark unchanged within noise. Clean release builds take
+  ~28 s longer; dev builds are unaffected.
+
 ### Fixed
 
 - Reopening the working-tree diff while a previous untracked-files

@@ -26,7 +26,7 @@ clap = { version = "4.6.1", features = ["derive"] }
 
 [profile.release]
 strip = true
-lto = "thin"
+lto = "fat"
 codegen-units = 1
 
 [dev-dependencies]
