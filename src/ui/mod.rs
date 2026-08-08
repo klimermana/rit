@@ -156,6 +156,8 @@ fn mode_label(app: &App) -> (&'static str, Color) {
         ("HELP", Color::White)
     } else if app.diff.search.active || app.search.state.active {
         ("SEARCH", Color::Yellow)
+    } else if app.diff.file_picker.is_some() {
+        ("PICK", Color::LightCyan)
     } else if app.status.open {
         ("STATUS", Color::Gray)
     } else if app.refs.open {
@@ -187,6 +189,8 @@ fn draw_status_bar(frame: &mut Frame, app: &App, area: Rect) {
         line
     } else if let Some(y) = &app.yank_message {
         Line::from(Span::styled(format!(" ✓ {}", y.text), Style::default().fg(Color::Green)))
+    } else if app.diff.file_picker.is_some() {
+        Line::from(Span::raw(" j/k:select-file  Enter:jump-to-diff  o:open-full-file  q/Esc:cancel"))
     } else if app.status.open {
         Line::from(Span::raw(" q/Esc/s:close-status  j/k:scroll  g/G:top/bottom"))
     } else if app.refs.open {
@@ -195,9 +199,11 @@ fn draw_status_bar(frame: &mut Frame, app: &App, area: Rect) {
         Line::from(Span::raw(
             " q/Esc:close-blame  j/k:nav  Enter:open-commit  ,:reblame-parent  Backspace:back  y:yank",
         ))
+    } else if app.diff.open && app.diff.file_view_return.is_some() {
+        Line::from(Span::raw(" q/Esc:back-to-diff  j/k:scroll  h/l:pan  b:blame  /:search  ?:help"))
     } else if app.diff.open {
         Line::from(Span::raw(
-            " q/Esc:close-diff  j/k:nav  ]/[:file  Tab:switch  /:search-diff  v:hunks  y:yank  ?:help",
+            " q/Esc:close-diff  j/k:nav  ]/[:file  t:files  o:full-file  Tab:switch  /:search-diff  v:hunks  ?:help",
         ))
     } else {
         let count = app.commits_len();
@@ -407,6 +413,12 @@ mod tests {
         app.diff.open = true;
         app.focus = crate::app::Focus::Diff;
         assert_eq!(mode_label(&app).0, "DIFF");
+        // The file picker preempts the main keymap (checked right after
+        // the searches in handle_input) but can only be active in DIFF
+        // mode — assert and clear before stacking the full-screen views.
+        app.diff.file_picker = Some(0);
+        assert_eq!(mode_label(&app).0, "PICK");
+        app.diff.file_picker = None;
         app.blame.open = true;
         assert_eq!(mode_label(&app).0, "BLAME");
         app.refs.open = true;

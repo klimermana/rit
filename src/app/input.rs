@@ -37,6 +37,13 @@ impl App {
             self.handle_commit_search_key(key);
             return;
         }
+        // File-picker mode is only ever entered from the focused diff
+        // pane, so it sits below the overlays above and preempts the
+        // main keymap.
+        if self.diff.file_picker.is_some() {
+            self.handle_file_picker_key(key);
+            return;
+        }
         if self.status.open {
             self.handle_status_key(key);
             return;
@@ -98,6 +105,23 @@ impl App {
                 self.update_diff_matches();
                 self.diff_jump_first_at_or_after_cursor();
             }
+            _ => {}
+        }
+    }
+
+    fn handle_file_picker_key(&mut self, key: KeyEvent) {
+        use KeyCode::*;
+        use KeyModifiers as Mod;
+        match (key.code, key.modifiers) {
+            (Char('q') | Esc | Char('t'), Mod::NONE) => self.diff.file_picker = None,
+            (Enter, Mod::NONE) => self.picker_activate(),
+            (Char('o'), Mod::NONE) => self.picker_open_file(),
+            (Char('j') | Down, Mod::NONE) => self.picker_move(1),
+            (Char('k') | Up, Mod::NONE) => self.picker_move(-1),
+            (Char('g'), Mod::NONE) => self.picker_move(isize::MIN),
+            (Char('G'), Mod::NONE | Mod::SHIFT) => self.picker_move(isize::MAX),
+            (Char('d'), Mod::CONTROL) => self.picker_move(HALF_PAGE as isize),
+            (Char('u'), Mod::CONTROL) => self.picker_move(-(HALF_PAGE as isize)),
             _ => {}
         }
     }
@@ -216,8 +240,12 @@ impl App {
                 self.migrate_search_to_diff();
                 self.fetch_diff_for_selected();
             }
-            // q/Esc pops the diff pane if open; otherwise quits from log.
+            // q/Esc pops the single-file view first, then the diff pane;
+            // otherwise quits from log.
             (_, Char('q') | Esc, Mod::NONE) if self.diff.open => {
+                if self.close_file_view() {
+                    return;
+                }
                 self.diff.open = false;
                 self.focus = Focus::Log;
                 // Carry an active diff search back to the log so the query
@@ -260,6 +288,8 @@ impl App {
             (Focus::Diff, Char(']'), Mod::NONE) => self.diff_jump_file(1),
             (Focus::Diff, Char('['), Mod::NONE) => self.diff_jump_file(-1),
             (Focus::Diff, Char('b'), Mod::NONE) => self.blame_from_diff_pane(),
+            (Focus::Diff, Char('t'), Mod::NONE) => self.open_file_picker(),
+            (Focus::Diff, Char('o'), Mod::NONE) => self.open_file_view_at_viewport(),
             _ => {}
         }
     }

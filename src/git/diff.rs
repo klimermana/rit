@@ -4,8 +4,8 @@
 
 use crate::{
     git::{
-        MAX_INLINE_DIFF_BYTES, MAX_INLINE_DIFF_FILES, MAX_INLINE_DIFF_LINES, PARALLEL_FILE_THRESHOLD, TreeDiffCache,
-        compute_tree_diff_records, meta::format_timestamp,
+        MAX_FILE_VIEW_DIFF_BYTES, MAX_INLINE_DIFF_BYTES, MAX_INLINE_DIFF_FILES, MAX_INLINE_DIFF_LINES,
+        PARALLEL_FILE_THRESHOLD, TreeDiffCache, compute_tree_diff_records, meta::format_timestamp,
     },
     model::{DiffDocument, DiffFlags, DiffLine, DiffLineKind, DiffStats, DiffTarget, FileSection, FileStat},
 };
@@ -250,14 +250,14 @@ impl DiffSink<'_> {
     pub fn guardrail_exceeded(&mut self) -> bool {
         if self.stats.files >= MAX_INLINE_DIFF_FILES {
             self.note_truncation(format!(
-                "… {} files changed; remaining file diffs suppressed (>{} files)",
+                "… {} files changed; remaining file diffs suppressed (>{} files; t lists them, o opens one)",
                 self.stats.files, MAX_INLINE_DIFF_FILES,
             ));
             return true;
         }
         if self.lines.len() >= MAX_INLINE_DIFF_LINES {
             self.note_truncation(format!(
-                "… diff truncated at {MAX_INLINE_DIFF_LINES} lines; remaining files summarised",
+                "… diff truncated at {MAX_INLINE_DIFF_LINES} lines; remaining files summarised (t lists files, o opens one)",
             ));
             return true;
         }
@@ -359,6 +359,133 @@ pub fn file_modification_output(path: &str, old: &[u8], new: &[u8]) -> FileDiffO
     FileDiffOutput { path: path.to_string(), lines, additions, deletions, skip_reason }
 }
 
+/// Full-context variant of the per-file renderers: emits the *entire*
+/// file with changed lines interleaved in place, instead of ±3-line
+/// hunks. Powers the single-file view (`o` in the diff pane), where the
+/// point is reading a change in the context of the whole file. Runs
+/// with the raised `MAX_FILE_VIEW_DIFF_BYTES` cap — the view is
+/// on-demand and single-file, so the inline guardrails don't apply.
+pub fn file_full_context_output(path: &str, old: &[u8], new: &[u8], mode_meta: Option<&str>) -> FileDiffOutput {
+    let mut lines: Vec<DiffLine> = Vec::new();
+    push_file_headers(&mut lines, path, mode_meta);
+    let (additions, deletions, skip_reason) = match classify_skip_with_cap(old, new, MAX_FILE_VIEW_DIFF_BYTES) {
+        Some(reason) => {
+            lines.push(DiffLine::new(DiffLineKind::Faint, file_view_skip_text(&reason, old.len().max(new.len()))));
+            (0, 0, Some(reason))
+        }
+        None => {
+            let (file_add, file_del) = render_full_context_into(&mut lines, old, new);
+            (file_add, file_del, None)
+        }
+    };
+    FileDiffOutput { path: path.to_string(), lines, additions, deletions, skip_reason }
+}
+
+/// `render_unified_into` without the context clamp: every unchanged
+/// line is emitted as `Context`, so no hunk headers are needed — the
+/// output *is* the file, with deletions inlined where they were
+/// removed and additions where they landed.
+fn render_full_context_into(lines: &mut Vec<DiffLine>, old: &[u8], new: &[u8]) -> (usize, usize) {
+    let input = InternedInput::new(old, new);
+    let mut diff = Diff::compute(Algorithm::Histogram, &input);
+    // Same slider postprocessing as the hunk renderer, so the isolated
+    // view of a file shows the same add/del lines the inline diff did.
+    diff.postprocess_lines(&input);
+
+    let before_total = input.before.len() as u32;
+    let mut file_add = 0usize;
+    let mut file_del = 0usize;
+    let mut cursor = 0u32;
+    for h in diff.hunks() {
+        while cursor < h.before.start {
+            push_token_line(lines, DiffLineKind::Context, &input, cursor, /* before */ true);
+            cursor += 1;
+        }
+        for i in h.before.start..h.before.end {
+            push_token_line(lines, DiffLineKind::Del, &input, i, /* before */ true);
+            file_del += 1;
+        }
+        cursor = h.before.end;
+        for i in h.after.start..h.after.end {
+            push_token_line(lines, DiffLineKind::Add, &input, i, /* before */ false);
+            file_add += 1;
+        }
+    }
+    while cursor < before_total {
+        push_token_line(lines, DiffLineKind::Context, &input, cursor, /* before */ true);
+        cursor += 1;
+    }
+    (file_add, file_del)
+}
+
+/// Render one file of `id`'s diff with full file context — the
+/// document behind `InspectReq::LoadFileDiff` for commit targets. The
+/// tree-diff records are a cache hit when the user is isolating a file
+/// from the commit diff already on screen.
+pub fn compute_file_diff(repo: &gix::Repository, id: ObjectId, path: &str, cache: &mut TreeDiffCache) -> DiffDocument {
+    let target = DiffTarget::Commit(id);
+    compute_file_diff_inner(repo, id, target, path, cache).unwrap_or_else(|e| empty_error_document(target, e))
+}
+
+fn compute_file_diff_inner(
+    repo: &gix::Repository,
+    id: ObjectId,
+    target: DiffTarget,
+    path: &str,
+    cache: &mut TreeDiffCache,
+) -> Result<DiffDocument> {
+    use gix::diff::tree::recorder::Change;
+
+    let commit_obj = repo.find_object(id)?.try_into_commit()?;
+    let parent_id = commit_obj.decode()?.parents().next();
+    let records = compute_tree_diff_records(repo, parent_id, id, cache)?;
+    let change = records
+        .iter()
+        .find(|c| change_is_blob(c) && change_path_bstr(c).to_str_lossy() == path)
+        .ok_or_else(|| anyhow::anyhow!("{path} was not changed in this commit"))?;
+
+    let output = match change {
+        Change::Addition { oid, .. } => {
+            let new = repo.find_object(*oid)?;
+            file_full_context_output(path, &[], &new.data, Some("new file"))
+        }
+        Change::Deletion { oid, .. } => {
+            let old = repo.find_object(*oid)?;
+            file_full_context_output(path, &old.data, &[], Some("deleted file"))
+        }
+        Change::Modification { previous_oid, oid, .. } => {
+            let old = repo.find_object(*previous_oid)?;
+            let new = repo.find_object(*oid)?;
+            file_full_context_output(path, &old.data, &new.data, None)
+        }
+    };
+
+    Ok(single_file_document(target, output))
+}
+
+/// Wrap one `FileDiffOutput` into a standalone `DiffDocument` — shared
+/// by the commit and working-tree single-file paths. No commit header:
+/// the takeover view's title already names the commit and path, so the
+/// file content starts at the top of the pane.
+pub fn single_file_document(target: DiffTarget, output: FileDiffOutput) -> DiffDocument {
+    let mut body: Vec<DiffLine> = Vec::new();
+    let mut stats = DiffStats { files: 0, insertions: 0, deletions: 0 };
+    let mut files: Vec<FileStat> = Vec::new();
+    let mut flags = DiffFlags::default();
+    let mut sections: Vec<FileSection> = Vec::new();
+    {
+        let mut sink = DiffSink {
+            lines: &mut body,
+            stats: &mut stats,
+            files: &mut files,
+            flags: &mut flags,
+            sections: &mut sections,
+        };
+        merge_file_output_into_sink(&mut sink, output);
+    }
+    DiffDocument { target, header: Vec::new(), body, files, stats, flags, untracked_anchor: None, sections }
+}
+
 /// Fold a per-file output into a sink, applying its skip/flag updates
 /// and recording the file in the diffstat. Used by both the
 /// sink-pushing wrappers below and the parallel renderers.
@@ -409,7 +536,26 @@ fn skip_summary_text(reason: &SkipReason, biggest_side_bytes: usize) -> String {
         SkipReason::Binary => "Binary file — diff suppressed".to_string(),
         SkipReason::Oversize => {
             let kib = biggest_side_bytes / 1024;
-            format!("Large file ({kib} KiB) — diff suppressed (>{} KiB)", MAX_INLINE_DIFF_BYTES / 1024)
+            format!(
+                "Large file ({kib} KiB) — diff suppressed (>{} KiB; o opens the full file)",
+                MAX_INLINE_DIFF_BYTES / 1024
+            )
+        }
+    }
+}
+
+/// Skip text for the single-file view, which runs with the raised
+/// `MAX_FILE_VIEW_DIFF_BYTES` cap and where "press o" would be
+/// circular advice.
+fn file_view_skip_text(reason: &SkipReason, biggest_side_bytes: usize) -> String {
+    match reason {
+        SkipReason::Binary => "Binary file — diff suppressed".to_string(),
+        SkipReason::Oversize => {
+            let kib = biggest_side_bytes / 1024;
+            format!(
+                "Large file ({kib} KiB) — exceeds even the single-file cap (>{} KiB)",
+                MAX_FILE_VIEW_DIFF_BYTES / 1024
+            )
         }
     }
 }
@@ -508,10 +654,10 @@ fn render_unified_into(lines: &mut Vec<DiffLine>, old: &[u8], new: &[u8]) -> (us
 /// newline (kept by `imara-diff`'s tokenizer to detect EOL changes)
 /// is stripped — the renderer prepends its own marker at draw time.
 ///
-/// `idx` is always a valid offset into the chosen side: `render_unified_into`
-/// only ever feeds indices it pulled from `Diff::hunks()` on this same
-/// `InternedInput`, and the cursor walks `[group_before_start, group_before_end)`
-/// which is clamped to the side's length. Likewise for the after side
+/// `idx` is always a valid offset into the chosen side: both callers
+/// (`render_unified_into` and `render_full_context_into`) only ever feed
+/// indices pulled from `Diff::hunks()` on this same `InternedInput`, or a
+/// cursor clamped to the side's length. Likewise for the after side
 /// (`h.after.start..h.after.end` ⊆ `0..input.after.len()`).
 fn push_token_line(
     lines: &mut Vec<DiffLine>,
@@ -548,11 +694,17 @@ pub enum SkipReason {
 /// `old` and `new` are raw blob bytes (either may be empty for pure
 /// add/delete).
 pub fn classify_skip(old: &[u8], new: &[u8]) -> Option<SkipReason> {
+    classify_skip_with_cap(old, new, MAX_INLINE_DIFF_BYTES)
+}
+
+/// `classify_skip` with a caller-chosen byte cap — the single-file view
+/// runs the same binary sniff but with `MAX_FILE_VIEW_DIFF_BYTES`.
+pub fn classify_skip_with_cap(old: &[u8], new: &[u8], max_bytes: usize) -> Option<SkipReason> {
     // NUL-byte sniff matches the convention used in compute_numstat_gix.
     if old.contains(&0) || new.contains(&0) {
         return Some(SkipReason::Binary);
     }
-    if old.len() > MAX_INLINE_DIFF_BYTES || new.len() > MAX_INLINE_DIFF_BYTES {
+    if old.len() > max_bytes || new.len() > max_bytes {
         return Some(SkipReason::Oversize);
     }
     None
@@ -597,7 +749,8 @@ fn change_path_bstr(change: &gix::diff::tree::recorder::Change) -> &gix::bstr::B
 #[cfg(test)]
 mod tests {
     use super::{
-        DiffSink, MAX_INLINE_DIFF_BYTES, SkipReason, classify_skip, compute_commit_diff, render_file_modification,
+        DiffSink, MAX_INLINE_DIFF_BYTES, SkipReason, classify_skip, compute_commit_diff, compute_file_diff,
+        file_full_context_output, render_file_modification,
     };
     use crate::{
         git::{TreeDiffCache, walk::build_pathspec_search},
@@ -739,6 +892,80 @@ mod tests {
         let scoped = compute_commit_diff(&repo, head, &mut cache, Some(&mut search));
         assert_eq!(scoped.stats.files, 1);
         assert!(!scoped.body.iter().any(|l| l.text.contains("outside the path filter")));
+    }
+
+    #[test]
+    fn full_context_emits_every_line_without_hunk_headers() {
+        let old: String = (0..30).map(|i| format!("line{i}\n")).collect();
+        let mut new_lines: Vec<String> = (0..30).map(|i| format!("line{i}\n")).collect();
+        new_lines[15] = "CHANGED\n".to_string();
+        let new: String = new_lines.concat();
+
+        let out = file_full_context_output("x.txt", old.as_bytes(), new.as_bytes(), None);
+
+        assert!(out.skip_reason.is_none());
+        assert_eq!(out.additions, 1);
+        assert_eq!(out.deletions, 1);
+        assert!(
+            !out.lines.iter().any(|l| matches!(l.kind, DiffLineKind::HunkHeader)),
+            "full-context output is the whole file — no hunk headers"
+        );
+        let context = out.lines.iter().filter(|l| matches!(l.kind, DiffLineKind::Context)).count();
+        assert_eq!(context, 29, "every unchanged line is present as context");
+        assert!(out.lines.iter().any(|l| l.text == "line0"), "lines far outside ±3 context are included");
+        assert!(out.lines.iter().any(|l| l.text == "line29"));
+    }
+
+    #[test]
+    fn full_context_renders_files_past_the_inline_cap() {
+        let big = vec![b'a'; MAX_INLINE_DIFF_BYTES + 1];
+        assert!(matches!(classify_skip(&big, b""), Some(SkipReason::Oversize)), "inline path suppresses this file");
+
+        let out = file_full_context_output("big.txt", &big, b"", Some("deleted file"));
+        assert!(out.skip_reason.is_none(), "single-file view renders past the inline byte cap");
+        assert_eq!(out.deletions, 1, "the blob is one giant line");
+    }
+
+    #[test]
+    fn compute_file_diff_isolates_one_file_with_full_context() {
+        let (td, repo) = make_fixture_repo();
+        let path = td.path();
+        let base: String = (0..12).map(|i| format!("alpha{i}\n")).collect();
+        write_file(path, "src/a.rs", &base);
+        write_file(path, "docs/b.md", "hello\n");
+        commit_all(path, "base");
+        let mut changed: Vec<String> = (0..12).map(|i| format!("alpha{i}\n")).collect();
+        changed[6] = "BETA\n".to_string();
+        write_file(path, "src/a.rs", &changed.concat());
+        write_file(path, "docs/b.md", "hello world\n");
+        commit_all(path, "change");
+        let head = repo.head_id().expect("head").detach();
+        let mut cache = TreeDiffCache::new();
+
+        let doc = compute_file_diff(&repo, head, "src/a.rs", &mut cache);
+        assert_eq!(doc.stats.files, 1);
+        assert_eq!(doc.files[0].path, "src/a.rs");
+        assert_eq!(doc.sections.len(), 1);
+        assert!(doc.body.iter().any(|l| matches!(l.kind, DiffLineKind::Add) && l.text == "BETA"));
+        assert!(
+            doc.body.iter().any(|l| matches!(l.kind, DiffLineKind::Context) && l.text == "alpha0"),
+            "context spans the whole file, not ±3 lines around the change"
+        );
+        assert!(doc.body.iter().any(|l| matches!(l.kind, DiffLineKind::Context) && l.text == "alpha11"));
+        assert!(!doc.body.iter().any(|l| l.text.contains("b.md")), "the other changed file stays out");
+    }
+
+    #[test]
+    fn compute_file_diff_unknown_path_yields_error_document() {
+        let (td, repo) = make_fixture_repo();
+        write_file(td.path(), "a.txt", "x\n");
+        commit_all(td.path(), "first");
+        let head = repo.head_id().expect("head").detach();
+        let mut cache = TreeDiffCache::new();
+
+        let doc = compute_file_diff(&repo, head, "nope.rs", &mut cache);
+        assert!(doc.header.iter().any(|l| l.text.starts_with("Error:")));
+        assert!(doc.body.is_empty());
     }
 
     #[test]

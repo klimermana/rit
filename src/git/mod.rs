@@ -35,6 +35,11 @@ pub const MAX_INLINE_DIFF_BYTES: usize = 256 * 1024;
 pub const MAX_INLINE_DIFF_LINES: usize = 20_000;
 pub const MAX_INLINE_DIFF_FILES: usize = 200;
 
+/// Byte cap for the on-demand single-file view (`o` in the diff pane).
+/// Deliberately far above `MAX_INLINE_DIFF_BYTES`: the user asked for
+/// exactly one file, so only truly pathological blobs are refused.
+pub const MAX_FILE_VIEW_DIFF_BYTES: usize = 8 * 1024 * 1024;
+
 /// Floor for the worker repo's decoded-object cache. gix leaves the
 /// cache **unset by default**, which makes every tree/commit lookup
 /// re-decode from scratch — the history walk and its pathspec filter
@@ -409,6 +414,14 @@ fn process_request<'r>(
             if needs_untracked_walk {
                 dirty_handles.0.push(spawn_untracked_scan(repo, target, seq, msg_tx.clone()));
             }
+        }
+        GitReq::Inspect(InspectReq::LoadFileDiff { target, path, seq }) => {
+            use crate::model::DiffTarget;
+            let document = match target {
+                DiffTarget::Commit(id) => diff::compute_file_diff(repo, id, &path, tree_diff_cache),
+                DiffTarget::WorkingTree => status::compute_worktree_file_diff(repo, &path),
+            };
+            _ = msg_tx.send(GitMsg::Inspect(InspectMsg::FileDiffLoaded { seq, document }));
         }
         GitReq::Inspect(InspectReq::LoadStatus) => {
             let document = status::compute_status(repo);

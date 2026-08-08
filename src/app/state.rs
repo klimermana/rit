@@ -171,6 +171,22 @@ pub struct DiffState {
     /// underlying diff content changes.
     pub header_lower: Option<Vec<String>>,
     pub body_lower: Option<Vec<String>>,
+    /// `o`: while the single-file takeover view is showing, the
+    /// multi-file document + viewport it replaced. q/Esc pops it back;
+    /// `None` means the pane shows a normal `LoadDiff` document.
+    pub file_view_return: Option<Box<FileViewReturn>>,
+    /// `t`: index into `document.files` of the file-picker cursor.
+    /// `Some` = picker mode is active (j/k move, Enter jumps, o opens
+    /// the single-file view).
+    pub file_picker: Option<usize>,
+}
+
+/// What the single-file view replaced — restored on q/Esc so the
+/// takeover behaves like a one-deep stack.
+pub struct FileViewReturn {
+    pub document: DiffDocument,
+    pub scroll: usize,
+    pub horizontal_scroll: usize,
 }
 
 impl DiffState {

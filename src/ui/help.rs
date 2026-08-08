@@ -8,8 +8,8 @@ use ratatui::{
 
 pub fn draw_help(frame: &mut Frame, area: Rect) {
     let width = 52u16.min(area.width.saturating_sub(4));
-    // 45 content rows + 2 border rows; clamped to the terminal height.
-    let height = 47u16.min(area.height.saturating_sub(4));
+    // 47 content rows + 2 border rows; clamped to the terminal height.
+    let height = 49u16.min(area.height.saturating_sub(4));
 
     let x = (area.width.saturating_sub(width)) / 2;
     let y = (area.height.saturating_sub(height)) / 2;
@@ -53,6 +53,8 @@ pub fn draw_help(frame: &mut Frame, area: Rect) {
         row!("  h / l / ← / →  ", "Scroll left / right (4 cols)"),
         row!("  0              ", "Reset horizontal scroll"),
         row!("  ] / [          ", "Jump to next / previous file in diff"),
+        row!("  t              ", "File picker: j/k select, Enter jumps, o opens"),
+        row!("  o              ", "Full-file diff of the file at the top (q backs out)"),
         row!("  b              ", "Blame the file at the top of the diff pane"),
         Line::from(""),
         Line::from(Span::styled("Blame View", h)),

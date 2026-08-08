@@ -6,7 +6,7 @@ use crate::{
 use ratatui::{
     Frame,
     layout::Rect,
-    style::{Color, Style},
+    style::{Color, Modifier, Style},
     text::{Line, Span},
     widgets::Paragraph,
 };
@@ -39,7 +39,7 @@ pub fn draw_diff(frame: &mut Frame, app: &App, area: Rect, focused: bool) {
     // eagerly; the wins come from not materialising the body.
     let diffstat: Vec<Line<'static>> = if !document.files.is_empty() {
         let mut out = Vec::with_capacity(document.files.len() + 3);
-        append_diffstat(&mut out, &document.files, &document.stats);
+        append_diffstat(&mut out, &document.files, &document.stats, app.diff.file_picker);
         out
     } else {
         Vec::new()
@@ -127,6 +127,15 @@ fn diff_title(app: &App) -> String {
     };
     let stats = &doc.stats;
     let trunc_tag = truncation_tag(&doc.flags);
+    // Single-file takeover view (`o`): path-centric title.
+    if app.diff.file_view_return.is_some()
+        && let Some(f) = doc.files.first()
+    {
+        return format!(
+            " Diff: {}  —  {}  +{}  -{}  [file]{} ",
+            label, f.path, stats.insertions, stats.deletions, trunc_tag,
+        );
+    }
     format!(
         " Diff: {}  {} file{} changed  +{}  -{}{}{}{} ",
         label,
@@ -156,7 +165,7 @@ fn truncation_tag(flags: &crate::model::DiffFlags) -> String {
     if parts.is_empty() { "  [truncated]".to_string() } else { format!("  [truncated: {}]", parts.join(", ")) }
 }
 
-fn append_diffstat(out: &mut Vec<Line<'static>>, files: &[FileStat], stats: &DiffStats) {
+fn append_diffstat(out: &mut Vec<Line<'static>>, files: &[FileStat], stats: &DiffStats, selected: Option<usize>) {
     out.push(diff_line_to_ratatui(&DiffLine { kind: DiffLineKind::Faint, text: "---".to_string() }));
 
     // Column width: longest path, capped so we leave room for the bar.
@@ -165,7 +174,7 @@ fn append_diffstat(out: &mut Vec<Line<'static>>, files: &[FileStat], stats: &Dif
     // Bar width: cap at 20 chars regardless of column space.
     let bar_cap = 20usize;
 
-    for f in files {
+    for (i, f) in files.iter().enumerate() {
         let total = f.additions + f.deletions;
         let bar_len = bar_len_for(total, max_changes, bar_cap).min(bar_cap).max(usize::from(total > 0));
 
@@ -181,7 +190,12 @@ fn append_diffstat(out: &mut Vec<Line<'static>>, files: &[FileStat], stats: &Dif
             plus = "+".repeat(plus_len),
             minus = "-".repeat(minus_len),
         );
-        out.push(diff_line_to_ratatui(&DiffLine { kind: DiffLineKind::Diffstat, text }));
+        let mut line = diff_line_to_ratatui(&DiffLine { kind: DiffLineKind::Diffstat, text });
+        // File-picker cursor row (`t` mode).
+        if selected == Some(i) {
+            line.style = Style::default().bg(Color::DarkGray).add_modifier(Modifier::BOLD);
+        }
+        out.push(line);
     }
 
     let summary = format!(

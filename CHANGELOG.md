@@ -9,6 +9,29 @@ Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- Single-file diff view: `o` in the diff pane takes over the pane with
+  the full diff of the file under the viewport — rendered as the
+  *entire file* with added/removed lines highlighted inline, so every
+  change is visible in its surrounding context instead of ±3-line
+  hunks. It uses a much higher size cap (8 MiB vs the inline 256 KiB),
+  so files whose diffs were suppressed as "large" are now viewable.
+  Search, horizontal scroll, line numbers, and `b` (blame) all work
+  inside it; `q`/`Esc` returns to the multi-file diff exactly where
+  you left it. Works for commit diffs and the working tree (where it
+  shows the file against HEAD).
+
+- File picker: `t` in the diff pane turns the diffstat into a
+  navigable file list — `j`/`k` select a file, `Enter` jumps to its
+  diff section, `o` opens its single-file view, `q`/`Esc` cancels.
+  Files whose diffs were suppressed by the file/line guardrails open
+  the single-file view directly on `Enter`, so every file in a huge
+  commit is now reachable. The status bar shows a `PICK` mode chip
+  while the picker is active.
+
+- The diff guardrail notices now say how to see the suppressed
+  content (`t` to list files, `o` to open one) instead of being dead
+  ends.
+
 - Pathspec-scoped diffs: when `rit` is launched with a path/pathspec
   (`rit src/ui`), the diff pane now shows only the hunks for files
   matching that pathspec, with a faint note counting the hidden files.

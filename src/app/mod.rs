@@ -14,8 +14,8 @@ pub mod search;
 pub mod state;
 
 pub use state::{
-    AuthorMode, BlameState, CommitSearchState, DateMode, DiffSearchState, DiffState, DisplayOptions, Focus, LogRow,
-    LogState, RefsState, SearchSnapshot, StatusState, WorkingTreeRow, YankFeedback,
+    AuthorMode, BlameState, CommitSearchState, DateMode, DiffSearchState, DiffState, DisplayOptions, FileViewReturn,
+    Focus, LogRow, LogState, RefsState, SearchSnapshot, StatusState, WorkingTreeRow, YankFeedback,
 };
 
 use crate::{
@@ -94,6 +94,8 @@ impl App {
                 search: DiffSearchState::new(),
                 header_lower: None,
                 body_lower: None,
+                file_view_return: None,
+                file_picker: None,
             },
             status: StatusState { open: false, document: None, scroll: 0, loading: false },
             refs: RefsState::new(),
@@ -273,10 +275,39 @@ impl App {
                     self.diff.document = Some(document);
                     self.diff.scroll = 0;
                     self.diff.horizontal_scroll = 0;
+                    // A fresh multi-file document invalidates the picker
+                    // cursor (the request path already dropped any stale
+                    // single-file return slot).
+                    self.diff.file_picker = None;
                     // New content invalidates the lowercased mirrors.
                     self.diff.header_lower = None;
                     self.diff.body_lower = None;
                     // Re-run diff search against new content.
+                    self.update_diff_matches();
+                }
+            }
+            InspectMsg::FileDiffLoaded { seq, document } => {
+                // Same seq/target discipline as DiffLoaded; additionally
+                // require the pane to still be open — a reply landing
+                // after q closed the pane must not resurrect state.
+                if seq == self.diff_seq && self.diff.open && self.diff.target == Some(document.target) {
+                    // Stash the multi-file document (and viewport) the
+                    // takeover replaces, so q/Esc can restore it without
+                    // a refetch.
+                    if let Some(current) = self.diff.document.take() {
+                        self.diff.file_view_return = Some(Box::new(FileViewReturn {
+                            document: current,
+                            scroll: self.diff.scroll,
+                            horizontal_scroll: self.diff.horizontal_scroll,
+                        }));
+                    }
+                    self.diff.loading = false;
+                    self.diff.document = Some(document);
+                    self.diff.scroll = 0;
+                    self.diff.horizontal_scroll = 0;
+                    self.diff.file_picker = None;
+                    self.diff.header_lower = None;
+                    self.diff.body_lower = None;
                     self.update_diff_matches();
                 }
             }
@@ -411,6 +442,8 @@ impl App {
         self.diff.body_lower = None;
         self.diff.target = None;
         self.diff.loading = false;
+        self.diff.file_view_return = None;
+        self.diff.file_picker = None;
         self.status.document = None;
         self.status.loading = false;
         self.search.clear();
@@ -500,6 +533,10 @@ impl App {
             self.diff.document = None;
             self.diff.header_lower = None;
             self.diff.body_lower = None;
+            // A new target invalidates the single-file takeover and any
+            // picker cursor along with the document they belonged to.
+            self.diff.file_view_return = None;
+            self.diff.file_picker = None;
             self.diff.loading = true;
             self.diff_seq = self.diff_seq.wrapping_add(1);
             self.send_inspect(InspectReq::LoadDiff { target, seq: self.diff_seq, scoped: self.diff.scoped });
@@ -518,6 +555,10 @@ impl App {
         }
         self.diff.scoped = !self.diff.scoped;
         let Some(target) = self.diff.target else { return };
+        // The incoming re-scoped document replaces whatever is showing —
+        // a stashed multi-file view would restore stale content.
+        self.diff.file_view_return = None;
+        self.diff.file_picker = None;
         self.diff.loading = true;
         self.diff_seq = self.diff_seq.wrapping_add(1);
         self.send_inspect(InspectReq::LoadDiff { target, seq: self.diff_seq, scoped: self.diff.scoped });
@@ -815,17 +856,8 @@ impl App {
     /// above) the top of the viewport. Commit diffs blame at that
     /// commit; the working-tree diff blames at HEAD.
     pub(crate) fn blame_from_diff_pane(&mut self) {
+        let Some(path) = self.diff_file_at_viewport() else { return };
         let Some(doc) = self.diff.document.as_ref() else { return };
-        if doc.sections.is_empty() {
-            return;
-        }
-        let offset = doc.header.len() + self.diff.diffstat_line_count();
-        let body_pos = self.diff.scroll.saturating_sub(offset);
-        // Last section starting at-or-before the viewport top; before
-        // the first section (header/diffstat) falls back to the first.
-        let section = doc.sections.iter().rev().find(|s| s.body_start <= body_pos).or_else(|| doc.sections.first());
-        let Some(section) = section else { return };
-        let path = section.path.clone();
         let at = match doc.target {
             DiffTarget::Commit(id) => BlameAt::Commit(id),
             DiffTarget::WorkingTree => BlameAt::Head,
@@ -917,6 +949,141 @@ impl App {
             self.diff.scroll = 0;
         }
     }
+
+    /// Path of the file whose section is at (or above) the top of the
+    /// diff viewport; before the first section (header/diffstat) falls
+    /// back to the first file. Shared by `b` (blame) and `o` (isolate).
+    fn diff_file_at_viewport(&self) -> Option<String> {
+        let doc = self.diff.document.as_ref()?;
+        let offset = doc.header.len() + self.diff.diffstat_line_count();
+        let body_pos = self.diff.scroll.saturating_sub(offset);
+        doc.sections
+            .iter()
+            .rev()
+            .find(|s| s.body_start <= body_pos)
+            .or_else(|| doc.sections.first())
+            .map(|s| s.path.clone())
+    }
+
+    /// `o` in the diff pane: isolate the file under the viewport into
+    /// the single-file takeover view.
+    pub(crate) fn open_file_view_at_viewport(&mut self) {
+        let Some(path) = self.diff_file_at_viewport() else { return };
+        self.open_file_view(path);
+    }
+
+    /// Request the full-context single-file document for `path` at the
+    /// pane's current target. No-op while a takeover view is already
+    /// showing — the view is a one-deep stack, not a browser history.
+    pub(crate) fn open_file_view(&mut self, path: String) {
+        if self.diff.file_view_return.is_some() {
+            return;
+        }
+        let Some(target) = self.diff.target else { return };
+        self.diff_seq = self.diff_seq.wrapping_add(1);
+        self.send_inspect(InspectReq::LoadFileDiff { target, path, seq: self.diff_seq });
+    }
+
+    /// q/Esc while the single-file view is showing: restore the stashed
+    /// multi-file document and viewport. Returns false when no takeover
+    /// view is active (the caller then closes the pane as usual).
+    pub(crate) fn close_file_view(&mut self) -> bool {
+        let Some(ret) = self.diff.file_view_return.take() else {
+            return false;
+        };
+        self.diff.document = Some(ret.document);
+        self.diff.scroll = ret.scroll;
+        self.diff.horizontal_scroll = ret.horizontal_scroll;
+        self.diff.header_lower = None;
+        self.diff.body_lower = None;
+        self.update_diff_matches();
+        // If the user isolated a working-tree file before the deferred
+        // untracked scan reported back, that update was seq-gated away
+        // while the takeover was up — the restored document would show
+        // the "(scanning…)" placeholder forever. Re-request it fresh;
+        // the restored document stays on screen until the reply lands.
+        if self.diff.document.as_ref().is_some_and(|d| d.untracked_anchor.is_some())
+            && let Some(target) = self.diff.target
+        {
+            self.diff.loading = true;
+            self.diff_seq = self.diff_seq.wrapping_add(1);
+            self.send_inspect(InspectReq::LoadDiff { target, seq: self.diff_seq, scoped: self.diff.scoped });
+        }
+        true
+    }
+
+    /// `t` in the diff pane: enter file-picker mode over the diffstat,
+    /// starting at the file currently under the viewport.
+    pub(crate) fn open_file_picker(&mut self) {
+        let start = self.diff_file_at_viewport();
+        let Some(doc) = self.diff.document.as_ref() else { return };
+        if doc.files.is_empty() {
+            return;
+        }
+        let idx = start.and_then(|p| doc.files.iter().position(|f| f.path == p)).unwrap_or(0);
+        self.diff.file_picker = Some(idx);
+        self.ensure_picker_visible();
+    }
+
+    /// Move the picker cursor by `delta`, clamped to the file list.
+    pub(crate) fn picker_move(&mut self, delta: isize) {
+        let Some(idx) = self.diff.file_picker else { return };
+        let total = self.diff.document.as_ref().map(|d| d.files.len()).unwrap_or(0);
+        if total == 0 {
+            return;
+        }
+        let sel = (idx as isize).saturating_add(delta).clamp(0, (total - 1) as isize);
+        self.diff.file_picker = Some(usize::try_from(sel).unwrap_or(0));
+        self.ensure_picker_visible();
+    }
+
+    /// Keep the picker's diffstat row inside the viewport. Row math
+    /// mirrors `append_diffstat`: header lines, then the `---`
+    /// separator, then one row per file.
+    fn ensure_picker_visible(&mut self) {
+        let Some(idx) = self.diff.file_picker else { return };
+        let Some(doc) = self.diff.document.as_ref() else { return };
+        let line = doc.header.len() + 1 + idx;
+        let h = self.diff.view_height.max(1);
+        if line < self.diff.scroll {
+            self.diff.scroll = line;
+        } else if line >= self.diff.scroll + h {
+            self.diff.scroll = line + 1 - h;
+        }
+    }
+
+    /// Enter on a picker row: jump to that file's diff section. Files
+    /// with no body section (suppressed past the file/line caps) and
+    /// summary mode (`v`, body hidden) fall through to the single-file
+    /// view — the only way to see those diffs.
+    pub(crate) fn picker_activate(&mut self) {
+        let Some(idx) = self.diff.file_picker.take() else { return };
+        let Some(doc) = self.diff.document.as_ref() else { return };
+        let Some(stat) = doc.files.get(idx) else { return };
+        let path = stat.path.clone();
+        let jump_pos = if self.diff.show_hunks {
+            let offset = doc.header.len() + self.diff.diffstat_line_count();
+            doc.sections.iter().find(|s| s.path == path).map(|s| offset + s.body_start)
+        } else {
+            None
+        };
+        match jump_pos {
+            Some(pos) => {
+                let max = self.diff.total_visible_lines().saturating_sub(self.diff.view_height);
+                self.diff.scroll = pos.min(max);
+            }
+            None => self.open_file_view(path),
+        }
+    }
+
+    /// `o` on a picker row: open that file's single-file view directly.
+    pub(crate) fn picker_open_file(&mut self) {
+        let Some(idx) = self.diff.file_picker.take() else { return };
+        let Some(path) = self.diff.document.as_ref().and_then(|d| d.files.get(idx)).map(|f| f.path.clone()) else {
+            return;
+        };
+        self.open_file_view(path);
+    }
 }
 
 #[cfg(test)]
@@ -924,7 +1091,10 @@ mod tests {
     use super::*;
     use crate::{
         git::GitReq,
-        model::{CommitRecord, CommitSearchText, DiffDocument, DiffFlags, DiffStats, DiffTarget, RefKind, RefLabel},
+        model::{
+            CommitRecord, CommitSearchText, DiffDocument, DiffFlags, DiffStats, DiffTarget, FileSection, FileStat,
+            RefKind, RefLabel,
+        },
     };
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
     use std::{collections::HashMap, sync::Arc};
@@ -988,6 +1158,43 @@ mod tests {
 
     fn key(code: KeyCode, mods: KeyModifiers) -> KeyEvent {
         KeyEvent::new(code, mods)
+    }
+
+    /// A commit diff with three files in the diffstat, two of which
+    /// have body sections ("capped.rs" was suppressed past the caps).
+    /// Header is 1 line, diffstat renders as 6 (separator + 3 rows +
+    /// totals + blank), so body offset = 7.
+    fn commit_doc_with_sections() -> DiffDocument {
+        DiffDocument {
+            target: DiffTarget::Commit(oid(7)),
+            header: vec![DiffLine::new(DiffLineKind::CommitHeader, "commit 7")],
+            body: (0..40).map(|i| DiffLine::new(DiffLineKind::Context, format!("line {i}"))).collect(),
+            files: vec![
+                FileStat { path: "a.rs".into(), additions: 1, deletions: 0 },
+                FileStat { path: "b.rs".into(), additions: 2, deletions: 1 },
+                FileStat { path: "capped.rs".into(), additions: 0, deletions: 0 },
+            ],
+            stats: DiffStats { files: 3, insertions: 3, deletions: 1 },
+            flags: DiffFlags::default(),
+            untracked_anchor: None,
+            sections: vec![
+                FileSection { path: "a.rs".into(), body_start: 0 },
+                FileSection { path: "b.rs".into(), body_start: 15 },
+            ],
+        }
+    }
+
+    fn single_file_doc(path: &str) -> DiffDocument {
+        DiffDocument {
+            target: DiffTarget::Commit(oid(7)),
+            header: Vec::new(),
+            body: vec![DiffLine::new(DiffLineKind::Context, "full file")],
+            files: vec![FileStat { path: path.into(), additions: 2, deletions: 1 }],
+            stats: DiffStats { files: 1, insertions: 2, deletions: 1 },
+            flags: DiffFlags::default(),
+            untracked_anchor: None,
+            sections: vec![FileSection { path: path.into(), body_start: 0 }],
+        }
     }
 
     // --- generation gating ---
@@ -1267,6 +1474,123 @@ mod tests {
         app.diff_jump_file(1);
         let max = app.diff.total_visible_lines() - app.diff.view_height;
         assert_eq!(app.diff.scroll, 31.min(max));
+    }
+
+    #[test]
+    fn o_isolates_the_viewport_file_and_q_restores_the_multi_file_view() {
+        let (mut app, ends) = test_app();
+        app.diff.open = true;
+        app.focus = Focus::Diff;
+        app.diff.target = Some(DiffTarget::Commit(oid(7)));
+        app.diff.view_height = 5;
+        app.diff.document = Some(commit_doc_with_sections());
+        // Body offset is 7 (see the doc helper); scroll 23 puts b.rs
+        // (body_start 15 → virtual 22) at the viewport top.
+        app.diff.scroll = 23;
+
+        app.handle_input(key(KeyCode::Char('o'), KeyModifiers::NONE));
+        let seq = app.diff_seq;
+        match ends.req_rx.try_recv().expect("LoadFileDiff sent") {
+            GitReq::Inspect(InspectReq::LoadFileDiff { target, path, seq: s }) => {
+                assert_eq!(target, DiffTarget::Commit(oid(7)));
+                assert_eq!(path, "b.rs", "o targets the file under the viewport, same rule as b");
+                assert_eq!(s, seq);
+            }
+            _ => panic!("expected LoadFileDiff"),
+        }
+
+        app.apply_inspect_msg(InspectMsg::FileDiffLoaded { seq, document: single_file_doc("b.rs") });
+        assert!(app.diff.file_view_return.is_some(), "multi-file view stashed for q");
+        assert_eq!(app.diff.scroll, 0);
+        assert_eq!(app.diff.document.as_ref().map(|d| d.files.len()), Some(1));
+
+        // First q pops back to the multi-file view at the old viewport.
+        app.handle_input(key(KeyCode::Char('q'), KeyModifiers::NONE));
+        assert!(app.diff.open, "first q only closes the file view");
+        assert!(app.diff.file_view_return.is_none());
+        assert_eq!(app.diff.document.as_ref().map(|d| d.files.len()), Some(3));
+        assert_eq!(app.diff.scroll, 23, "viewport restored");
+
+        // Second q closes the pane as before.
+        app.handle_input(key(KeyCode::Char('q'), KeyModifiers::NONE));
+        assert!(!app.diff.open);
+    }
+
+    #[test]
+    fn file_diff_loaded_with_stale_seq_is_dropped() {
+        let (mut app, _ends) = test_app();
+        app.diff.open = true;
+        app.diff.target = Some(DiffTarget::Commit(oid(7)));
+        app.diff_seq = 5;
+        app.diff.document = Some(commit_doc_with_sections());
+
+        app.apply_inspect_msg(InspectMsg::FileDiffLoaded { seq: 4, document: single_file_doc("b.rs") });
+
+        assert!(app.diff.file_view_return.is_none());
+        assert_eq!(app.diff.document.as_ref().map(|d| d.files.len()), Some(3), "stale reply dropped");
+    }
+
+    #[test]
+    fn picker_enter_jumps_to_the_selected_files_section() {
+        let (mut app, _ends) = test_app();
+        app.diff.open = true;
+        app.focus = Focus::Diff;
+        app.diff.target = Some(DiffTarget::Commit(oid(7)));
+        app.diff.view_height = 10;
+        app.diff.document = Some(commit_doc_with_sections());
+
+        app.handle_input(key(KeyCode::Char('t'), KeyModifiers::NONE));
+        assert_eq!(app.diff.file_picker, Some(0), "picker starts at the viewport file");
+
+        app.handle_input(key(KeyCode::Char('j'), KeyModifiers::NONE));
+        assert_eq!(app.diff.file_picker, Some(1));
+
+        app.handle_input(key(KeyCode::Enter, KeyModifiers::NONE));
+        assert!(app.diff.file_picker.is_none(), "Enter exits picker mode");
+        assert_eq!(app.diff.scroll, 22, "jumped to b.rs: offset 7 + body_start 15");
+    }
+
+    #[test]
+    fn picker_falls_through_to_file_view_when_no_section_exists() {
+        let (mut app, ends) = test_app();
+        app.diff.open = true;
+        app.focus = Focus::Diff;
+        app.diff.target = Some(DiffTarget::Commit(oid(7)));
+        app.diff.view_height = 10;
+        app.diff.document = Some(commit_doc_with_sections());
+
+        app.handle_input(key(KeyCode::Char('t'), KeyModifiers::NONE));
+        app.handle_input(key(KeyCode::Char('G'), KeyModifiers::SHIFT));
+        assert_eq!(app.diff.file_picker, Some(2), "G lands on the last file");
+
+        // capped.rs has no body section — Enter opens the single-file
+        // view instead of jumping nowhere.
+        app.handle_input(key(KeyCode::Enter, KeyModifiers::NONE));
+        assert!(app.diff.file_picker.is_none());
+        assert!(matches!(
+            ends.req_rx.try_recv(),
+            Ok(GitReq::Inspect(InspectReq::LoadFileDiff { path, .. })) if path == "capped.rs"
+        ));
+    }
+
+    #[test]
+    fn picker_o_requests_the_selected_file_view() {
+        let (mut app, ends) = test_app();
+        app.diff.open = true;
+        app.focus = Focus::Diff;
+        app.diff.target = Some(DiffTarget::Commit(oid(7)));
+        app.diff.view_height = 10;
+        app.diff.document = Some(commit_doc_with_sections());
+
+        app.handle_input(key(KeyCode::Char('t'), KeyModifiers::NONE));
+        app.handle_input(key(KeyCode::Char('j'), KeyModifiers::NONE));
+        app.handle_input(key(KeyCode::Char('o'), KeyModifiers::NONE));
+
+        assert!(app.diff.file_picker.is_none());
+        assert!(matches!(
+            ends.req_rx.try_recv(),
+            Ok(GitReq::Inspect(InspectReq::LoadFileDiff { path, .. })) if path == "b.rs"
+        ));
     }
 
     #[test]

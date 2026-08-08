@@ -28,6 +28,15 @@ pub enum InspectReq {
         /// pathspec was given.
         scoped: bool,
     },
+    /// The single-file takeover view (`o` in the diff pane): render
+    /// `path`'s diff at `target` with full file context and the raised
+    /// `MAX_FILE_VIEW_DIFF_BYTES` cap. `seq` shares the app's diff
+    /// counter, so a newer `LoadDiff`/`LoadFileDiff` supersedes it.
+    LoadFileDiff {
+        target: DiffTarget,
+        path: String,
+        seq: u64,
+    },
     LoadStatus,
     /// Build the refs-view listing: every branch and tag peeled to its
     /// commit, with summary + relative date. Requested each time the
@@ -67,6 +76,13 @@ pub enum BlameAt {
 pub enum InspectMsg {
     /// `seq` echoes the `LoadDiff` request this document answers.
     DiffLoaded {
+        seq: u64,
+        document: DiffDocument,
+    },
+    /// Reply to `LoadFileDiff`. Kept distinct from `DiffLoaded` so the
+    /// app can stash the multi-file document it is replacing (for
+    /// q/Esc restore) — a plain `DiffLoaded` overwrites it.
+    FileDiffLoaded {
         seq: u64,
         document: DiffDocument,
     },

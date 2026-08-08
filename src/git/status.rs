@@ -16,8 +16,8 @@
 
 use crate::{
     git::diff::{
-        DiffSink, FileDiffOutput, file_addition_output, file_deletion_output, file_modification_output,
-        merge_file_output_into_sink,
+        DiffSink, FileDiffOutput, empty_error_document, file_addition_output, file_deletion_output,
+        file_full_context_output, file_modification_output, merge_file_output_into_sink, single_file_document,
     },
     model::{
         DiffDocument, DiffFlags, DiffLine, DiffLineKind, DiffStats, DiffTarget, FileSection, FileStat, StatusDocument,
@@ -479,6 +479,45 @@ pub fn compute_working_tree_diff(repo: &gix::Repository, target: DiffTarget) -> 
     DiffDocument { target, header: Vec::new(), body, files, stats, flags, untracked_anchor, sections }
 }
 
+/// Full-context single-file diff for the working tree: HEAD's blob
+/// (empty when the file is new) against the on-disk bytes (empty when
+/// deleted). The isolate view deliberately collapses the staged /
+/// unstaged split — it answers "how does this file differ from HEAD",
+/// with the whole file as context.
+pub fn compute_worktree_file_diff(repo: &gix::Repository, path: &str) -> DiffDocument {
+    compute_worktree_file_diff_inner(repo, path).unwrap_or_else(|e| empty_error_document(DiffTarget::WorkingTree, e))
+}
+
+fn compute_worktree_file_diff_inner(repo: &gix::Repository, path: &str) -> Result<DiffDocument> {
+    let old = head_blob_bytes(repo, path)?.unwrap_or_default();
+    let workdir = repo.workdir().ok_or_else(|| anyhow::anyhow!("repository has no worktree"))?;
+    let new = std::fs::read(workdir.join(path)).unwrap_or_default();
+    if old.is_empty() && new.is_empty() {
+        anyhow::bail!("{path}: not in HEAD and not on disk");
+    }
+    let mode_meta = if old.is_empty() {
+        Some("new file")
+    } else if new.is_empty() {
+        Some("deleted file")
+    } else {
+        None
+    };
+    let output = file_full_context_output(path, &old, &new, mode_meta);
+    Ok(single_file_document(DiffTarget::WorkingTree, output))
+}
+
+/// Bytes of `path`'s blob at HEAD, `None` when the path doesn't exist
+/// there (new file) or HEAD is unborn.
+fn head_blob_bytes(repo: &gix::Repository, path: &str) -> Result<Option<Vec<u8>>> {
+    let Ok(head) = repo.head_commit() else {
+        return Ok(None);
+    };
+    match head.tree()?.lookup_entry_by_path(path)? {
+        Some(entry) if entry.mode().is_blob() => Ok(Some(entry.object()?.data.clone())),
+        _ => Ok(None),
+    }
+}
+
 /// Walk just the untracked-files dimension of `gix::status`, returning
 /// the entries the dir walk surfaces. Used by the worker's side thread
 /// to fill in a `DiffDocument`'s placeholder anchor without blocking
@@ -515,11 +554,52 @@ pub fn collect_untracked_paths(repo: &gix::Repository) -> Vec<String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{UNTRACKED_PENDING_PLACEHOLDER, collect_untracked_paths, compute_status, compute_working_tree_diff};
+    use super::{
+        UNTRACKED_PENDING_PLACEHOLDER, collect_untracked_paths, compute_status, compute_working_tree_diff,
+        compute_worktree_file_diff,
+    };
     use crate::{
         model::{DiffLineKind, DiffTarget},
         test_support::{commit_all, make_fixture_repo, run_git, write_file},
     };
+
+    #[test]
+    fn worktree_file_diff_shows_full_context_against_head() {
+        let (td, repo) = make_fixture_repo();
+        let path = td.path();
+        let base: String = (0..10).map(|i| format!("row{i}\n")).collect();
+        write_file(path, "a.txt", &base);
+        commit_all(path, "base");
+        let mut changed: Vec<String> = (0..10).map(|i| format!("row{i}\n")).collect();
+        changed[5] = "EDITED\n".to_string();
+        write_file(path, "a.txt", &changed.concat());
+
+        let doc = compute_worktree_file_diff(&repo, "a.txt");
+        assert_eq!(doc.stats.files, 1);
+        assert!(doc.body.iter().any(|l| matches!(l.kind, DiffLineKind::Add) && l.text == "EDITED"));
+        assert!(
+            doc.body.iter().any(|l| matches!(l.kind, DiffLineKind::Context) && l.text == "row0"),
+            "context spans the whole file"
+        );
+        assert!(doc.body.iter().any(|l| matches!(l.kind, DiffLineKind::Context) && l.text == "row9"));
+    }
+
+    #[test]
+    fn worktree_file_diff_handles_untracked_and_missing_paths() {
+        let (td, repo) = make_fixture_repo();
+        let path = td.path();
+        write_file(path, "tracked.txt", "x\n");
+        commit_all(path, "base");
+
+        // Untracked file: rendered as a pure addition against HEAD.
+        std::fs::write(path.join("new.txt"), "fresh\n").expect("write");
+        let doc = compute_worktree_file_diff(&repo, "new.txt");
+        assert!(doc.body.iter().any(|l| matches!(l.kind, DiffLineKind::Add) && l.text == "fresh"));
+
+        // Neither in HEAD nor on disk: error document.
+        let doc = compute_worktree_file_diff(&repo, "missing.txt");
+        assert!(doc.header.iter().any(|l| l.text.starts_with("Error:")));
+    }
 
     #[test]
     fn working_tree_diff_renders_staged_and_unstaged_sections() {
