@@ -15,10 +15,12 @@ Versioning](https://semver.org/spec/v2.0.0.html).
   change is visible in its surrounding context instead of ±3-line
   hunks. It uses a much higher size cap (8 MiB vs the inline 256 KiB),
   so files whose diffs were suppressed as "large" are now viewable.
-  Search, horizontal scroll, line numbers, and `b` (blame) all work
-  inside it; `q`/`Esc` returns to the multi-file diff exactly where
-  you left it. Works for commit diffs and the working tree (where it
-  shows the file against HEAD).
+  The view opens scrolled to the first changed line (with a few lines
+  of leading context) instead of the top of the file. Search,
+  horizontal scroll, line numbers, and `b` (blame) all work inside
+  it; `q`/`Esc` returns to the multi-file diff exactly where you left
+  it. Works for commit diffs and the working tree (where it shows the
+  file against HEAD).
 
 - File picker: `t` in the diff pane turns the diffstat into a
   navigable file list — `j`/`k` select a file (wrapping past either

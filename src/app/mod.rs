@@ -304,7 +304,7 @@ impl App {
                     }
                     self.diff.loading = false;
                     self.diff.document = Some(document);
-                    self.diff.scroll = 0;
+                    self.diff.scroll = self.file_view_first_change_scroll();
                     self.diff.horizontal_scroll = 0;
                     self.diff.close_picker();
                     self.diff.header_lower = None;
@@ -985,6 +985,26 @@ impl App {
         self.send_inspect(InspectReq::LoadFileDiff { target, path, seq: self.diff_seq });
     }
 
+    /// Initial viewport for a freshly-loaded single-file view: the
+    /// first +/- line, kept a few rows down so its leading context is
+    /// visible — `o` should land on the change, not the top of the
+    /// file. Falls back to the top when the body has no changed lines
+    /// (skip summaries) or isn't rendered (summary mode).
+    fn file_view_first_change_scroll(&self) -> usize {
+        // Match the ±3 context the inline hunk view shows above a change.
+        const LEAD_CONTEXT: usize = 3;
+        if !self.diff.show_hunks {
+            return 0;
+        }
+        let Some(doc) = self.diff.document.as_ref() else { return 0 };
+        let Some(first) = doc.body.iter().position(|l| matches!(l.kind, DiffLineKind::Add | DiffLineKind::Del)) else {
+            return 0;
+        };
+        let offset = doc.header.len() + self.diff.diffstat_line_count();
+        let max = self.diff.total_visible_lines().saturating_sub(self.diff.view_height);
+        (offset + first).saturating_sub(LEAD_CONTEXT).min(max)
+    }
+
     /// q/Esc while the single-file view is showing: restore the stashed
     /// multi-file document and viewport. Returns false when no takeover
     /// view is active (the caller then closes the pane as usual).
@@ -1557,7 +1577,7 @@ mod tests {
 
         app.apply_inspect_msg(InspectMsg::FileDiffLoaded { seq, document: single_file_doc("b.rs") });
         assert!(app.diff.file_view_return.is_some(), "multi-file view stashed for q");
-        assert_eq!(app.diff.scroll, 0);
+        assert_eq!(app.diff.scroll, 0, "stub body has no +/- lines, so the view opens at the top");
         assert_eq!(app.diff.document.as_ref().map(|d| d.files.len()), Some(1));
 
         // First q pops back to the multi-file view at the old viewport.
@@ -1570,6 +1590,42 @@ mod tests {
         // Second q closes the pane as before.
         app.handle_input(key(KeyCode::Char('q'), KeyModifiers::NONE));
         assert!(!app.diff.open);
+    }
+
+    #[test]
+    fn file_view_opens_scrolled_to_the_first_change() {
+        let (mut app, _ends) = test_app();
+        app.diff.open = true;
+        app.diff.target = Some(DiffTarget::Commit(oid(7)));
+        app.diff.view_height = 10;
+
+        let mut doc = single_file_doc("b.rs");
+        doc.body = (0..20)
+            .map(|i| DiffLine::new(DiffLineKind::Context, format!("line {i}")))
+            .chain(std::iter::once(DiffLine::new(DiffLineKind::Add, "added")))
+            .chain((21..30).map(|i| DiffLine::new(DiffLineKind::Context, format!("line {i}"))))
+            .collect();
+        app.apply_inspect_msg(InspectMsg::FileDiffLoaded { seq: app.diff_seq, document: doc });
+
+        // Empty header + 4-line diffstat block put the Add (body index
+        // 20) at virtual line 24; minus 3 lines of lead context = 21.
+        assert_eq!(app.diff.scroll, 21);
+    }
+
+    #[test]
+    fn file_view_first_change_near_the_top_clamps_to_zero() {
+        let (mut app, _ends) = test_app();
+        app.diff.open = true;
+        app.diff.target = Some(DiffTarget::Commit(oid(7)));
+        app.diff.view_height = 10;
+
+        let mut doc = single_file_doc("b.rs");
+        doc.header = Vec::new();
+        doc.files = Vec::new(); // no diffstat block
+        doc.body = vec![DiffLine::new(DiffLineKind::Add, "added first line")];
+        app.apply_inspect_msg(InspectMsg::FileDiffLoaded { seq: app.diff_seq, document: doc });
+
+        assert_eq!(app.diff.scroll, 0, "lead context saturates at the top of the document");
     }
 
     #[test]
