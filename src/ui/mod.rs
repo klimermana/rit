@@ -189,8 +189,24 @@ fn draw_status_bar(frame: &mut Frame, app: &App, area: Rect) {
         line
     } else if let Some(y) = &app.yank_message {
         Line::from(Span::styled(format!(" ✓ {}", y.text), Style::default().fg(Color::Green)))
+    } else if app.diff.file_picker.is_some() && app.diff.picker_filter.active {
+        let snap = app.diff.picker_filter.snapshot();
+        Line::from(vec![
+            Span::raw(format!(" [{}/{}] filter /", snap.display_index, snap.matches_len)),
+            Span::styled(snap.query.to_string(), Style::default().fg(Color::Yellow)),
+            Span::raw("█  Enter:done  Esc:clear"),
+        ])
+    } else if app.diff.file_picker.is_some() && !app.diff.picker_filter.query.is_empty() {
+        let snap = app.diff.picker_filter.snapshot();
+        Line::from(vec![
+            Span::styled(
+                format!(" [{}/{}] /{}", snap.display_index, snap.matches_len, snap.query),
+                Style::default().fg(Color::Yellow),
+            ),
+            Span::raw("  j/k:next/prev-match  Enter:jump  o:open  Esc:clear-filter"),
+        ])
     } else if app.diff.file_picker.is_some() {
-        Line::from(Span::raw(" j/k:select-file  Enter:jump-to-diff  o:open-full-file  q/Esc:cancel"))
+        Line::from(Span::raw(" j/k:select-file  Enter:jump-to-diff  o:open-full-file  /:filter  q/Esc:cancel"))
     } else if app.status.open {
         Line::from(Span::raw(" q/Esc/s:close-status  j/k:scroll  g/G:top/bottom"))
     } else if app.refs.open {

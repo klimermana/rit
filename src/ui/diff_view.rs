@@ -38,8 +38,10 @@ pub fn draw_diff(frame: &mut Frame, app: &App, area: Rect, focused: bool) {
     // Diffstat is small (one row per file, plus 3 framing lines) so build it
     // eagerly; the wins come from not materialising the body.
     let diffstat: Vec<Line<'static>> = if !document.files.is_empty() {
+        let picker_matches = (app.diff.file_picker.is_some() && !app.diff.picker_filter.query.is_empty())
+            .then_some(app.diff.picker_filter.matches.as_slice());
         let mut out = Vec::with_capacity(document.files.len() + 3);
-        append_diffstat(&mut out, &document.files, &document.stats, app.diff.file_picker);
+        append_diffstat(&mut out, &document.files, &document.stats, app.diff.file_picker, picker_matches);
         out
     } else {
         Vec::new()
@@ -165,7 +167,15 @@ fn truncation_tag(flags: &crate::model::DiffFlags) -> String {
     if parts.is_empty() { "  [truncated]".to_string() } else { format!("  [truncated: {}]", parts.join(", ")) }
 }
 
-fn append_diffstat(out: &mut Vec<Line<'static>>, files: &[FileStat], stats: &DiffStats, selected: Option<usize>) {
+fn append_diffstat(
+    out: &mut Vec<Line<'static>>,
+    files: &[FileStat],
+    stats: &DiffStats,
+    selected: Option<usize>,
+    // Picker filter matches (sorted file indices); rows outside the set
+    // render faint. `None` = no filter, all rows normal.
+    filter_matches: Option<&[usize]>,
+) {
     out.push(diff_line_to_ratatui(&DiffLine { kind: DiffLineKind::Faint, text: "---".to_string() }));
 
     // Column width: longest path, capped so we leave room for the bar.
@@ -190,7 +200,14 @@ fn append_diffstat(out: &mut Vec<Line<'static>>, files: &[FileStat], stats: &Dif
             plus = "+".repeat(plus_len),
             minus = "-".repeat(minus_len),
         );
-        let mut line = diff_line_to_ratatui(&DiffLine { kind: DiffLineKind::Diffstat, text });
+        // Rows the picker filter excludes render faint; the span's own
+        // fg would win over a line-level restyle, so pick the kind here.
+        let kind = if filter_matches.is_some_and(|m| m.binary_search(&i).is_err()) {
+            DiffLineKind::Faint
+        } else {
+            DiffLineKind::Diffstat
+        };
+        let mut line = diff_line_to_ratatui(&DiffLine { kind, text });
         // File-picker cursor row (`t` mode).
         if selected == Some(i) {
             line.style = Style::default().bg(Color::DarkGray).add_modifier(Modifier::BOLD);

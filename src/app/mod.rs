@@ -15,7 +15,7 @@ pub mod state;
 
 pub use state::{
     AuthorMode, BlameState, CommitSearchState, DateMode, DiffSearchState, DiffState, DisplayOptions, FileViewReturn,
-    Focus, LogRow, LogState, RefsState, SearchSnapshot, StatusState, WorkingTreeRow, YankFeedback,
+    Focus, LogRow, LogState, RefsState, SearchSnapshot, SearchState, StatusState, WorkingTreeRow, YankFeedback,
 };
 
 use crate::{
@@ -96,6 +96,7 @@ impl App {
                 body_lower: None,
                 file_view_return: None,
                 file_picker: None,
+                picker_filter: SearchState::new(),
             },
             status: StatusState { open: false, document: None, scroll: 0, loading: false },
             refs: RefsState::new(),
@@ -278,7 +279,7 @@ impl App {
                     // A fresh multi-file document invalidates the picker
                     // cursor (the request path already dropped any stale
                     // single-file return slot).
-                    self.diff.file_picker = None;
+                    self.diff.close_picker();
                     // New content invalidates the lowercased mirrors.
                     self.diff.header_lower = None;
                     self.diff.body_lower = None;
@@ -305,7 +306,7 @@ impl App {
                     self.diff.document = Some(document);
                     self.diff.scroll = 0;
                     self.diff.horizontal_scroll = 0;
-                    self.diff.file_picker = None;
+                    self.diff.close_picker();
                     self.diff.header_lower = None;
                     self.diff.body_lower = None;
                     self.update_diff_matches();
@@ -443,7 +444,7 @@ impl App {
         self.diff.target = None;
         self.diff.loading = false;
         self.diff.file_view_return = None;
-        self.diff.file_picker = None;
+        self.diff.close_picker();
         self.status.document = None;
         self.status.loading = false;
         self.search.clear();
@@ -536,7 +537,7 @@ impl App {
             // A new target invalidates the single-file takeover and any
             // picker cursor along with the document they belonged to.
             self.diff.file_view_return = None;
-            self.diff.file_picker = None;
+            self.diff.close_picker();
             self.diff.loading = true;
             self.diff_seq = self.diff_seq.wrapping_add(1);
             self.send_inspect(InspectReq::LoadDiff { target, seq: self.diff_seq, scoped: self.diff.scoped });
@@ -558,7 +559,7 @@ impl App {
         // The incoming re-scoped document replaces whatever is showing —
         // a stashed multi-file view would restore stale content.
         self.diff.file_view_return = None;
-        self.diff.file_picker = None;
+        self.diff.close_picker();
         self.diff.loading = true;
         self.diff_seq = self.diff_seq.wrapping_add(1);
         self.send_inspect(InspectReq::LoadDiff { target, seq: self.diff_seq, scoped: self.diff.scoped });
@@ -1021,20 +1022,62 @@ impl App {
             return;
         }
         let idx = start.and_then(|p| doc.files.iter().position(|f| f.path == p)).unwrap_or(0);
+        self.diff.picker_filter.clear();
         self.diff.file_picker = Some(idx);
         self.ensure_picker_visible();
     }
 
-    /// Move the picker cursor by `delta`, clamped to the file list.
+    /// Move the picker cursor by `delta` over the navigable rows — all
+    /// files normally, only `picker_filter.matches` while a filter is
+    /// set. Single steps (j/k) wrap around the ends; larger jumps
+    /// (g/G, half-page) clamp.
     pub(crate) fn picker_move(&mut self, delta: isize) {
         let Some(idx) = self.diff.file_picker else { return };
         let total = self.diff.document.as_ref().map(|d| d.files.len()).unwrap_or(0);
         if total == 0 {
             return;
         }
-        let sel = (idx as isize).saturating_add(delta).clamp(0, (total - 1) as isize);
-        self.diff.file_picker = Some(usize::try_from(sel).unwrap_or(0));
+        let sel = if self.diff.picker_filter.query.is_empty() {
+            step_wrapping(total, idx.min(total - 1), delta)
+        } else {
+            let matches = &self.diff.picker_filter.matches;
+            if matches.is_empty() {
+                return;
+            }
+            // The cursor sits on a match whenever the filter is set
+            // (update_picker_matches snaps it); position() is defensive.
+            let pos = matches.iter().position(|&m| m >= idx).unwrap_or(matches.len() - 1);
+            let pos = step_wrapping(matches.len(), pos, delta);
+            let Some(&m) = matches.get(pos) else { return };
+            self.diff.picker_filter.current = pos;
+            m
+        };
+        self.diff.file_picker = Some(sel);
         self.ensure_picker_visible();
+    }
+
+    /// Recompute `picker_filter.matches` (case-insensitive substring on
+    /// the file path) and snap the cursor onto the first match at or
+    /// after it, wrapping to the first match overall.
+    pub(crate) fn update_picker_matches(&mut self) {
+        let query = self.diff.picker_filter.query.to_lowercase();
+        let Some(doc) = self.diff.document.as_ref() else { return };
+        self.diff.picker_filter.matches = doc
+            .files
+            .iter()
+            .enumerate()
+            .filter(|(_, f)| !query.is_empty() && f.path.to_lowercase().contains(&query))
+            .map(|(i, _)| i)
+            .collect();
+        let matches = &self.diff.picker_filter.matches;
+        if let Some(idx) = self.diff.file_picker {
+            let pos = matches.iter().position(|&m| m >= idx).unwrap_or(0);
+            if let Some(&m) = matches.get(pos) {
+                self.diff.picker_filter.current = pos;
+                self.diff.file_picker = Some(m);
+                self.ensure_picker_visible();
+            }
+        }
     }
 
     /// Keep the picker's diffstat row inside the viewport. Row math
@@ -1058,6 +1101,7 @@ impl App {
     /// view — the only way to see those diffs.
     pub(crate) fn picker_activate(&mut self) {
         let Some(idx) = self.diff.file_picker.take() else { return };
+        self.diff.picker_filter.clear();
         let Some(doc) = self.diff.document.as_ref() else { return };
         let Some(stat) = doc.files.get(idx) else { return };
         let path = stat.path.clone();
@@ -1079,10 +1123,22 @@ impl App {
     /// `o` on a picker row: open that file's single-file view directly.
     pub(crate) fn picker_open_file(&mut self) {
         let Some(idx) = self.diff.file_picker.take() else { return };
+        self.diff.picker_filter.clear();
         let Some(path) = self.diff.document.as_ref().and_then(|d| d.files.get(idx)).map(|f| f.path.clone()) else {
             return;
         };
         self.open_file_view(path);
+    }
+}
+
+/// Advance position `pos` by `delta` within a list of `len` rows:
+/// single steps wrap around the ends, larger deltas (g/G's
+/// `isize::MIN`/`MAX`, half-pages) clamp. `len` must be non-zero.
+fn step_wrapping(len: usize, pos: usize, delta: isize) -> usize {
+    match delta {
+        1 if pos + 1 >= len => 0,
+        -1 if pos == 0 => len - 1,
+        _ => usize::try_from((pos as isize).saturating_add(delta).clamp(0, (len - 1) as isize)).unwrap_or(0),
     }
 }
 
@@ -1547,6 +1603,85 @@ mod tests {
 
         app.handle_input(key(KeyCode::Enter, KeyModifiers::NONE));
         assert!(app.diff.file_picker.is_none(), "Enter exits picker mode");
+        assert_eq!(app.diff.scroll, 22, "jumped to b.rs: offset 7 + body_start 15");
+    }
+
+    #[test]
+    fn picker_jk_wraps_around_the_ends() {
+        let (mut app, _ends) = test_app();
+        app.diff.open = true;
+        app.focus = Focus::Diff;
+        app.diff.target = Some(DiffTarget::Commit(oid(7)));
+        app.diff.view_height = 10;
+        app.diff.document = Some(commit_doc_with_sections());
+
+        app.handle_input(key(KeyCode::Char('t'), KeyModifiers::NONE));
+        assert_eq!(app.diff.file_picker, Some(0));
+
+        app.handle_input(key(KeyCode::Char('k'), KeyModifiers::NONE));
+        assert_eq!(app.diff.file_picker, Some(2), "k at the top wraps to the last file");
+        app.handle_input(key(KeyCode::Char('j'), KeyModifiers::NONE));
+        assert_eq!(app.diff.file_picker, Some(0), "j at the bottom wraps back to the first");
+
+        // Large jumps still clamp instead of wrapping.
+        app.handle_input(key(KeyCode::Char('G'), KeyModifiers::SHIFT));
+        app.handle_input(key(KeyCode::Char('G'), KeyModifiers::SHIFT));
+        assert_eq!(app.diff.file_picker, Some(2), "repeated G pins to the last file");
+    }
+
+    #[test]
+    fn picker_filter_narrows_movement_to_matching_files() {
+        let (mut app, _ends) = test_app();
+        app.diff.open = true;
+        app.focus = Focus::Diff;
+        app.diff.target = Some(DiffTarget::Commit(oid(7)));
+        app.diff.view_height = 10;
+        app.diff.document = Some(commit_doc_with_sections());
+
+        app.handle_input(key(KeyCode::Char('t'), KeyModifiers::NONE));
+        app.handle_input(key(KeyCode::Char('/'), KeyModifiers::NONE));
+        assert!(app.diff.picker_filter.active, "/ enters filter input");
+
+        // "a" matches a.rs and capped.rs but not b.rs.
+        app.handle_input(key(KeyCode::Char('a'), KeyModifiers::NONE));
+        assert_eq!(app.diff.picker_filter.matches, vec![0, 2]);
+        assert_eq!(app.diff.file_picker, Some(0), "cursor snaps to the first match at-or-after it");
+
+        app.handle_input(key(KeyCode::Enter, KeyModifiers::NONE));
+        assert!(!app.diff.picker_filter.active, "Enter keeps the filter and returns to navigation");
+        assert_eq!(app.diff.file_picker, Some(0));
+
+        app.handle_input(key(KeyCode::Char('j'), KeyModifiers::NONE));
+        assert_eq!(app.diff.file_picker, Some(2), "j skips the non-matching b.rs");
+        app.handle_input(key(KeyCode::Char('j'), KeyModifiers::NONE));
+        assert_eq!(app.diff.file_picker, Some(0), "movement wraps within the matches");
+
+        // Esc peels the filter first, then the picker.
+        app.handle_input(key(KeyCode::Esc, KeyModifiers::NONE));
+        assert!(app.diff.file_picker.is_some(), "first Esc only clears the filter");
+        assert!(app.diff.picker_filter.query.is_empty());
+        app.handle_input(key(KeyCode::Esc, KeyModifiers::NONE));
+        assert!(app.diff.file_picker.is_none(), "second Esc closes the picker");
+    }
+
+    #[test]
+    fn picker_filter_enter_jumps_and_clears_the_filter() {
+        let (mut app, _ends) = test_app();
+        app.diff.open = true;
+        app.focus = Focus::Diff;
+        app.diff.target = Some(DiffTarget::Commit(oid(7)));
+        app.diff.view_height = 10;
+        app.diff.document = Some(commit_doc_with_sections());
+
+        app.handle_input(key(KeyCode::Char('t'), KeyModifiers::NONE));
+        app.handle_input(key(KeyCode::Char('/'), KeyModifiers::NONE));
+        app.handle_input(key(KeyCode::Char('b'), KeyModifiers::NONE));
+        assert_eq!(app.diff.file_picker, Some(1), "typing jumps the cursor onto b.rs");
+
+        app.handle_input(key(KeyCode::Enter, KeyModifiers::NONE));
+        app.handle_input(key(KeyCode::Enter, KeyModifiers::NONE));
+        assert!(app.diff.file_picker.is_none());
+        assert!(app.diff.picker_filter.query.is_empty(), "activation drops the filter with the picker");
         assert_eq!(app.diff.scroll, 22, "jumped to b.rs: offset 7 + body_start 15");
     }
 

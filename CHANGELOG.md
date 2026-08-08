@@ -21,12 +21,15 @@ Versioning](https://semver.org/spec/v2.0.0.html).
   shows the file against HEAD).
 
 - File picker: `t` in the diff pane turns the diffstat into a
-  navigable file list — `j`/`k` select a file, `Enter` jumps to its
-  diff section, `o` opens its single-file view, `q`/`Esc` cancels.
-  Files whose diffs were suppressed by the file/line guardrails open
-  the single-file view directly on `Enter`, so every file in a huge
-  commit is now reachable. The status bar shows a `PICK` mode chip
-  while the picker is active.
+  navigable file list — `j`/`k` select a file (wrapping past either
+  end), `/` filters by filename (non-matching rows dim and `j`/`k`
+  move only between matches; `Esc` clears the filter before closing
+  the picker), `Enter` jumps to its diff section, `o` opens its
+  single-file view, `q`/`Esc` cancels. Files whose diffs were
+  suppressed by the file/line guardrails open the single-file view
+  directly on `Enter`, so every file in a huge commit is now
+  reachable. The status bar shows a `PICK` mode chip while the picker
+  is active.
 
 - The diff guardrail notices now say how to see the suppressed
   content (`t` to list files, `o` to open one) instead of being dead

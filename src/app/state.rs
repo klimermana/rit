@@ -179,6 +179,10 @@ pub struct DiffState {
     /// `Some` = picker mode is active (j/k move, Enter jumps, o opens
     /// the single-file view).
     pub file_picker: Option<usize>,
+    /// `/` inside the picker: filename filter. `active` = the query is
+    /// being typed; a non-empty `query` restricts picker movement to
+    /// `matches` (indices into `document.files`) and dims the rest.
+    pub picker_filter: SearchState,
 }
 
 /// What the single-file view replaced — restored on q/Esc so the
@@ -190,6 +194,13 @@ pub struct FileViewReturn {
 }
 
 impl DiffState {
+    /// Drop the picker cursor and its filename filter together — the
+    /// filter never outlives the picker it narrows.
+    pub fn close_picker(&mut self) {
+        self.file_picker = None;
+        self.picker_filter.clear();
+    }
+
     /// Total number of rendered lines: header + synthesised diffstat block +
     /// (when `show_hunks`) body.
     pub fn total_visible_lines(&self) -> usize {

@@ -112,8 +112,37 @@ impl App {
     fn handle_file_picker_key(&mut self, key: KeyEvent) {
         use KeyCode::*;
         use KeyModifiers as Mod;
+        // Filter input mode (`/` inside the picker): keystrokes edit the
+        // query; Enter keeps it and returns to navigation, Esc drops it.
+        if self.diff.picker_filter.active {
+            match (key.code, key.modifiers) {
+                (Esc, _) => {
+                    self.diff.picker_filter.clear();
+                }
+                (Enter, _) => self.diff.picker_filter.active = false,
+                (Backspace, _) => {
+                    self.diff.picker_filter.query.pop();
+                    self.update_picker_matches();
+                }
+                (Char(c), Mod::NONE) | (Char(c), Mod::SHIFT) => {
+                    self.diff.picker_filter.query.push(c);
+                    self.update_picker_matches();
+                }
+                _ => {}
+            }
+            return;
+        }
         match (key.code, key.modifiers) {
-            (Char('q') | Esc | Char('t'), Mod::NONE) => self.diff.file_picker = None,
+            (Char('q') | Char('t'), Mod::NONE) => self.diff.close_picker(),
+            // Esc peels one layer at a time: filter first, then picker.
+            (Esc, Mod::NONE) => {
+                if self.diff.picker_filter.query.is_empty() {
+                    self.diff.close_picker();
+                } else {
+                    self.diff.picker_filter.clear();
+                }
+            }
+            (Char('/'), Mod::NONE) => self.diff.picker_filter.active = true,
             (Enter, Mod::NONE) => self.picker_activate(),
             (Char('o'), Mod::NONE) => self.picker_open_file(),
             (Char('j') | Down, Mod::NONE) => self.picker_move(1),
