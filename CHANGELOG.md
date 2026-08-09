@@ -7,6 +7,13 @@ Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Changed
+
+- Upgraded all dependencies to latest, notably gix 0.83 → 0.86.
+  Interleaved A/B benchmarks show a ~7–16% slowdown in the commit
+  history walk (indexing) from the gix bump; diff generation, search,
+  and scrolling are unaffected.
+
 ### Added
 
 - Single-file diff view: `o` in the diff pane takes over the pane with
