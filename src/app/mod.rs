@@ -10,12 +10,14 @@
 
 pub mod clipboard;
 pub mod input;
+pub mod mouse;
 pub mod search;
 pub mod state;
 
 pub use state::{
-    AuthorMode, BlameState, CommitSearchState, DateMode, DiffSearchState, DiffState, DisplayOptions, FileViewReturn,
-    Focus, LogRow, LogState, RefsState, SearchSnapshot, SearchState, StatusState, WorkingTreeRow, YankFeedback,
+    AuthorMode, BlameState, CommitSearchState, DateMode, DiffSearchState, DiffSelection, DiffState, DisplayOptions,
+    FileViewReturn, Focus, LogRow, LogState, PaneRects, RefsState, SearchSnapshot, SearchState, StatusState,
+    WorkingTreeRow, YankFeedback,
 };
 
 use crate::{
@@ -43,6 +45,9 @@ pub struct App {
     pub refs: RefsState,
     pub blame: BlameState,
     pub focus: Focus,
+    /// Pane geometry recorded by the renderer each frame — the mouse
+    /// handler routes wheel/click/drag events by hit-testing these.
+    pub panes: PaneRects,
     /// Render-time display toggles (`D` date, `A` author, `X` hash).
     pub display: DisplayOptions,
     pub show_help: bool,
@@ -97,11 +102,13 @@ impl App {
                 file_view_return: None,
                 file_picker: None,
                 picker_filter: SearchState::new(),
+                selection: None,
             },
             status: StatusState { open: false, document: None, scroll: 0, loading: false },
             refs: RefsState::new(),
             blame: BlameState::new(),
             focus: Focus::Log,
+            panes: PaneRects::default(),
             display: DisplayOptions::default(),
             show_help: false,
             yank_message: None,
@@ -155,7 +162,8 @@ impl App {
             select! {
                 recv(input_rx) -> evt => match evt {
                     Ok(Event::Key(key)) => self.handle_input(key),
-                    // Resize / Mouse / etc. just wake the loop so we redraw.
+                    Ok(Event::Mouse(m)) => self.handle_mouse(m),
+                    // Resize / focus / etc. just wake the loop so we redraw.
                     Ok(_) => {}
                     Err(_) => self.should_quit = true,
                 },
@@ -280,9 +288,11 @@ impl App {
                     // cursor (the request path already dropped any stale
                     // single-file return slot).
                     self.diff.close_picker();
-                    // New content invalidates the lowercased mirrors.
+                    // New content invalidates the lowercased mirrors and
+                    // any mouse selection.
                     self.diff.header_lower = None;
                     self.diff.body_lower = None;
+                    self.diff.selection = None;
                     // Re-run diff search against new content.
                     self.update_diff_matches();
                 }
@@ -309,6 +319,7 @@ impl App {
                     self.diff.close_picker();
                     self.diff.header_lower = None;
                     self.diff.body_lower = None;
+                    self.diff.selection = None;
                     self.update_diff_matches();
                 }
             }
@@ -413,12 +424,13 @@ impl App {
             }
         }
 
-        // Body indices shifted, so the lowercased mirrors and any
-        // active diff-search match set are stale. Mirror the
-        // invalidation path `DiffLoaded` already does so the next
-        // search keystroke sees fresh content.
+        // Body indices shifted, so the lowercased mirrors, any active
+        // diff-search match set, and any mouse selection are stale.
+        // Mirror the invalidation path `DiffLoaded` already does so the
+        // next search keystroke sees fresh content.
         self.diff.header_lower = None;
         self.diff.body_lower = None;
+        self.diff.selection = None;
         self.update_diff_matches();
     }
 
@@ -534,6 +546,7 @@ impl App {
             self.diff.document = None;
             self.diff.header_lower = None;
             self.diff.body_lower = None;
+            self.diff.selection = None;
             // A new target invalidates the single-file takeover and any
             // picker cursor along with the document they belonged to.
             self.diff.file_view_return = None;
@@ -1017,6 +1030,7 @@ impl App {
         self.diff.horizontal_scroll = ret.horizontal_scroll;
         self.diff.header_lower = None;
         self.diff.body_lower = None;
+        self.diff.selection = None;
         self.update_diff_matches();
         // If the user isolated a working-tree file before the deferred
         // untracked scan reported back, that update was seq-gated away

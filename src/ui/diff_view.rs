@@ -1,5 +1,5 @@
 use crate::{
-    app::{App, LogRow},
+    app::{App, DiffSelection, LogRow},
     model::{DiffLine, DiffLineKind, DiffStats, DiffTarget, FileStat},
     ui::{diff_line_to_ratatui, highlight_matches_in_span},
 };
@@ -10,6 +10,10 @@ use ratatui::{
     text::{Line, Span},
     widgets::Paragraph,
 };
+
+/// Background of the mouse drag-selection bar. Bluish so it can't be
+/// confused with the yellow search highlights or the gray cursor bars.
+const SELECTION_BG: Color = Color::Rgb(40, 65, 110);
 
 pub fn draw_diff(frame: &mut Frame, app: &App, area: Rect, focused: bool) {
     let block = crate::ui::pane_block(diff_title(app), focused, crate::ui::mode_accent(app));
@@ -61,6 +65,7 @@ pub fn draw_diff(frame: &mut Frame, app: &App, area: Rect, focused: bool) {
     let search_query = app.diff.search.query.to_lowercase();
     let has_diff_search = !search_query.is_empty();
     let current_match_line = app.diff.search.current_pos();
+    let selection = app.diff.selection.as_ref().map(DiffSelection::range);
 
     // Build Lines only for the visible window.
     let visible: Vec<Line> = (scroll..end)
@@ -96,7 +101,15 @@ pub fn draw_diff(frame: &mut Frame, app: &App, area: Rect, focused: bool) {
             } else {
                 spans.extend(line.spans);
             }
-            Line::from(spans).style(line.style)
+            // Mouse selection: a full-width background bar over the
+            // selected rows. Patched at the line level so span
+            // foregrounds (and the search highlight's own bg) still
+            // read through.
+            let mut style = line.style;
+            if selection.is_some_and(|(lo, hi)| (lo..=hi).contains(&global_idx)) {
+                style = style.patch(Style::default().bg(SELECTION_BG));
+            }
+            Line::from(spans).style(style)
         })
         .collect();
 
@@ -167,7 +180,7 @@ fn truncation_tag(flags: &crate::model::DiffFlags) -> String {
     if parts.is_empty() { "  [truncated]".to_string() } else { format!("  [truncated: {}]", parts.join(", ")) }
 }
 
-fn append_diffstat(
+pub(crate) fn append_diffstat(
     out: &mut Vec<Line<'static>>,
     files: &[FileStat],
     stats: &DiffStats,

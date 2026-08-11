@@ -8,6 +8,7 @@ use crate::{
     model::{BlameDocument, CommitRecord, DiffDocument, DiffTarget, RefEntry, StatusDocument},
 };
 use compact_str::CompactString;
+use ratatui::layout::Rect;
 use std::time::Instant;
 
 pub struct WorkingTreeRow {
@@ -32,6 +33,40 @@ pub enum LogRow {
 pub enum Focus {
     Log,
     Diff,
+}
+
+/// Inner (border-excluded) screen rects of the log/diff panes as of the
+/// last draw. `None` when the pane wasn't drawn (pane closed, or a
+/// full-screen view is up). The mouse handler hit-tests events against
+/// these; at worst they are one frame stale, which is fine for pointer
+/// routing.
+#[derive(Clone, Copy, Default)]
+pub struct PaneRects {
+    pub log: Option<Rect>,
+    pub diff: Option<Rect>,
+}
+
+/// Mouse-drag selection in the diff pane. `anchor`/`cursor` are virtual
+/// line indices into header + diffstat + body — the same space as
+/// `DiffState::scroll` and the diff-search matches — so the highlight
+/// stays glued to content while the view scrolls under the drag.
+pub struct DiffSelection {
+    /// Line the drag started on.
+    pub anchor: usize,
+    /// Line the drag last touched (may be above `anchor`).
+    pub cursor: usize,
+    /// True while the left button is held.
+    pub dragging: bool,
+    /// True once the drag crossed at least one cell boundary — a plain
+    /// click never copies, it only moves focus.
+    pub moved: bool,
+}
+
+impl DiffSelection {
+    /// Selection bounds as an ordered inclusive pair.
+    pub fn range(&self) -> (usize, usize) {
+        (self.anchor.min(self.cursor), self.anchor.max(self.cursor))
+    }
 }
 
 pub struct LogState {
@@ -183,6 +218,9 @@ pub struct DiffState {
     /// being typed; a non-empty `query` restricts picker movement to
     /// `matches` (indices into `document.files`) and dims the rest.
     pub picker_filter: SearchState,
+    /// Mouse drag-to-copy selection. Cleared whenever the document (or
+    /// the virtual-line indexing, e.g. the `v` hunks toggle) changes.
+    pub selection: Option<DiffSelection>,
 }
 
 /// What the single-file view replaced — restored on q/Esc so the

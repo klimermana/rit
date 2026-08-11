@@ -9,6 +9,12 @@ pub fn yank_to_clipboard(text: &str) {
         process::{Command, Stdio},
     };
 
+    // Unit tests exercise the yank paths (mouse drag-copy, `y`); a
+    // `cargo test` run must not clobber the developer's real clipboard.
+    if cfg!(test) {
+        return;
+    }
+
     #[cfg(target_os = "macos")]
     {
         if let Ok(mut child) = Command::new("pbcopy").stdin(Stdio::piped()).spawn() {

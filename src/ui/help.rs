@@ -8,8 +8,8 @@ use ratatui::{
 
 pub fn draw_help(frame: &mut Frame, area: Rect) {
     let width = 52u16.min(area.width.saturating_sub(4));
-    // 47 content rows + 2 border rows; clamped to the terminal height.
-    let height = 49u16.min(area.height.saturating_sub(4));
+    // 53 content rows + 2 border rows; clamped to the terminal height.
+    let height = 55u16.min(area.height.saturating_sub(4));
 
     let x = (area.width.saturating_sub(width)) / 2;
     let y = (area.height.saturating_sub(height)) / 2;
@@ -81,6 +81,12 @@ pub fn draw_help(frame: &mut Frame, area: Rect) {
         row!("  D              ", "Cycle date column: relative / absolute / off"),
         row!("  A              ", "Cycle author column: full / abbreviated / off"),
         row!("  X              ", "Toggle full 40-char commit hash"),
+        Line::from(""),
+        Line::from(Span::styled("Mouse", h)),
+        row!("  wheel          ", "Scroll the pane under the pointer"),
+        row!("  click          ", "Focus pane / select commit"),
+        row!("  drag in diff   ", "Select lines; copied on release"),
+        row!("  Opt/Alt+drag   ", "Terminal's native text selection"),
         Line::from(""),
         Line::from(Span::styled("CLI", h)),
         row!("  rit <pathspec> ", "Limit log to commits matching pathspec (git log -- semantics)"),

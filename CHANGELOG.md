@@ -16,6 +16,15 @@ Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- Mouse support. The terminal's mouse is now captured: the wheel
+  scrolls whichever pane is under the pointer (and the status, refs,
+  and blame views), clicking a pane focuses it (clicking a log row
+  also selects that commit), and dragging in the diff pane selects
+  whole lines *confined to that pane* — releasing the button copies
+  them to the clipboard with the gutter (line numbers, `+`/`-`
+  markers) stripped. This fixes copying out of a side-by-side layout,
+  where the terminal's own selection would sweep up the log pane too.
+  The terminal-native selection remains available via Option/Alt+drag.
 - Single-file diff view: `o` in the diff pane takes over the pane with
   the full diff of the file under the viewport — rendered as the
   *entire file* with added/removed lines highlighted inline, so every

@@ -2,7 +2,7 @@ use anyhow::Result;
 use clap::{Parser, Subcommand};
 use crossbeam_channel::{Sender, bounded, unbounded};
 use crossterm::{
-    event::{self, Event},
+    event::{self, DisableMouseCapture, EnableMouseCapture, Event},
     execute,
     terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
 };
@@ -54,13 +54,16 @@ fn main() -> Result<()> {
     let original_hook = panic::take_hook();
     panic::set_hook(Box::new(move |info| {
         _ = disable_raw_mode();
-        _ = execute!(io::stderr(), LeaveAlternateScreen);
+        _ = execute!(io::stderr(), DisableMouseCapture, LeaveAlternateScreen);
         original_hook(info);
     }));
 
     enable_raw_mode()?;
     let mut stdout = io::stdout();
-    execute!(stdout, EnterAlternateScreen)?;
+    // Mouse capture: wheel scrolling plus the diff pane's drag-to-copy
+    // selection. The terminal's own selection stays reachable via the
+    // usual Option/Alt+drag escape hatch.
+    execute!(stdout, EnterAlternateScreen, EnableMouseCapture)?;
     // Wrap stdout in BufWriter so ratatui's many small per-cell writes
     // coalesce into far fewer syscalls. CrosstermBackend calls flush() at
     // the end of each frame, so latency is not affected.
@@ -90,7 +93,7 @@ fn main() -> Result<()> {
     let result = app.run(&mut terminal);
 
     disable_raw_mode()?;
-    execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
+    execute!(terminal.backend_mut(), DisableMouseCapture, LeaveAlternateScreen)?;
     terminal.show_cursor()?;
 
     result

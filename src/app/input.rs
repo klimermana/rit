@@ -226,6 +226,9 @@ impl App {
             (_, Char('v'), Mod::NONE) if self.diff.open => {
                 self.diff.show_hunks = !self.diff.show_hunks;
                 self.diff.scroll = 0;
+                // The toggle collapses/expands the body section, so
+                // virtual-line selection indices no longer line up.
+                self.diff.selection = None;
             }
             (_, Char('f'), Mod::NONE) if self.diff.open => self.toggle_diff_scope(),
             (_, Char('y'), Mod::NONE) => self.yank_selected_hash(),
@@ -277,6 +280,7 @@ impl App {
                 }
                 self.diff.open = false;
                 self.focus = Focus::Log;
+                self.diff.selection = None;
                 // Carry an active diff search back to the log so the query
                 // keeps working there. No-op if diff search is empty.
                 self.migrate_search_to_log();

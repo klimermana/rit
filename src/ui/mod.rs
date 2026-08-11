@@ -10,7 +10,7 @@ use crate::{
 };
 use ratatui::{
     Frame,
-    layout::{Alignment, Constraint, Direction, Layout, Rect},
+    layout::{Alignment, Constraint, Direction, Layout, Margin, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span},
     widgets::{Block, BorderType, Borders, Paragraph},
@@ -38,6 +38,11 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
             .style(Style::default().bg(Color::DarkGray).fg(Color::White).add_modifier(Modifier::BOLD)),
         title_area,
     );
+
+    // Assume a full-screen view until the two-pane path below proves
+    // otherwise — the mouse handler must not hit-test against rects
+    // from a layout that is no longer on screen.
+    app.panes = crate::app::PaneRects::default();
 
     if app.status.open {
         draw_status_view(frame, app, main_area);
@@ -88,6 +93,11 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
     } else {
         (main_area, None)
     };
+
+    // Record the panes' inner rects (the panes draw Borders::ALL, so
+    // inner = area minus a 1-cell margin) for mouse hit-testing.
+    app.panes.log = Some(log_area.inner(Margin::new(1, 1)));
+    app.panes.diff = diff_area_opt.map(|a| a.inner(Margin::new(1, 1)));
 
     // Single source of truth for the log viewport size.
     app.log.view_height = (log_area.height as usize).saturating_sub(2).max(1);
