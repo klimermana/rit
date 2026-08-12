@@ -131,6 +131,7 @@ fn diff_title(app: &App) -> String {
     };
     let label = match app.diff.target {
         Some(DiffTarget::WorkingTree) => "Working Tree".to_string(),
+        Some(DiffTarget::Staged) => "Staged".to_string(),
         Some(DiffTarget::Commit(_)) => match app.log.rows.get(app.log.selected) {
             Some(LogRow::Commit(c)) => c.short_id.to_string(),
             _ => "commit".to_string(),

@@ -19,14 +19,23 @@ pub struct WorkingTreeRow {
     pub dirty: Option<bool>,
 }
 
+/// The "Staged changes" pseudo-row. Its presence *is* the state: the
+/// row sits at index 1 only while the worker reports staged changes
+/// (see `App::sync_staged_row`), so it carries nothing but the author
+/// used by the render scaffolding.
+pub struct StagedRow {
+    pub author: CompactString,
+}
+
 #[expect(
     clippy::large_enum_variant,
-    reason = "the WorkingTree variant occurs exactly once (index 0, see commits_len) so no per-row \
-              memory is wasted, and boxing CommitRecord would add a pointer chase to every commit \
-              row on the per-frame render and search hot paths"
+    reason = "the WorkingTree/Staged variants occur at most once each (indices 0/1, see commits_len) \
+              so no per-row memory is wasted, and boxing CommitRecord would add a pointer chase to \
+              every commit row on the per-frame render and search hot paths"
 )]
 pub enum LogRow {
     WorkingTree(WorkingTreeRow),
+    Staged(StagedRow),
     Commit(CommitRecord),
 }
 

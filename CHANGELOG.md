@@ -16,6 +16,14 @@ Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- "Staged changes" row in the log: when the index differs from HEAD, a
+  second pseudo-row appears under "Uncommitted changes". Selecting it
+  shows a staged-only diff (index vs HEAD) — worktree edits that
+  aren't staged and untracked files are excluded, so it answers
+  "what exactly will `git commit` pick up". The single-file view (`o`)
+  inside it diffs HEAD's blob against the index blob. The row appears
+  and disappears with the same background check that drives the
+  dirty indicator.
 - Mouse support. The terminal's mouse is now captured: the wheel
   scrolls whichever pane is under the pointer (and the status, refs,
   and blame views), clicking a pane focuses it (clicking a log row

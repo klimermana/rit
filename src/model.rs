@@ -127,6 +127,9 @@ pub enum RefKind {
 pub enum DiffTarget {
     Commit(ObjectId),
     WorkingTree,
+    /// Staged changes only: index vs HEAD. Backs the log's
+    /// "Staged changes" pseudo-row.
+    Staged,
 }
 
 /// A complete diff payload as produced by the inspect path. Bundling

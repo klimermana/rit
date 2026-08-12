@@ -466,6 +466,101 @@ fn assemble_working_tree_body(
     (body, files, stats, flags, untracked_anchor, sections)
 }
 
+/// Collect the index-vs-HEAD changes without touching the worktree:
+/// `tree_index_status` diffs two in-memory indices, so unlike
+/// `sweep_status` there is no stat walk to pay for. Feeds the
+/// staged-only diff document behind the log's "Staged changes" row.
+fn staged_changes(repo: &gix::Repository) -> Result<Vec<gix::diff::index::Change>> {
+    use std::ops::ControlFlow;
+    let head_tree = repo.head_tree_id_or_empty()?;
+    let index = repo.index_or_empty()?;
+    let mut changes = Vec::new();
+    repo.tree_index_status(
+        &head_tree,
+        &index,
+        None,
+        gix::status::tree_index::TrackRenames::AsConfigured,
+        |change, _, _| -> Result<_, std::convert::Infallible> {
+            changes.push(change.into_owned());
+            Ok(ControlFlow::Continue(()))
+        },
+    )?;
+    Ok(changes)
+}
+
+/// Staged-only diff document (index vs HEAD) for `DiffTarget::Staged`.
+/// Same per-file rendering as the working-tree view's staged section,
+/// without the short-status header, the unstaged section, or the
+/// deferred untracked walk — none of them describe the index.
+pub fn compute_staged_diff(repo: &gix::Repository, target: DiffTarget) -> DiffDocument {
+    let mut body: Vec<DiffLine> = Vec::new();
+    let mut files: Vec<FileStat> = Vec::new();
+    let mut stats = DiffStats { files: 0, insertions: 0, deletions: 0 };
+    let mut flags = DiffFlags::default();
+    let mut sections: Vec<FileSection> = Vec::new();
+
+    body.push(DiffLine::new(DiffLineKind::SectionStaged, "Staged Changes (index vs HEAD)"));
+    body.push(DiffLine::new(DiffLineKind::Blank, ""));
+
+    let staged = match staged_changes(repo) {
+        Ok(changes) => changes,
+        Err(e) => {
+            body.push(DiffLine::new(DiffLineKind::Faint, format!("Status query failed: {e}")));
+            Vec::new()
+        }
+    };
+
+    {
+        let mut sink = DiffSink {
+            lines: &mut body,
+            stats: &mut stats,
+            files: &mut files,
+            flags: &mut flags,
+            sections: &mut sections,
+        };
+        if render_staged_section(repo, &mut sink, staged) == 0 {
+            sink.lines.push(DiffLine::new(DiffLineKind::Faint, "(no staged changes)"));
+        }
+    }
+
+    DiffDocument { target, header: Vec::new(), body, files, stats, flags, untracked_anchor: None, sections }
+}
+
+/// Full-context single-file diff for the staged view: HEAD's blob
+/// (empty when the file is a staged addition) against the index blob
+/// (empty when the deletion is staged). The worktree bytes never enter
+/// the picture — this answers "what exactly did I stage for this file".
+pub fn compute_staged_file_diff(repo: &gix::Repository, path: &str) -> DiffDocument {
+    compute_staged_file_diff_inner(repo, path).unwrap_or_else(|e| empty_error_document(DiffTarget::Staged, e))
+}
+
+fn compute_staged_file_diff_inner(repo: &gix::Repository, path: &str) -> Result<DiffDocument> {
+    let old = head_blob_bytes(repo, path)?.unwrap_or_default();
+    let new = index_blob_bytes(repo, path)?.unwrap_or_default();
+    if old.is_empty() && new.is_empty() {
+        anyhow::bail!("{path}: not in HEAD and not in the index");
+    }
+    let mode_meta = if old.is_empty() {
+        Some("new file")
+    } else if new.is_empty() {
+        Some("deleted file")
+    } else {
+        None
+    };
+    let output = file_full_context_output(path, &old, &new, mode_meta);
+    Ok(single_file_document(DiffTarget::Staged, output))
+}
+
+/// Bytes of `path`'s blob in the index, `None` when the path has no
+/// index entry (e.g. a staged deletion).
+fn index_blob_bytes(repo: &gix::Repository, path: &str) -> Result<Option<Vec<u8>>> {
+    let index = repo.index_or_empty()?;
+    match index.entry_by_path(path.into()) {
+        Some(entry) => Ok(Some(repo.find_object(entry.id)?.data.clone())),
+        None => Ok(None),
+    }
+}
+
 /// Assemble the working-tree diff document with the untracked walk
 /// deferred to a side thread. The returned document has a
 /// `untracked_anchor` pointing at a faint placeholder in `body`; the
@@ -555,8 +650,8 @@ pub fn collect_untracked_paths(repo: &gix::Repository) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::{
-        UNTRACKED_PENDING_PLACEHOLDER, collect_untracked_paths, compute_status, compute_working_tree_diff,
-        compute_worktree_file_diff,
+        UNTRACKED_PENDING_PLACEHOLDER, collect_untracked_paths, compute_staged_diff, compute_staged_file_diff,
+        compute_status, compute_working_tree_diff, compute_worktree_file_diff,
     };
     use crate::{
         model::{DiffLineKind, DiffTarget},
@@ -663,6 +758,79 @@ mod tests {
         assert_eq!(doc.stats.files, 0);
         assert_eq!(doc.stats.insertions, 0);
         assert_eq!(doc.stats.deletions, 0);
+    }
+
+    #[test]
+    fn staged_diff_renders_only_the_index_vs_head_changes() {
+        let (td, repo) = make_fixture_repo();
+        let path = td.path();
+
+        write_file(path, "staged.txt", "one\ntwo\n");
+        write_file(path, "unstaged.txt", "alpha\nbeta\n");
+        commit_all(path, "baseline");
+
+        write_file(path, "staged.txt", "one\nTWO\n");
+        run_git(path, &["add", "staged.txt"]);
+        write_file(path, "unstaged.txt", "alpha\nBETA\n");
+        std::fs::write(path.join("untracked.txt"), "x\n").expect("write");
+
+        let doc = compute_staged_diff(&repo, DiffTarget::Staged);
+        let body_text: String = doc.body.iter().map(|l| l.text.as_str()).collect::<Vec<_>>().join("\n");
+
+        assert!(body_text.contains("diff --git a/staged.txt b/staged.txt"));
+        assert!(doc.body.iter().any(|l| matches!(l.kind, DiffLineKind::Add) && l.text == "TWO"));
+        assert!(!body_text.contains("unstaged.txt"), "worktree-only change must not appear");
+        assert!(!body_text.contains("untracked.txt"), "untracked files must not appear");
+        assert_eq!(doc.stats.files, 1);
+        assert!(doc.untracked_anchor.is_none(), "staged diff has no deferred untracked walk");
+
+        let paths: Vec<&str> = doc.files.iter().map(|f| f.path.as_str()).collect();
+        assert_eq!(paths, vec!["staged.txt"]);
+    }
+
+    #[test]
+    fn staged_diff_with_clean_index_shows_placeholder() {
+        let (td, repo) = make_fixture_repo();
+        let path = td.path();
+        write_file(path, "a.txt", "hi\n");
+        commit_all(path, "baseline");
+        // Worktree noise only — the staged view should read as empty.
+        write_file(path, "a.txt", "hi\nthere\n");
+
+        let doc = compute_staged_diff(&repo, DiffTarget::Staged);
+        let body_text: String = doc.body.iter().map(|l| l.text.as_str()).collect::<Vec<_>>().join("\n");
+        assert!(body_text.contains("(no staged changes)"));
+        assert_eq!(doc.stats.files, 0);
+    }
+
+    #[test]
+    fn staged_file_diff_shows_index_blob_not_worktree_bytes() {
+        let (td, repo) = make_fixture_repo();
+        let path = td.path();
+        let base: String = (0..8).map(|i| format!("row{i}\n")).collect();
+        write_file(path, "a.txt", &base);
+        commit_all(path, "base");
+
+        // Stage one edit, then dirty the worktree further on top of it.
+        write_file(path, "a.txt", &base.replace("row3\n", "STAGED\n"));
+        run_git(path, &["add", "a.txt"]);
+        write_file(path, "a.txt", &base.replace("row3\n", "WORKTREE\n"));
+
+        let doc = compute_staged_file_diff(&repo, "a.txt");
+        assert_eq!(doc.stats.files, 1);
+        assert!(doc.body.iter().any(|l| matches!(l.kind, DiffLineKind::Add) && l.text == "STAGED"));
+        assert!(
+            !doc.body.iter().any(|l| l.text == "WORKTREE"),
+            "worktree edit that isn't staged must not leak into the staged file view"
+        );
+        assert!(
+            doc.body.iter().any(|l| matches!(l.kind, DiffLineKind::Context) && l.text == "row0"),
+            "context spans the whole file"
+        );
+
+        // A path with nothing staged and absent from HEAD errors.
+        let doc = compute_staged_file_diff(&repo, "missing.txt");
+        assert!(doc.header.iter().any(|l| l.text.starts_with("Error:")));
     }
 
     #[test]

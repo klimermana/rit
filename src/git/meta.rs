@@ -161,6 +161,32 @@ pub fn quick_is_dirty(repo: &gix::Repository) -> Option<bool> {
     Some(false)
 }
 
+/// Whether the index differs from HEAD (i.e. anything is staged).
+/// Purely in-memory tree-vs-index diff — no worktree stat walk — so
+/// it's cheap even on wide checkouts, unlike `quick_is_dirty`. Early
+/// exit on the first change via `ControlFlow::Break`. Returns `None`
+/// when the query itself fails; the UI keeps the previous row state.
+pub fn quick_has_staged(repo: &gix::Repository) -> Option<bool> {
+    use std::ops::ControlFlow;
+    let head_tree = repo.head_tree_id_or_empty().ok()?;
+    let index = repo.index_or_empty().ok()?;
+    let mut found = false;
+    let outcome = repo.tree_index_status(
+        &head_tree,
+        &index,
+        None,
+        gix::status::tree_index::TrackRenames::Disabled,
+        |_, _, _| -> Result<_, std::convert::Infallible> {
+            found = true;
+            Ok(ControlFlow::Break(()))
+        },
+    );
+    match outcome {
+        Ok(_) => Some(found),
+        Err(_) => None,
+    }
+}
+
 pub fn relative_time(unix_secs: i64) -> CompactString {
     let now = Utc::now();
     let t = Utc.timestamp_opt(unix_secs, 0).single().unwrap_or(now);

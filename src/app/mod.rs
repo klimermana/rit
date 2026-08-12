@@ -16,7 +16,7 @@ pub mod state;
 
 pub use state::{
     AuthorMode, BlameState, CommitSearchState, DateMode, DiffSearchState, DiffSelection, DiffState, DisplayOptions,
-    FileViewReturn, Focus, LogRow, LogState, PaneRects, RefsState, SearchSnapshot, SearchState, StatusState,
+    FileViewReturn, Focus, LogRow, LogState, PaneRects, RefsState, SearchSnapshot, SearchState, StagedRow, StatusState,
     WorkingTreeRow, YankFeedback,
 };
 
@@ -248,11 +248,13 @@ impl App {
             HistoryMsg::RefsLoaded { generation, refs_map, first_batch_rows } => {
                 if generation == self.walk_gen {
                     // Backfill ref labels only on commits that arrived before
-                    // refs were live. The working-tree row is at index 0
-                    // (not a Commit), so the prefix runs `[1..=first_batch_rows]`.
-                    // Subsequent batches were built with the refs already in
-                    // hand and don't need touching.
-                    let backfill_end = (first_batch_rows + 1).min(self.log.rows.len());
+                    // refs were live. Commits sit below the pseudo-row prefix
+                    // (working-tree row, plus the staged row when present),
+                    // so count the prefix instead of assuming 1. Subsequent
+                    // batches were built with the refs already in hand and
+                    // don't need touching.
+                    let prefix = self.log.rows.iter().take_while(|r| !matches!(r, LogRow::Commit(_))).count();
+                    let backfill_end = (first_batch_rows + prefix).min(self.log.rows.len());
                     for row in self.log.rows.iter_mut().take(backfill_end) {
                         if let LogRow::Commit(c) = row
                             && let Some(labels) = refs_map.get(&c.id)
@@ -358,9 +360,10 @@ impl App {
                     }
                 }
             }
-            InspectMsg::WorkingTreeMeta { author, dirty } => {
+            InspectMsg::WorkingTreeMeta { author, dirty, staged } => {
+                let author: compact_str::CompactString = author.into();
                 if let Some(LogRow::WorkingTree(w)) = self.log.rows.first_mut() {
-                    w.author = author.into();
+                    w.author = author.clone();
                     // Only update the dirty bit when the worker actually
                     // produced one; preserve the previous indicator on
                     // status-query errors.
@@ -368,6 +371,7 @@ impl App {
                         w.dirty = dirty;
                     }
                 }
+                self.sync_staged_row(staged, author);
             }
             InspectMsg::UntrackedFilesUpdate { target, seq, paths } => {
                 self.apply_untracked_update(target, seq, paths);
@@ -434,6 +438,64 @@ impl App {
         self.update_diff_matches();
     }
 
+    fn has_staged_row(&self) -> bool {
+        matches!(self.log.rows.get(1), Some(LogRow::Staged(_)))
+    }
+
+    /// Reconcile the "Staged changes" pseudo-row (index 1) with the
+    /// worker's latest index-vs-HEAD verdict: `Some(true)` inserts it,
+    /// `Some(false)` removes it, `None` (probe failed) keeps whatever
+    /// is showing. Inserting/removing shifts every commit row by one,
+    /// so the selection, the scroll anchor, and the search match
+    /// indices are adjusted in place — matches stay sorted under a
+    /// uniform shift, which the binary searches in the render/search
+    /// paths rely on.
+    fn sync_staged_row(&mut self, staged: Option<bool>, author: compact_str::CompactString) {
+        match (staged, self.has_staged_row()) {
+            (Some(true), true) | (None, true) => {
+                if let Some(LogRow::Staged(s)) = self.log.rows.get_mut(1) {
+                    s.author = author;
+                }
+            }
+            (Some(true), false) => {
+                self.log.rows.insert(1, LogRow::Staged(StagedRow { author }));
+                for m in &mut self.search.state.matches {
+                    *m += 1;
+                }
+                // Selection can't be on the not-yet-inserted row; >= 1
+                // means a commit, which just moved down one.
+                if self.log.selected >= 1 {
+                    self.log.selected += 1;
+                }
+                if self.log.scroll >= 1 {
+                    self.log.scroll += 1;
+                }
+                self.ensure_selected_visible();
+            }
+            (Some(false), true) => {
+                self.log.rows.remove(1);
+                for m in &mut self.search.state.matches {
+                    *m -= 1;
+                }
+                if self.log.selected > 1 {
+                    self.log.selected -= 1;
+                } else if self.log.selected == 1 {
+                    // The selected row vanished; fall back to the
+                    // working-tree row and repoint the diff pane.
+                    self.log.selected = 0;
+                    if self.diff.open {
+                        self.fetch_diff_for_selected();
+                    }
+                }
+                if self.log.scroll >= 1 {
+                    self.log.scroll -= 1;
+                }
+                self.ensure_selected_visible();
+            }
+            (Some(false), false) | (None, false) => {}
+        }
+    }
+
     pub(crate) fn reload(&mut self) {
         // `root: None` keeps the worker's current walk root.
         self.reload_with_root(None);
@@ -447,7 +509,14 @@ impl App {
             Some(LogRow::WorkingTree(w)) => w.author.clone(),
             _ => "you".into(),
         };
-        self.log.rows = vec![LogRow::WorkingTree(WorkingTreeRow { author, dirty: None })];
+        // Carry the staged row across the reload like the author — the
+        // fresh dirty check (RefreshWorkingTreeMeta below) corrects it
+        // if the index changed, without flickering it off meanwhile.
+        let had_staged = self.has_staged_row();
+        self.log.rows = vec![LogRow::WorkingTree(WorkingTreeRow { author: author.clone(), dirty: None })];
+        if had_staged {
+            self.log.rows.push(LogRow::Staged(StagedRow { author }));
+        }
         self.log.selected = 0;
         self.log.scroll = 0;
         self.diff.document = None;
@@ -533,6 +602,7 @@ impl App {
         let target = match row {
             LogRow::Commit(c) => DiffTarget::Commit(c.id),
             LogRow::WorkingTree(_) => DiffTarget::WorkingTree,
+            LogRow::Staged(_) => DiffTarget::Staged,
         };
         self.request_diff(target);
     }
@@ -796,13 +866,13 @@ impl App {
         self.display.date.col_width()
     }
 
-    /// Number of real commits in the log (excludes the pseudo "Not Committed
-    /// Yet" row at index 0). The working-tree row is created in `App::new`
-    /// and replaced 1-for-1 in `reload`, never removed — so a direct
-    /// `rows.len() - 1` is exact and O(1), important because this runs on
-    /// every redraw via the status-bar renderer.
+    /// Number of real commits in the log (excludes the pseudo rows: the
+    /// "Not Committed Yet" row always at index 0, and the "Staged
+    /// changes" row at index 1 when present). Both live at fixed indices,
+    /// so this stays O(1) — important because it runs on every redraw
+    /// via the status-bar renderer.
     pub fn commits_len(&self) -> usize {
-        self.log.rows.len().saturating_sub(1)
+        self.log.rows.len().saturating_sub(1 + usize::from(self.has_staged_row()))
     }
 
     pub(crate) fn diff_scroll_down(&mut self, n: usize) {
@@ -874,7 +944,7 @@ impl App {
         let Some(doc) = self.diff.document.as_ref() else { return };
         let at = match doc.target {
             DiffTarget::Commit(id) => BlameAt::Commit(id),
-            DiffTarget::WorkingTree => BlameAt::Head,
+            DiffTarget::WorkingTree | DiffTarget::Staged => BlameAt::Head,
         };
         self.blame.history.clear();
         self.blame.pending_return = None;
@@ -1359,6 +1429,105 @@ mod tests {
         app.apply_history_msg(HistoryMsg::RefsLoaded { generation: 7, refs_map: Arc::new(map), first_batch_rows: 1 });
         let LogRow::Commit(c1) = &app.log.rows[1] else { panic!("row 1 should be a commit") };
         assert!(c1.refs.is_empty());
+    }
+
+    // --- staged row lifecycle ---
+
+    fn meta_msg(staged: Option<bool>) -> InspectMsg {
+        InspectMsg::WorkingTreeMeta { author: "you".to_string(), dirty: Some(true), staged }
+    }
+
+    #[test]
+    fn staged_row_inserts_and_removes_with_index_state() {
+        let (mut app, _ends) = test_app();
+        app.apply_history_msg(HistoryMsg::Commits {
+            generation: 0,
+            commits: vec![commit_record(1, "first", "a"), commit_record(2, "second", "b")],
+        });
+        app.search.state.query = "first".to_string();
+        app.update_commit_matches();
+        assert_eq!(app.search.state.matches, vec![1]);
+        app.log.selected = 1; // on commit 1
+        assert_eq!(app.commits_len(), 2);
+
+        app.apply_inspect_msg(meta_msg(Some(true)));
+        assert!(matches!(app.log.rows.get(1), Some(LogRow::Staged(_))), "staged row inserted at index 1");
+        assert_eq!(app.log.selected, 2, "selection follows the commit it was on");
+        assert_eq!(app.search.state.matches, vec![2], "match indices shifted with the rows");
+        assert_eq!(app.commits_len(), 2, "pseudo rows are not commits");
+
+        // Repeat report keeps a single row.
+        app.apply_inspect_msg(meta_msg(Some(true)));
+        assert_eq!(app.log.rows.len(), 4);
+
+        // `None` (probe failed) preserves the row.
+        app.apply_inspect_msg(meta_msg(None));
+        assert!(matches!(app.log.rows.get(1), Some(LogRow::Staged(_))));
+
+        app.apply_inspect_msg(meta_msg(Some(false)));
+        assert!(matches!(app.log.rows.get(1), Some(LogRow::Commit(_))), "staged row removed");
+        assert_eq!(app.log.selected, 1, "selection shifts back");
+        assert_eq!(app.search.state.matches, vec![1]);
+    }
+
+    #[test]
+    fn staged_row_selected_falls_back_to_working_tree_on_removal() {
+        let (mut app, ends) = test_app();
+        app.apply_history_msg(HistoryMsg::Commits { generation: 0, commits: vec![commit_record(1, "x", "a")] });
+        app.apply_inspect_msg(meta_msg(Some(true)));
+        app.log.selected = 1; // the staged row
+        app.diff.open = true;
+        app.fetch_diff_for_selected();
+        assert_eq!(app.diff.target, Some(DiffTarget::Staged));
+        while ends.req_rx.try_recv().is_ok() {}
+
+        app.apply_inspect_msg(meta_msg(Some(false)));
+        assert_eq!(app.log.selected, 0, "selection falls back to the working-tree row");
+        assert_eq!(app.diff.target, Some(DiffTarget::WorkingTree), "diff pane repointed");
+        assert!(
+            matches!(
+                ends.req_rx.try_recv(),
+                Ok(GitReq::Inspect(InspectReq::LoadDiff { target: DiffTarget::WorkingTree, .. }))
+            ),
+            "replacement diff requested"
+        );
+    }
+
+    #[test]
+    fn staged_row_requests_staged_diff_target() {
+        let (mut app, ends) = test_app();
+        app.apply_inspect_msg(meta_msg(Some(true)));
+        app.log.selected = 1;
+        app.diff.open = true;
+        app.fetch_diff_for_selected();
+        match ends.req_rx.try_recv().expect("request sent") {
+            GitReq::Inspect(InspectReq::LoadDiff { target, .. }) => assert_eq!(target, DiffTarget::Staged),
+            _ => panic!("expected LoadDiff"),
+        }
+    }
+
+    #[test]
+    fn refs_backfill_prefix_accounts_for_staged_row() {
+        let (mut app, _ends) = test_app();
+        app.apply_inspect_msg(meta_msg(Some(true)));
+        app.apply_history_msg(HistoryMsg::Commits { generation: 0, commits: vec![commit_record(1, "first", "a")] });
+
+        let mut map: HashMap<gix::ObjectId, Vec<RefLabel>> = HashMap::new();
+        map.insert(oid(1), vec![RefLabel { name: "v1.0".into(), kind: RefKind::Tag }]);
+        app.apply_history_msg(HistoryMsg::RefsLoaded { generation: 0, refs_map: Arc::new(map), first_batch_rows: 1 });
+
+        let LogRow::Commit(c1) = &app.log.rows[2] else { panic!("row 2 should be a commit") };
+        assert_eq!(c1.refs.len(), 1, "backfill still reaches the whole first batch below both pseudo rows");
+    }
+
+    #[test]
+    fn reload_preserves_staged_row_until_fresh_verdict() {
+        let (mut app, _ends) = test_app();
+        app.apply_inspect_msg(meta_msg(Some(true)));
+        app.reload();
+        assert!(matches!(app.log.rows.get(1), Some(LogRow::Staged(_))), "row carried across reload");
+        app.apply_inspect_msg(meta_msg(Some(false)));
+        assert!(app.log.rows.get(1).is_none(), "fresh verdict removes it");
     }
 
     // --- DiffLoaded / untracked splice sequencing ---

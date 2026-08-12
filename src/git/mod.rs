@@ -238,8 +238,11 @@ fn run_git_thread_inner(
     // batch — see the `!refs_loaded` arm of the loop below), and the
     // app's `apply_inspect_msg` (src/app/mod.rs) already keeps its prior
     // indicator across `dirty: None` updates.
-    _ = msg_tx
-        .send(GitMsg::Inspect(InspectMsg::WorkingTreeMeta { author: meta::working_tree_author(&repo), dirty: None }));
+    _ = msg_tx.send(GitMsg::Inspect(InspectMsg::WorkingTreeMeta {
+        author: meta::working_tree_author(&repo),
+        dirty: None,
+        staged: None,
+    }));
 
     let mut walker =
         walk::Walker::new(&repo, path_filter.clone(), walk_root, 0, graph_enabled, Arc::new(HashMap::new()))?;
@@ -403,6 +406,7 @@ fn process_request<'r>(
                     diff::compute_commit_diff(repo, id, tree_diff_cache, scope)
                 }
                 DiffTarget::WorkingTree => status::compute_working_tree_diff(repo, target),
+                DiffTarget::Staged => status::compute_staged_diff(repo, target),
             };
             // For working-tree diffs the document carries an
             // `untracked_anchor`; spawn the dir walk on a side thread
@@ -420,6 +424,7 @@ fn process_request<'r>(
             let document = match target {
                 DiffTarget::Commit(id) => diff::compute_file_diff(repo, id, &path, tree_diff_cache),
                 DiffTarget::WorkingTree => status::compute_worktree_file_diff(repo, &path),
+                DiffTarget::Staged => status::compute_staged_file_diff(repo, &path),
             };
             _ = msg_tx.send(GitMsg::Inspect(InspectMsg::FileDiffLoaded { seq, document }));
         }
@@ -485,8 +490,12 @@ fn spawn_dirty_check(repo: &gix::Repository, msg_tx: crossbeam_channel::Sender<G
     let repo = repo.clone();
     std::thread::spawn(move || {
         let author = meta::working_tree_author(&repo);
+        // The staged probe is in-memory (index vs HEAD) and cheap;
+        // run it before the worktree stat walk so its result doesn't
+        // wait on the expensive part of the scan.
+        let staged = meta::quick_has_staged(&repo);
         let dirty = meta::quick_is_dirty(&repo);
-        _ = msg_tx.send(GitMsg::Inspect(InspectMsg::WorkingTreeMeta { author, dirty }));
+        _ = msg_tx.send(GitMsg::Inspect(InspectMsg::WorkingTreeMeta { author, dirty, staged }));
     })
 }
 
@@ -560,7 +569,7 @@ impl Drop for DirtyJoin {
 mod tests {
     use super::{
         GitReq, HistoryReq, InspectReq, coalesce_requests,
-        meta::{quick_is_dirty, relative_time},
+        meta::{quick_has_staged, quick_is_dirty, relative_time},
         resolve_positional,
     };
     use crate::{
@@ -626,6 +635,66 @@ mod tests {
         assert_eq!(quick_is_dirty(&repo), Some(false), "after commit, back to clean");
         std::fs::write(path.join("new_untracked.txt"), "x").expect("write");
         assert_eq!(quick_is_dirty(&repo), Some(true), "untracked file should count as dirty");
+    }
+
+    #[test]
+    fn quick_has_staged_tracks_index_vs_head_only() {
+        let (td, repo) = make_fixture_repo();
+        let path = td.path();
+
+        // Unborn HEAD with a staged file: the empty-tree fallback still
+        // sees the index entry.
+        write_file(path, "tracked.txt", "hi\n");
+        crate::test_support::run_git(path, &["add", "tracked.txt"]);
+        assert_eq!(quick_has_staged(&repo), Some(true), "staged add on unborn HEAD counts");
+
+        commit_all(path, "baseline");
+        assert_eq!(quick_has_staged(&repo), Some(false), "freshly committed index matches HEAD");
+
+        // Unstaged and untracked changes must NOT flip the staged bit.
+        write_file(path, "tracked.txt", "hi\nthere\n");
+        std::fs::write(path.join("untracked.txt"), "x").expect("write");
+        assert_eq!(quick_has_staged(&repo), Some(false), "worktree-only changes are not staged");
+
+        crate::test_support::run_git(path, &["add", "tracked.txt"]);
+        assert_eq!(quick_has_staged(&repo), Some(true), "git add flips to staged");
+
+        commit_all(path, "second");
+        assert_eq!(quick_has_staged(&repo), Some(false), "commit clears the staged bit");
+    }
+
+    #[test]
+    fn worker_answers_staged_load_diff() {
+        use crate::{git::InspectMsg, model::DiffLineKind};
+        let (td, _repo) = make_fixture_repo();
+        let path = td.path();
+        write_file(path, "a.txt", "one\n");
+        commit_all(path, "baseline");
+        write_file(path, "a.txt", "one\nTWO\n");
+        crate::test_support::run_git(path, &["add", "a.txt"]);
+
+        // `run_git_thread` discovers the repo from the cwd, so hold the
+        // chdir until the worker has answered (the bench does the same).
+        let prev = std::env::current_dir().expect("cwd");
+        std::env::set_current_dir(path).expect("cd into fixture");
+        let (req_tx, req_rx) = crossbeam_channel::unbounded();
+        let (msg_tx, msg_rx) = crossbeam_channel::unbounded();
+        let handle = std::thread::spawn(move || super::run_git_thread(req_rx, msg_tx, None, false));
+
+        req_tx
+            .send(GitReq::Inspect(InspectReq::LoadDiff { target: DiffTarget::Staged, seq: 1, scoped: false }))
+            .expect("send");
+        let document = loop {
+            match msg_rx.recv_timeout(std::time::Duration::from_secs(10)).expect("worker reply") {
+                super::GitMsg::Inspect(InspectMsg::DiffLoaded { seq: 1, document }) => break document,
+                _ => continue,
+            }
+        };
+        std::env::set_current_dir(prev).expect("cd back");
+        assert_eq!(document.target, DiffTarget::Staged);
+        assert!(document.body.iter().any(|l| matches!(l.kind, DiffLineKind::Add) && l.text == "TWO"));
+        drop(req_tx);
+        _ = handle.join();
     }
 
     #[test]

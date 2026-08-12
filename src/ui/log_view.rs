@@ -1,5 +1,5 @@
 use crate::{
-    app::{App, LogRow, WorkingTreeRow},
+    app::{App, LogRow, StagedRow, WorkingTreeRow},
     model::{CommitRecord, RefKind},
     ui::highlight_matches_in_span,
 };
@@ -57,6 +57,7 @@ pub fn draw_log(frame: &mut Frame, app: &App, area: Rect, focused: bool) {
 
         let spans = match row {
             LogRow::WorkingTree(w) => working_tree_spans(w, app),
+            LogRow::Staged(s) => staged_spans(s, app),
             LogRow::Commit(c) => commit_spans(c, app, row_query, highlight),
         };
 
@@ -148,7 +149,10 @@ fn date_cell(app: &App, unix_secs: i64, relative: &str) -> Option<String> {
     }
 }
 
-fn working_tree_spans(row: &WorkingTreeRow, app: &App) -> Vec<Span<'static>> {
+/// The hash / date / author columns shared by the pseudo rows (working
+/// tree, staged): an all-zero hash, "now", and the configured author,
+/// each following the same display toggles as the commit rows.
+fn pseudo_row_scaffold(author: &str, app: &App) -> Vec<Span<'static>> {
     let mut spans: Vec<Span<'static>> = Vec::new();
     let dim = Style::default().fg(Color::DarkGray);
     let hash = if app.display.full_hash { "0".repeat(40) } else { "0000000".to_string() };
@@ -162,13 +166,18 @@ fn working_tree_spans(row: &WorkingTreeRow, app: &App) -> Vec<Span<'static>> {
         spans.push(Span::raw(" "));
     }
     if app.author_col_width() > 0 {
-        let author = truncate_chars(&row.author, app.author_col_width());
+        let author = truncate_chars(author, app.author_col_width());
         spans.push(Span::styled(
             format!("{:<width$}", author, width = app.author_col_width()),
             Style::default().fg(Color::Green),
         ));
         spans.push(Span::raw(" "));
     }
+    spans
+}
+
+fn working_tree_spans(row: &WorkingTreeRow, app: &App) -> Vec<Span<'static>> {
+    let mut spans = pseudo_row_scaffold(&row.author, app);
     let (text, style) = match row.dirty {
         Some(true) => ("Uncommitted changes", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
         Some(false) => ("Working tree clean", Style::default().fg(Color::Green)),
@@ -176,5 +185,14 @@ fn working_tree_spans(row: &WorkingTreeRow, app: &App) -> Vec<Span<'static>> {
         None => ("Not Committed Yet", Style::default().fg(Color::DarkGray).add_modifier(Modifier::BOLD)),
     };
     spans.push(Span::styled(text, style));
+    spans
+}
+
+fn staged_spans(row: &StagedRow, app: &App) -> Vec<Span<'static>> {
+    let mut spans = pseudo_row_scaffold(&row.author, app);
+    // The row only exists while something is staged, so the label is
+    // unconditional — green for "ready to commit", distinct from the
+    // yellow "Uncommitted changes" above it.
+    spans.push(Span::styled("Staged changes", Style::default().fg(Color::Green).add_modifier(Modifier::BOLD)));
     spans
 }

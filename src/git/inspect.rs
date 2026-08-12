@@ -103,6 +103,11 @@ pub enum InspectMsg {
         /// case. `Some(true)` if anything (staged / unstaged / untracked)
         /// differs from HEAD; `Some(false)` for a clean tree.
         dirty: Option<bool>,
+        /// Whether the index differs from HEAD. Drives the log's
+        /// "Staged changes" pseudo-row: `Some(true)` inserts it,
+        /// `Some(false)` removes it, `None` (check failed or deferred)
+        /// leaves it as-is.
+        staged: Option<bool>,
     },
     /// Follow-up to a working-tree `LoadDiff` once the off-thread
     /// untracked-files walk completes. The app splices `paths` into the
