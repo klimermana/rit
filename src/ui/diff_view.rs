@@ -1,5 +1,5 @@
 use crate::{
-    app::{App, DiffSelection, LogRow},
+    app::{App, LogRow, state::cell_in_selection},
     model::{DiffLine, DiffLineKind, DiffStats, DiffTarget, FileStat},
     ui::{diff_line_to_ratatui, highlight_matches_in_span},
 };
@@ -65,7 +65,7 @@ pub fn draw_diff(frame: &mut Frame, app: &App, area: Rect, focused: bool) {
     let search_query = app.diff.search.query.to_lowercase();
     let has_diff_search = !search_query.is_empty();
     let current_match_line = app.diff.search.current_pos();
-    let selection = app.diff.selection.as_ref().map(DiffSelection::range);
+    let selection = app.diff.selection.as_ref();
 
     // Build Lines only for the visible window.
     let visible: Vec<Line> = (scroll..end)
@@ -101,13 +101,17 @@ pub fn draw_diff(frame: &mut Frame, app: &App, area: Rect, focused: bool) {
             } else {
                 spans.extend(line.spans);
             }
-            // Mouse selection: a full-width background bar over the
-            // selected rows. Patched at the line level so span
+            // Mouse selection: fully-covered rows get a full-width
+            // background bar, patched at the line level so span
             // foregrounds (and the search highlight's own bg) still
-            // read through.
+            // read through; the partially-covered first/last rows get
+            // the bar only over their selected cells, which requires
+            // splitting spans at the cell boundaries.
             let mut style = line.style;
-            if selection.is_some_and(|(lo, hi)| (lo..=hi).contains(&global_idx)) {
-                style = style.patch(Style::default().bg(SELECTION_BG));
+            match selection.and_then(|sel| sel.cells_on_line(global_idx)) {
+                Some((0, None)) => style = style.patch(Style::default().bg(SELECTION_BG)),
+                Some((start, end)) => spans = patch_selection_cells(spans, start, end),
+                None => {}
             }
             Line::from(spans).style(style)
         })
@@ -240,6 +244,38 @@ pub(crate) fn append_diffstat(
     );
     out.push(diff_line_to_ratatui(&DiffLine { kind: DiffLineKind::DiffstatTotal, text: summary }));
     out.push(diff_line_to_ratatui(&DiffLine { kind: DiffLineKind::Blank, text: String::new() }));
+}
+
+/// Re-style display cells `start..end` (`end: None` = to end of line)
+/// of an assembled row with the selection background, splitting spans
+/// at the cell boundaries. Cells are counted over the unscrolled row
+/// exactly as ratatui will render it — gutter included, wide chars
+/// two cells, zero-width chars traveling with their base char (the
+/// same rule `cell_in_selection` gives the copy path).
+fn patch_selection_cells(spans: Vec<Span<'static>>, start: usize, end: Option<usize>) -> Vec<Span<'static>> {
+    use unicode_width::UnicodeWidthChar;
+
+    let bg = Style::default().bg(SELECTION_BG);
+    let mut out = Vec::with_capacity(spans.len() + 2);
+    let mut acc = 0usize;
+    for span in spans {
+        // (selected?, run text) buckets in original order; consecutive
+        // chars with the same selection membership stay one span.
+        let mut runs: Vec<(bool, String)> = Vec::new();
+        for ch in span.content.chars() {
+            let w = ch.width().unwrap_or(0);
+            let inside = cell_in_selection(acc, w, start, end);
+            match runs.last_mut() {
+                Some((flag, text)) if *flag == inside => text.push(ch),
+                _ => runs.push((inside, ch.to_string())),
+            }
+            acc += w;
+        }
+        for (inside, text) in runs {
+            out.push(Span::styled(text, if inside { span.style.patch(bg) } else { span.style }));
+        }
+    }
+    out
 }
 
 /// Scale `part` against `whole`, rounding to the nearest integer in `0..=cap`.

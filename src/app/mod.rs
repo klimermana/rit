@@ -52,6 +52,10 @@ pub struct App {
     pub display: DisplayOptions,
     pub show_help: bool,
     pub yank_message: Option<YankFeedback>,
+    /// Last left-button press in the diff pane — `(when, (line, cell),
+    /// click count)` — so the next press can be recognized as a
+    /// double- (word) or triple- (line) click.
+    pub last_diff_click: Option<(Instant, (usize, usize), u32)>,
     pub error: Option<String>,
     pub repo_name: String,
     pub branch_name: String,
@@ -112,6 +116,7 @@ impl App {
             display: DisplayOptions::default(),
             show_help: false,
             yank_message: None,
+            last_diff_click: None,
             error: None,
             repo_name: "unknown".to_string(),
             branch_name: "HEAD".to_string(),

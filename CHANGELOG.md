@@ -7,6 +7,18 @@ Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Fixed
+
+- Copying (drag-to-copy or `y`) on a machine without a display no
+  longer prints `Error: Can't open display: (null)` into the UI:
+  clipboard helper processes now run with their output discarded, X11
+  helpers (`xclip`/`xsel`) are only tried when `DISPLAY` is set, and
+  `wl-copy` is used on Wayland. When no helper is available — e.g.
+  over SSH with no display — the copy falls back to an OSC 52 escape
+  sequence, which asks the terminal emulator itself to set the
+  clipboard (most terminals support it; some gate it behind a
+  "allow clipboard access" setting).
+
 ### Changed
 
 - Upgraded all dependencies to latest, notably gix 0.83 → 0.86.
@@ -27,10 +39,14 @@ Versioning](https://semver.org/spec/v2.0.0.html).
 - Mouse support. The terminal's mouse is now captured: the wheel
   scrolls whichever pane is under the pointer (and the status, refs,
   and blame views), clicking a pane focuses it (clicking a log row
-  also selects that commit), and dragging in the diff pane selects
-  whole lines *confined to that pane* — releasing the button copies
-  them to the clipboard with the gutter (line numbers, `+`/`-`
-  markers) stripped. This fixes copying out of a side-by-side layout,
+  also selects that commit), and dragging in the diff pane makes a
+  character-precise text selection *confined to that pane* — releasing
+  the button copies it to the clipboard with the gutter (line numbers,
+  `+`/`-` markers) stripped from every fully-selected line.
+  Double-clicking selects the word under the cursor (word characters
+  follow iTerm's default, so paths, flags, and versions come out
+  whole); triple-clicking selects the whole line. This fixes copying
+  out of a side-by-side layout,
   where the terminal's own selection would sweep up the log pane too.
   The terminal-native selection remains available via Option/Alt+drag.
 - Single-file diff view: `o` in the diff pane takes over the pane with

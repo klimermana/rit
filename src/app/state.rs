@@ -55,15 +55,18 @@ pub struct PaneRects {
     pub diff: Option<Rect>,
 }
 
-/// Mouse-drag selection in the diff pane. `anchor`/`cursor` are virtual
-/// line indices into header + diffstat + body — the same space as
-/// `DiffState::scroll` and the diff-search matches — so the highlight
-/// stays glued to content while the view scrolls under the drag.
+/// Mouse-drag selection in the diff pane. `anchor`/`cursor` are
+/// `(virtual line, display cell)` pairs: the line half is an index into
+/// header + diffstat + body — the same space as `DiffState::scroll` and
+/// the diff-search matches — so the highlight stays glued to content
+/// while the view scrolls under the drag. The cell half is a column of
+/// the *unscrolled rendered row* (gutter included, `horizontal_scroll`
+/// already added back), so it too stays glued to content.
 pub struct DiffSelection {
-    /// Line the drag started on.
-    pub anchor: usize,
-    /// Line the drag last touched (may be above `anchor`).
-    pub cursor: usize,
+    /// Where the drag started.
+    pub anchor: (usize, usize),
+    /// Where the drag last touched (may be above/left of `anchor`).
+    pub cursor: (usize, usize),
     /// True while the left button is held.
     pub dragging: bool,
     /// True once the drag crossed at least one cell boundary — a plain
@@ -72,9 +75,47 @@ pub struct DiffSelection {
 }
 
 impl DiffSelection {
-    /// Selection bounds as an ordered inclusive pair.
-    pub fn range(&self) -> (usize, usize) {
+    /// Selection bounds as an ordered inclusive pair (tuple order:
+    /// line first, then cell — exactly the reading order of a drag).
+    pub fn range(&self) -> ((usize, usize), (usize, usize)) {
         (self.anchor.min(self.cursor), self.anchor.max(self.cursor))
+    }
+
+    /// First and last selected line.
+    pub fn line_range(&self) -> (usize, usize) {
+        (self.anchor.0.min(self.cursor.0), self.anchor.0.max(self.cursor.0))
+    }
+
+    /// The cell span selected on `line`, as `(start, end)` with `end`
+    /// exclusive and `None` meaning "to the end of the line". `None`
+    /// altogether when `line` is outside the selection. Terminal-style
+    /// semantics: the cell under the cursor is included.
+    pub fn cells_on_line(&self, line: usize) -> Option<(usize, Option<usize>)> {
+        let ((lo_line, lo_cell), (hi_line, hi_cell)) = self.range();
+        if line < lo_line || line > hi_line {
+            return None;
+        }
+        let end = Some(hi_cell.saturating_add(1));
+        match (line == lo_line, line == hi_line) {
+            (true, true) => Some((lo_cell, end)),
+            (true, false) => Some((lo_cell, None)),
+            (false, true) => Some((0, end)),
+            (false, false) => Some((0, None)),
+        }
+    }
+}
+
+/// Whether a glyph occupying display cells `[cell, cell + width)`
+/// belongs to the selected span `[start, end)` (`end: None` = to end of
+/// line). Zero-width glyphs (combining marks) travel with the glyph
+/// they modify: included exactly when a base char ending at `cell`
+/// would be. Shared by the renderer's highlight and the copy path so a
+/// selection always copies exactly what it highlights.
+pub(crate) fn cell_in_selection(cell: usize, width: usize, start: usize, end: Option<usize>) -> bool {
+    if width == 0 {
+        cell > start && end.is_none_or(|e| cell <= e)
+    } else {
+        cell + width > start && end.is_none_or(|e| cell < e)
     }
 }
 

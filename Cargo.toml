@@ -23,6 +23,9 @@ compact_str = "0.10"
 imara-diff = "0.2"
 rayon = "1"
 clap = { version = "4.6.1", features = ["derive"] }
+# Already in the tree via ratatui; used directly so selection cell math
+# matches what ratatui actually renders.
+unicode-width = "0.2"
 
 [profile.release]
 strip = true

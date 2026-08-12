@@ -2691,6 +2691,7 @@ dependencies = [
  "ratatui",
  "rayon",
  "tempfile",
+ "unicode-width",
 ]
 
 [[package]]
