@@ -9,8 +9,9 @@
 //!     commit
 //!   - drag in the diff pane: character-precise text selection —
 //!     confined to the pane, so a side-by-side layout never bleeds the
-//!     log into the copy — and yanks the gutter-stripped text to the
-//!     clipboard on release
+//!     log into the copy — and yanks the text to the clipboard on
+//!     release, line numbers stripped but `+`/`-` prefixes kept so the
+//!     copy still reads as a diff
 //!   - double-click in the diff pane selects the word under the cell,
 //!     triple-click the whole line
 
@@ -233,8 +234,8 @@ impl App {
             let l = doc.body.get(idx - body_offset)?;
             (l.text.clone(), Some(l.kind))
         };
-        let prefix = usize::from(matches!(kind, Some(DiffLineKind::Add | DiffLineKind::Del | DiffLineKind::Context)));
-        Some((text, self.diff_gutter_cells(idx) + prefix))
+        let prefix = kind.map_or("", DiffLineKind::prefix);
+        Some((text, self.diff_gutter_cells(idx) + prefix.len()))
     }
 
     /// The word under `cell` on virtual line `idx`, as an inclusive
@@ -276,10 +277,11 @@ impl App {
 
     /// Plain text of the selection from `lo` to `hi` (`(line, cell)`
     /// pairs, `lo <= hi`), in the same header → diffstat → body order
-    /// the renderer draws. Fully-covered lines come back whole and
-    /// gutter-stripped — no line numbers, no `+`/`-`/space prefix
-    /// (`DiffLine.text` already stores body lines unprefixed); the
-    /// first and last line are cut to the selected cells. Lines are
+    /// the renderer draws. Line numbers are never copied, but the
+    /// `+`/`-`/space prefix is a real content cell: any selection
+    /// covering it copies it, so multi-line yanks still read as a
+    /// diff. Fully-covered lines come back whole; the first and last
+    /// line are cut to the selected cells. Lines are
     /// newline-separated with no trailing newline, like a terminal's
     /// own selection.
     pub(crate) fn diff_selection_text(&self, lo: (usize, usize), hi: (usize, usize)) -> String {
@@ -322,14 +324,17 @@ impl App {
                 let l = doc.body.get(idx - body_offset);
                 (l.map(|l| l.text.as_str()).unwrap_or(""), l.map(|l| l.kind))
             };
-            let prefix =
-                usize::from(matches!(kind, Some(DiffLineKind::Add | DiffLineKind::Del | DiffLineKind::Context)));
-            let offset = self.diff_gutter_cells(idx) + prefix;
+            let prefix = kind.map_or("", DiffLineKind::prefix);
+            let gutter = self.diff_gutter_cells(idx);
             if idx > lo.0 {
                 out.push('\n');
             }
             if let Some((start, end)) = sel.cells_on_line(idx) {
-                out.push_str(slice_by_cells(line, offset, start, end));
+                // The prefix renders as one cell right after the gutter.
+                if !prefix.is_empty() && cell_in_selection(gutter, 1, start, end) {
+                    out.push_str(prefix);
+                }
+                out.push_str(slice_by_cells(line, gutter + prefix.len(), start, end));
             }
         }
         out
@@ -389,9 +394,9 @@ fn word_cells_at(text: &str, offset: usize, cell: usize) -> Option<(usize, usize
 
 /// Substring of `text` covering the selected display cells
 /// `start..end` (`end: None` = to end of line), where `text`'s first
-/// char sits at cell `offset` of the rendered row — i.e. the gutter
-/// and `+`/`-` prefix occupy `0..offset` and are never part of the
-/// result.
+/// char sits at cell `offset` of the rendered row — cells before
+/// `offset` (the gutter, and the `+`/`-` prefix which the caller
+/// copies separately) are never part of the result.
 fn slice_by_cells(text: &str, offset: usize, start: usize, end: Option<usize>) -> &str {
     let mut acc = offset;
     let mut from: Option<usize> = None;
@@ -470,7 +475,7 @@ mod tests {
     }
 
     #[test]
-    fn selection_text_strips_gutter_and_rebuilds_diffstat() {
+    fn selection_text_strips_line_numbers_but_keeps_diff_prefixes() {
         let (app, _ends) = app_with_diff();
         // Whole document: header line, 5 diffstat lines, 4 body lines.
         let text = app.diff_selection_text((0, 0), (9, usize::MAX - 1));
@@ -479,10 +484,11 @@ mod tests {
         assert_eq!(lines[0], "Working tree");
         assert_eq!(lines[1], "---");
         assert!(lines[2].starts_with(" a.rs"), "diffstat row: {:?}", lines[2]);
-        // Body lines come back without the +/-/space prefix.
-        assert_eq!(lines[7], "old line");
-        assert_eq!(lines[8], "new line");
-        assert_eq!(lines[9], "context line");
+        // Body lines keep the +/-/space prefix so the copy reads as a
+        // diff; the line-number gutter is still stripped.
+        assert_eq!(lines[7], "-old line");
+        assert_eq!(lines[8], "+new line");
+        assert_eq!(lines[9], " context line");
     }
 
     #[test]
@@ -542,8 +548,10 @@ mod tests {
     fn multi_line_selection_cuts_only_the_end_lines() {
         let (app, _ends) = app_with_diff();
         // From 'd' of "old line" (line 7, cell 8) to 'w' of "new line"
-        // (line 8, cell 8): partial first and last line.
-        assert_eq!(app.diff_selection_text((7, 8), (8, 8)), "d line\nnew");
+        // (line 8, cell 8): partial first and last line. The last line
+        // is selected from cell 0, so its `+` prefix is included; the
+        // first line starts mid-content, so its `-` is not.
+        assert_eq!(app.diff_selection_text((7, 8), (8, 8)), "d line\n+new");
     }
 
     #[test]
@@ -585,8 +593,9 @@ mod tests {
         let sel = app.diff.selection.as_ref().expect("triple-click selects the line");
         assert_eq!(sel.range(), ((7, 0), (7, 13)));
         app.handle_mouse(mouse(K::Up(MouseButton::Left), 48, 9));
-        assert_eq!(app.diff_selection_text((7, 0), (7, 13)), "old line");
-        assert_eq!(app.yank_message.as_ref().map(|y| y.text.as_str()), Some("Copied 8 chars"));
+        // The span covers the prefix cell, so the `-` comes along.
+        assert_eq!(app.diff_selection_text((7, 0), (7, 13)), "-old line");
+        assert_eq!(app.yank_message.as_ref().map(|y| y.text.as_str()), Some("Copied 9 chars"));
     }
 
     #[test]

@@ -476,12 +476,7 @@ pub fn diff_line_to_ratatui(line: &DiffLine) -> Line<'static> {
     // prefix character — the renderer prepends it here based on `kind`.
     // This drops one per-line `format!` allocation from the producer
     // side (worth thousands on a large diff).
-    let prefix = match line.kind {
-        DiffLineKind::Add => "+",
-        DiffLineKind::Del => "-",
-        DiffLineKind::Context => " ",
-        _ => "",
-    };
+    let prefix = line.kind.prefix();
     if prefix.is_empty() {
         Line::from(Span::styled(line.text.clone(), style))
     } else {

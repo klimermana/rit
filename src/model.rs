@@ -239,3 +239,17 @@ pub enum DiffLineKind {
     StatusOurs,
     StatusTheirs,
 }
+
+impl DiffLineKind {
+    /// Unified-diff prefix the renderer draws before the line's text.
+    /// Add / Del / Context store their text *without* it, so the copy
+    /// path needs the same mapping to reproduce what's on screen.
+    pub fn prefix(self) -> &'static str {
+        match self {
+            Self::Add => "+",
+            Self::Del => "-",
+            Self::Context => " ",
+            _ => "",
+        }
+    }
+}

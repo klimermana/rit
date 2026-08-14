@@ -9,6 +9,13 @@ Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- Copying from the diff pane now keeps the `+`/`-`/space prefixes, so
+  a multi-line copy still reads as a diff instead of an ambiguous
+  blob of lines. The prefix is a real selectable cell right after the
+  line-number gutter: full-line and multi-line selections include it,
+  while a drag that starts mid-line (or a double-clicked word) still
+  copies just the content. Line numbers are never copied.
+
 - Copying (drag-to-copy or `y`) on a machine without a display no
   longer prints `Error: Can't open display: (null)` into the UI:
   clipboard helper processes now run with their output discarded, X11
