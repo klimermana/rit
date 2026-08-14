@@ -158,16 +158,18 @@ pub fn render_diff_records(
 ) {
     use gix::diff::tree::recorder::Change;
 
+    let items = pair_exact_renames(records);
+
     // File-count cap kicks in before any blob is fetched. `headroom`
     // is how many more files the sink can absorb full diffs for;
     // anything past that is accounted as a skipped file with the
     // truncation note pinned to the document.
     let headroom = MAX_INLINE_DIFF_FILES.saturating_sub(sink.stats.files);
-    let (render_records, skip_records) = if records.len() > headroom {
-        let (a, b) = records.split_at(headroom);
+    let (render_records, skip_records) = if items.len() > headroom {
+        let (a, b) = items.split_at(headroom);
         (a, Some(b))
     } else {
-        (records, None)
+        (items.as_slice(), None)
     };
 
     // Render every surviving record. Above `PARALLEL_FILE_THRESHOLD`
@@ -178,7 +180,15 @@ pub fn render_diff_records(
     // does that without re-opening the repo. Below the threshold the
     // per-call rayon setup costs more than it saves on a 1- or
     // 2-file diff, so we stay serial.
-    let render_one = |worker_repo: &gix::Repository, change: &Change| -> Option<FileDiffOutput> {
+    let render_one = |worker_repo: &gix::Repository, item: &RenderRecord<'_>| -> Option<FileDiffOutput> {
+        let change = match item {
+            // Exact rename: identical blob on both sides, so the
+            // output is headers-only and needs no object lookup.
+            RenderRecord::Rename { path, source_path } => {
+                return Some(file_pure_rename_output(path, source_path, /* copied */ false));
+            }
+            RenderRecord::Change(change) => change,
+        };
         match change {
             Change::Addition { entry_mode, oid, path, .. } if entry_mode.is_blob() => {
                 let p = path.to_str_lossy().into_owned();
@@ -223,10 +233,88 @@ pub fn render_diff_records(
         // Trip the truncation note once before draining the tail so
         // the message lines up with the file-count guardrail caller.
         let _ = sink.guardrail_exceeded();
-        for change in skipped {
-            sink.account_skipped_file(change_path(change));
+        for item in skipped {
+            sink.account_skipped_file(item.dest_path());
         }
     }
+}
+
+/// A tree-diff record ready to render: either a raw recorder change or
+/// an exact-content rename synthesized from a Deletion + Addition pair
+/// sharing a blob oid.
+enum RenderRecord<'a> {
+    Change(&'a gix::diff::tree::recorder::Change),
+    Rename { path: String, source_path: String },
+}
+
+impl RenderRecord<'_> {
+    /// Path the change lands at — what the diffstat and skip
+    /// accounting report.
+    fn dest_path(&self) -> String {
+        match self {
+            Self::Change(change) => change_path(change),
+            Self::Rename { path, .. } => path.clone(),
+        }
+    }
+}
+
+/// Pair blob Deletions and Additions that share an oid into `Rename`
+/// records — the exact-rename (100% similarity) case `git mv` +
+/// commit produces. The tree recorder has no rewrite tracking, and
+/// gix's similarity analysis would put content comparison on the diff
+/// hot path; oid-equality pairing is a hash-map pass that only runs
+/// when a diff actually contains both deletions and additions.
+/// Renames with content edits still render as delete + add. The
+/// rename sits at the addition's position; ties between equal-content
+/// deletions resolve in record order.
+fn pair_exact_renames(records: &[gix::diff::tree::recorder::Change]) -> Vec<RenderRecord<'_>> {
+    use gix::diff::tree::recorder::Change;
+    use std::collections::HashMap;
+
+    let has = |pred: fn(&Change) -> bool| records.iter().any(pred);
+    if !has(|c| matches!(c, Change::Deletion { entry_mode, .. } if entry_mode.is_blob()))
+        || !has(|c| matches!(c, Change::Addition { entry_mode, .. } if entry_mode.is_blob()))
+    {
+        return records.iter().map(RenderRecord::Change).collect();
+    }
+
+    // Deleted-blob oid → record indices, reversed so `pop` consumes
+    // the earliest deletion first.
+    let mut deleted: HashMap<ObjectId, Vec<usize>> = HashMap::new();
+    for (i, change) in records.iter().enumerate() {
+        if let Change::Deletion { entry_mode, oid, .. } = change
+            && entry_mode.is_blob()
+        {
+            deleted.entry(*oid).or_default().push(i);
+        }
+    }
+    for indices in deleted.values_mut() {
+        indices.reverse();
+    }
+
+    // Addition index → paired deletion index, and the set of paired
+    // deletions (dropped from the output).
+    let mut consumed: std::collections::HashSet<usize> = std::collections::HashSet::new();
+    let mut source: HashMap<usize, usize> = HashMap::new();
+    for (i, change) in records.iter().enumerate() {
+        if let Change::Addition { entry_mode, oid, .. } = change
+            && entry_mode.is_blob()
+            && let Some(del_idx) = deleted.get_mut(oid).and_then(Vec::pop)
+        {
+            consumed.insert(del_idx);
+            source.insert(i, del_idx);
+        }
+    }
+
+    records
+        .iter()
+        .enumerate()
+        .filter(|(i, _)| !consumed.contains(i))
+        .map(|(i, change)| match source.get(&i).and_then(|del_idx| records.get(*del_idx)) {
+            Some(deletion) => RenderRecord::Rename { path: change_path(change), source_path: change_path(deletion) },
+            None => RenderRecord::Change(change),
+        })
+        .collect()
 }
 
 /// Mutable accumulator threaded through every file-render call. Keeps the
@@ -359,6 +447,48 @@ pub fn file_modification_output(path: &str, old: &[u8], new: &[u8]) -> FileDiffO
     FileDiffOutput { path: path.to_string(), lines, additions, deletions, skip_reason }
 }
 
+/// Rename with identical content (the `git mv` case): git-style
+/// `rename from` / `rename to` headers and nothing else — no hunks,
+/// and no blob data needed, so callers can skip the ODB round-trip.
+pub fn file_pure_rename_output(path: &str, source_path: &str, copied: bool) -> FileDiffOutput {
+    let mut lines: Vec<DiffLine> = Vec::new();
+    push_rename_headers(&mut lines, path, source_path, copied);
+    FileDiffOutput { path: path.to_string(), lines, additions: 0, deletions: 0, skip_reason: None }
+}
+
+/// Rename (or copy) that also edited the content: rename headers plus
+/// the unified hunks between the source and destination blobs.
+pub fn file_rename_output(path: &str, source_path: &str, copied: bool, old: &[u8], new: &[u8]) -> FileDiffOutput {
+    if old == new {
+        return file_pure_rename_output(path, source_path, copied);
+    }
+    let mut lines: Vec<DiffLine> = Vec::new();
+    push_rename_headers(&mut lines, path, source_path, copied);
+    lines.push(DiffLine::new(DiffLineKind::OldMarker, format!("--- a/{source_path}")));
+    lines.push(DiffLine::new(DiffLineKind::NewMarker, format!("+++ b/{path}")));
+    let (additions, deletions, skip_reason) = match classify_skip(old, new) {
+        Some(reason) => {
+            lines.push(DiffLine::new(DiffLineKind::Faint, skip_summary_text(&reason, old.len().max(new.len()))));
+            (0, 0, Some(reason))
+        }
+        None => {
+            let (file_add, file_del) = render_unified_into(&mut lines, old, new);
+            (file_add, file_del, None)
+        }
+    };
+    FileDiffOutput { path: path.to_string(), lines, additions, deletions, skip_reason }
+}
+
+/// The `diff --git` + `rename from`/`rename to` block shared by both
+/// rename outputs. `copied` switches the wording to `copy from`/`copy
+/// to` (index rewrites flag copies when the source path survives).
+fn push_rename_headers(lines: &mut Vec<DiffLine>, path: &str, source_path: &str, copied: bool) {
+    lines.push(DiffLine::new(DiffLineKind::FileHeader, format!("diff --git a/{source_path} b/{path}")));
+    let (from, to) = if copied { ("copy from", "copy to") } else { ("rename from", "rename to") };
+    lines.push(DiffLine::new(DiffLineKind::FileMeta, format!("{from} {source_path}")));
+    lines.push(DiffLine::new(DiffLineKind::FileMeta, format!("{to} {path}")));
+}
+
 /// Full-context variant of the per-file renderers: emits the *entire*
 /// file with changed lines interleaved in place, instead of ±3-line
 /// hunks. Powers the single-file view (`o` in the diff pane), where the
@@ -446,8 +576,20 @@ fn compute_file_diff_inner(
 
     let output = match change {
         Change::Addition { oid, .. } => {
+            // The destination of an exact rename reads better as the
+            // unchanged file with a "renamed from" note than as an
+            // all-new file (matches the commit view's pairing).
+            let renamed_from = records.iter().find_map(|c| match c {
+                Change::Deletion { entry_mode, oid: del_oid, path, .. } if entry_mode.is_blob() && del_oid == oid => {
+                    Some(path.to_str_lossy().into_owned())
+                }
+                _ => None,
+            });
             let new = repo.find_object(*oid)?;
-            file_full_context_output(path, &[], &new.data, Some("new file"))
+            match renamed_from {
+                Some(src) => file_full_context_output(path, &new.data, &new.data, Some(&format!("renamed from {src}"))),
+                None => file_full_context_output(path, &[], &new.data, Some("new file")),
+            }
         }
         Change::Deletion { oid, .. } => {
             let old = repo.find_object(*oid)?;
@@ -755,7 +897,7 @@ mod tests {
     use crate::{
         git::{TreeDiffCache, walk::build_pathspec_search},
         model::{DiffFlags, DiffLine, DiffLineKind, DiffStats, FileStat, PathFilter},
-        test_support::{commit_all, make_fixture_repo, write_file},
+        test_support::{commit_all, make_fixture_repo, run_git, write_file},
     };
 
     /// Drive `render_file_modification` and pull out the hunk-header
@@ -953,6 +1095,97 @@ mod tests {
         );
         assert!(doc.body.iter().any(|l| matches!(l.kind, DiffLineKind::Context) && l.text == "alpha11"));
         assert!(!doc.body.iter().any(|l| l.text.contains("b.md")), "the other changed file stays out");
+    }
+
+    #[test]
+    fn commit_diff_pairs_exact_renames() {
+        let (td, repo) = make_fixture_repo();
+        let path = td.path();
+        write_file(path, "original.txt", "one\ntwo\nthree\n");
+        commit_all(path, "base");
+        run_git(path, &["mv", "original.txt", "renamed.txt"]);
+        commit_all(path, "rename");
+        let head = repo.head_id().expect("head").detach();
+        let mut cache = TreeDiffCache::new();
+
+        let doc = compute_commit_diff(&repo, head, &mut cache, None);
+        assert_eq!(doc.stats.files, 1, "a pure rename is one file, not delete + add");
+        assert_eq!(doc.files[0].path, "renamed.txt");
+        assert_eq!((doc.stats.insertions, doc.stats.deletions), (0, 0));
+        assert!(
+            doc.body.iter().any(|l| l.text == "rename from original.txt"),
+            "body: {:?}",
+            doc.body.iter().map(|l| l.text.as_str()).collect::<Vec<_>>()
+        );
+        assert!(doc.body.iter().any(|l| l.text == "rename to renamed.txt"));
+        assert!(
+            !doc.body.iter().any(|l| matches!(l.kind, DiffLineKind::Add | DiffLineKind::Del)),
+            "pure rename emits no hunks"
+        );
+    }
+
+    #[test]
+    fn commit_diff_rename_with_edits_stays_delete_plus_add() {
+        let (td, repo) = make_fixture_repo();
+        let path = td.path();
+        write_file(path, "original.txt", "one\ntwo\nthree\n");
+        commit_all(path, "base");
+        run_git(path, &["mv", "original.txt", "renamed.txt"]);
+        write_file(path, "renamed.txt", "one\nTWO\nthree\n");
+        commit_all(path, "rename and edit");
+        let head = repo.head_id().expect("head").detach();
+        let mut cache = TreeDiffCache::new();
+
+        // Different blobs on each side — oid pairing can't see it, so
+        // the fallback is the old delete + add rendering.
+        let doc = compute_commit_diff(&repo, head, &mut cache, None);
+        assert_eq!(doc.stats.files, 2);
+        assert!(!doc.body.iter().any(|l| l.text.starts_with("rename from")));
+    }
+
+    #[test]
+    fn commit_diff_pairs_renames_among_other_changes() {
+        let (td, repo) = make_fixture_repo();
+        let path = td.path();
+        write_file(path, "original.txt", "one\ntwo\nthree\n");
+        write_file(path, "kept.txt", "alpha\n");
+        commit_all(path, "base");
+        run_git(path, &["mv", "original.txt", "renamed.txt"]);
+        write_file(path, "kept.txt", "alpha\nbeta\n");
+        write_file(path, "brand_new.txt", "fresh\n");
+        commit_all(path, "rename + edit + add");
+        let head = repo.head_id().expect("head").detach();
+        let mut cache = TreeDiffCache::new();
+
+        let doc = compute_commit_diff(&repo, head, &mut cache, None);
+        assert_eq!(doc.stats.files, 3, "rename, modification, and addition");
+        assert!(doc.body.iter().any(|l| l.text == "rename from original.txt"));
+        assert!(doc.body.iter().any(|l| matches!(l.kind, DiffLineKind::Add) && l.text == "beta"));
+        assert!(doc.body.iter().any(|l| matches!(l.kind, DiffLineKind::Add) && l.text == "fresh"));
+    }
+
+    #[test]
+    fn file_diff_on_rename_destination_notes_the_source() {
+        let (td, repo) = make_fixture_repo();
+        let path = td.path();
+        write_file(path, "original.txt", "one\ntwo\nthree\n");
+        commit_all(path, "base");
+        run_git(path, &["mv", "original.txt", "renamed.txt"]);
+        commit_all(path, "rename");
+        let head = repo.head_id().expect("head").detach();
+        let mut cache = TreeDiffCache::new();
+
+        let doc = compute_file_diff(&repo, head, "renamed.txt", &mut cache);
+        assert!(
+            doc.body.iter().any(|l| l.text == "renamed from original.txt"),
+            "body: {:?}",
+            doc.body.iter().map(|l| l.text.as_str()).collect::<Vec<_>>()
+        );
+        assert!(
+            doc.body.iter().any(|l| matches!(l.kind, DiffLineKind::Context) && l.text == "one"),
+            "content shows as unchanged context, not an all-new file"
+        );
+        assert!(!doc.body.iter().any(|l| matches!(l.kind, DiffLineKind::Add | DiffLineKind::Del)));
     }
 
     #[test]

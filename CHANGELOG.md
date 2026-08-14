@@ -28,7 +28,17 @@ Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Changed
 
-- Upgraded all dependencies to latest, notably gix 0.83 → 0.86.
+- Renamed files are now shown as renames instead of disappearing or
+  splitting in two. Commit diffs pair a deletion and an addition with
+  identical content into one `rename from` / `rename to` entry (exact
+  renames — a rename with edits in the same commit still shows as
+  delete + add). The staged section uses git's own rename detection,
+  so `git mv` — even followed by edits — renders rename headers plus
+  the real hunks, instead of a bare 0-line modification at the new
+  path that never mentioned the old one; the short-status block
+  spells it `R old -> new` like `git status --short`. The single-file
+  view (`o`) on a rename destination shows the file as unchanged
+  content with a `renamed from` note rather than as all-new.
   Interleaved A/B benchmarks show a ~7–16% slowdown in the commit
   history walk (indexing) from the gix bump; diff generation, search,
   and scrolling are unaffected.

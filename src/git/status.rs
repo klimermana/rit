@@ -17,7 +17,8 @@
 use crate::{
     git::diff::{
         DiffSink, FileDiffOutput, empty_error_document, file_addition_output, file_deletion_output,
-        file_full_context_output, file_modification_output, merge_file_output_into_sink, single_file_document,
+        file_full_context_output, file_modification_output, file_pure_rename_output, file_rename_output,
+        merge_file_output_into_sink, single_file_document,
     },
     model::{
         DiffDocument, DiffFlags, DiffLine, DiffLineKind, DiffStats, DiffTarget, FileSection, FileStat, StatusDocument,
@@ -53,20 +54,30 @@ enum StagedRender {
         path: String,
         oid: ObjectId,
     },
-    /// Modification *and* rewrite collapse here — `git diff` displays
-    /// renames as a modification at the destination path today, and
-    /// the per-file render only needs old/new oids.
     Modification {
         path: String,
         old_oid: ObjectId,
         new_oid: ObjectId,
+    },
+    /// Rename (or copy) detected by gix's index rewrite tracking.
+    /// Renders `rename from`/`rename to` headers, plus hunks between
+    /// the source and destination blobs when the content changed too.
+    Rename {
+        path: String,
+        source_path: String,
+        old_oid: ObjectId,
+        new_oid: ObjectId,
+        copied: bool,
     },
 }
 
 impl StagedRender {
     fn path(&self) -> &str {
         match self {
-            Self::Addition { path, .. } | Self::Deletion { path, .. } | Self::Modification { path, .. } => path,
+            Self::Addition { path, .. }
+            | Self::Deletion { path, .. }
+            | Self::Modification { path, .. }
+            | Self::Rename { path, .. } => path,
         }
     }
 
@@ -84,10 +95,12 @@ impl StagedRender {
                 old_oid: previous_id.into_owned(),
                 new_oid: id.into_owned(),
             },
-            Change::Rewrite { location, source_id, id, .. } => Self::Modification {
+            Change::Rewrite { location, source_location, source_id, id, copy, .. } => Self::Rename {
                 path: location.to_string(),
+                source_path: source_location.to_string(),
                 old_oid: source_id.into_owned(),
                 new_oid: id.into_owned(),
+                copied: copy,
             },
         }
     }
@@ -154,7 +167,10 @@ fn sweep_status(repo: &gix::Repository, untracked_files: UntrackedFiles) -> Resu
                     Change::Addition { location, .. } => (location.to_string(), 'A'),
                     Change::Deletion { location, .. } => (location.to_string(), 'D'),
                     Change::Modification { location, .. } => (location.to_string(), 'M'),
-                    Change::Rewrite { location, copy, .. } => (location.to_string(), if *copy { 'C' } else { 'R' }),
+                    // `git status --short` spelling: `R old -> new`.
+                    Change::Rewrite { location, source_location, copy, .. } => {
+                        (format!("{source_location} -> {location}"), if *copy { 'C' } else { 'R' })
+                    }
                 };
                 short.entry(path).or_insert((' ', ' ')).0 = c;
                 staged.push(change);
@@ -281,6 +297,16 @@ fn render_staged_section(
                 let old = worker_repo.find_object(*old_oid).ok()?;
                 let new = worker_repo.find_object(*new_oid).ok()?;
                 Some(file_modification_output(path, &old.data, &new.data))
+            }
+            StagedRender::Rename { path, source_path, old_oid, new_oid, copied } => {
+                if old_oid == new_oid {
+                    // Pure rename: headers only, no blobs to fetch.
+                    Some(file_pure_rename_output(path, source_path, *copied))
+                } else {
+                    let old = worker_repo.find_object(*old_oid).ok()?;
+                    let new = worker_repo.find_object(*new_oid).ok()?;
+                    Some(file_rename_output(path, source_path, *copied, &old.data, &new.data))
+                }
             }
         }
     };
@@ -657,6 +683,52 @@ mod tests {
         model::{DiffLineKind, DiffTarget},
         test_support::{commit_all, make_fixture_repo, run_git, write_file},
     };
+
+    #[test]
+    fn staged_pure_rename_shows_arrow_and_rename_headers() {
+        let (td, repo) = make_fixture_repo();
+        let path = td.path();
+        write_file(path, "original.txt", "one\ntwo\nthree\nfour\n");
+        commit_all(path, "base");
+        run_git(path, &["mv", "original.txt", "renamed.txt"]);
+
+        let doc = compute_working_tree_diff(&repo, DiffTarget::WorkingTree);
+        assert!(
+            doc.body.iter().any(|l| l.text == "R  original.txt -> renamed.txt"),
+            "short status spells the rename git-style: {:?}",
+            doc.body.iter().map(|l| l.text.as_str()).collect::<Vec<_>>()
+        );
+        assert!(doc.body.iter().any(|l| l.text == "rename from original.txt"));
+        assert!(doc.body.iter().any(|l| l.text == "rename to renamed.txt"));
+        assert_eq!(doc.stats.files, 1);
+        assert!(
+            !doc.body.iter().any(|l| matches!(l.kind, DiffLineKind::Add | DiffLineKind::Del)),
+            "pure rename emits no hunks"
+        );
+    }
+
+    #[test]
+    fn staged_rename_with_edits_diffs_source_against_destination() {
+        let (td, repo) = make_fixture_repo();
+        let path = td.path();
+        write_file(path, "original.txt", "one\ntwo\nthree\nfour\n");
+        commit_all(path, "base");
+        run_git(path, &["mv", "original.txt", "renamed.txt"]);
+        write_file(path, "renamed.txt", "one\nTWO\nthree\nfour\n");
+        run_git(path, &["add", "-A"]);
+
+        // gix's similarity tracking pairs the edited rename (verified
+        // against gix 0.86): one file, rename headers, real hunks.
+        let doc = compute_staged_diff(&repo, DiffTarget::Staged);
+        assert_eq!(doc.stats.files, 1);
+        assert!(
+            doc.body.iter().any(|l| l.text == "rename from original.txt"),
+            "body: {:?}",
+            doc.body.iter().map(|l| l.text.as_str()).collect::<Vec<_>>()
+        );
+        assert!(doc.body.iter().any(|l| matches!(l.kind, DiffLineKind::Add) && l.text == "TWO"));
+        assert!(doc.body.iter().any(|l| matches!(l.kind, DiffLineKind::Del) && l.text == "two"));
+    }
 
     #[test]
     fn worktree_file_diff_shows_full_context_against_head() {
